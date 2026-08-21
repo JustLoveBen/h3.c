@@ -8,8 +8,8 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_w4a8.c \
+	h3_text_encoder.c h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -17,9 +17,38 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
+	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe
 
 all: h3 libh3.a
+
+# Host-only safetensors tools (no Metal frameworks).
+# -D_GNU_SOURCE: Linux needs pread/strdup; Darwin ignores harmlessly with -std=c11.
+h3_st_inventory: tools/h3_st_inventory.c h3_safetensors.c h3_w4a8.c \
+		h3_safetensors.h h3_w4a8.h h3.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_st_inventory.c h3_safetensors.c h3_w4a8.c
+
+h3_w4a8_probe: tools/h3_w4a8_probe.c h3_safetensors.c h3_w4a8.c h3_safetensors.h h3_w4a8.h h3.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_w4a8_probe.c h3_safetensors.c h3_w4a8.c
+
+# INT8 ConvRot DiT host loader (theme-follow secondary path; not W4A8).
+h3_dit_int8_probe: tools/h3_dit_int8_probe.c h3_safetensors.c h3_dit_int8.c \
+		h3_safetensors.h h3_dit_int8.h h3.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_dit_int8_probe.c \
+		h3_safetensors.c h3_dit_int8.c
+
+# P4: CPU W4A8 dequant + FP32 GEMM (+ optional --check-act-convrot).
+# Does not link Metal. CUDA probe is CMake-only (see docs/nvidia_build.md).
+h3_w4a8_matmul_probe: tools/h3_w4a8_matmul_probe.c h3_safetensors.c h3_w4a8.c \
+		h3_w4a8_dequant.c h3_safetensors.h h3_w4a8.h h3_w4a8_dequant.h h3.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_w4a8_matmul_probe.c \
+		h3_safetensors.c h3_w4a8.c h3_w4a8_dequant.c -lm
+
+# P4 step-3: multi-block smoke + CPU INT8 act/GEMM vs FP32 (no Metal).
+h3_w4a8_blocks_probe: tools/h3_w4a8_blocks_probe.c h3_safetensors.c h3_w4a8.c \
+		h3_w4a8_dequant.c h3_safetensors.h h3_w4a8.h h3_w4a8_dequant.h h3.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_w4a8_blocks_probe.c \
+		h3_safetensors.c h3_w4a8.c h3_w4a8_dequant.c -lm
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -211,5 +240,6 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
+		h3_w4a8_probe h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
 	h3_dit_bench h3_dit_bench_864 \
 	libh3.a *.o *.d tests/*.o tests/*.d

@@ -28,3 +28,10 @@ h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
 .DS_Store
+/out
+/models
+/input
+/scripts
+h3_*_probe
+h3_st_inventory
+tmp_*

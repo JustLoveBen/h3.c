@@ -809,3 +809,65 @@ at every size for A/B comparison.
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
 Qwen encoder, and decoders never have to coexist in unified memory.
+
+## NVIDIA / CUDA (experimental stub)
+
+Apple Silicon builds continue to use this Makefile. An early CUDA device-probe
+stub and the W4A8 quantization contract live under `docs/`:
+
+- [`docs/nvidia_quant_contract.md`](docs/nvidia_quant_contract.md) — frozen W4A8 target (not M5 int8)
+- [`docs/nvidia_build.md`](docs/nvidia_build.md) — `cmake -DH3_GPU_BACKEND=cuda`
+
+### CUDA F2VA (first-frame → video)
+
+Official CUDA bypass F2VA is `--first-frame IMG` (not G3-lite): jpeg STRETCH
+→ VAE encode → DiT COND rows + Qwen vision TE (`<Picture n>` + pads) →
+`forward_avc` with AdaLN visual-condition 0.999. Do **not** mix with
+`--init-latent` / `--init-first-frame` / `--lock-first-frame`.
+
+**CFG defaults differ:** T2VA theme path keeps **`--cfg 5`** (underwater turtle
+/ orange cat). Official `--first-frame` F2VA defaults to **`--cfg 1`**
+(CFG-distilled + image condition). On 8-step INT8, cfg=5 later frames collapse
+to a center hotspot even with VIDEO tags off. Pass `--cfg` to override.
+
+**CUDA INT8 exception (not Metal bit-match):** the official INT8 8-step
+quality path keeps Picture+vision span on **TEXT AdaLN**. Those rows are
+condition embeddings, not video latent. Metal tags them VIDEO@σ (`tag=0` on
+START+pads+END); doing that on CUDA INT8 8-step blows later frames into a
+center hotspot. `--dit-text-tags` restores Metal-like tagging for debug only.
+
+**VAE decode:** T2VA **quality knife** uses the fp16 Video VAE
+(`minimax_h3_video_vae_fp16.safetensors`) with default **256px tiles +
+deblock16** and F32 GEMM (no INT8 ConvRot, no F16-TC recast). INT8 VAE
+remains the speed decode. Do **not** set `H3_VAE_NO_SPATIAL_TILE=1` on
+the quality path. Encoder weights are always fp16 (`--vae-encode`).
+Photographic quality also needs the **gold recipe**: official prompt ids
+(57-token orange cat / 55-token underwater) and **`--cfg 1`** (H3 is
+CFG-distilled). `cfg=5` + the 20-token v4 prompt overexposes and turns fur
+into fingerprint strokes; fp16 decode of that hot latent does not fix it.
+See `out/verify_stage_s_hq2/`.
+
+Lite img2img (`--init-latent` + `--init-first-frame`) is **debug only**, not
+official F2VA or L2VA. `--lock-first-frame` pins t=0 (standing pose) and must not
+be used to pass the quality gate. Long prompts keep full token ids (CLI never
+silent-truncates).
+
+### CUDA L2VA (last-frame → video)
+
+Official CUDA bypass L2VA is `--last-frame IMG` (not G3-lite, not
+`--init-latent` written at t=T−1). Same encode / vision / `forward_avc` path as
+F2VA, with Metal last-frame geometry:
+
+- pixels: `H3_IMAGE_FIT_COVER` (not F2VA STRETCH)
+- `keyframes=[aligned_frame_count-1]`
+- RoPE `condition_time = text_seq + video_span_sum(latent_t) − 5/3` (end of
+  the video time axis)
+
+Default `--cfg 1` like F2VA (T2VA stays 5). Do **not** mix with `--first-frame`
+in this build (FL2VA is a later stage) or with lite flags. `--skip-dit
+--last-frame` measures the VAE encode→decode PSNR ceiling of the cover canvas.
+
+Stage F wiring gate uses `input/test_1_first_frame.jpeg` as the **last**
+frame (no separate last-frame still). That is enough to prove the ending
+aligns with the jpeg and the opening is **not** a copy of it. FL2VA (first +
+last, two different stills) is stage G.

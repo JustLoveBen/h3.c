@@ -1,6 +1,11 @@
 #include "h3_ffmpeg.h"
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -9,8 +14,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef SSIZE_MAX
+#define SSIZE_MAX ((ssize_t)(((size_t)-1) >> 1))
+#endif
 
 extern char **environ;
 
@@ -674,7 +684,7 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", (char *)path, NULL
+        "-shortest", "-movflags", "+faststart", (char *)path, NULL
     };
     posix_spawn_file_actions_t actions;
     int code = posix_spawn_file_actions_init(&actions);

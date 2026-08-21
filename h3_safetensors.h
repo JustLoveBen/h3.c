@@ -20,7 +20,9 @@ typedef enum {
     H3_DTYPE_F32,
     H3_DTYPE_I64,
     H3_DTYPE_U64,
-    H3_DTYPE_F64
+    H3_DTYPE_F64,
+    /* FP8 E4M3 (1 byte). Read-only mapping for W4A8 weight_s_rel / TE scales. */
+    H3_DTYPE_F8_E4M3
 } h3_dtype;
 
 typedef struct {
@@ -39,19 +41,49 @@ typedef struct {
     uint64_t header_size;
     h3_st_tensor *tensors;
     size_t tensor_count;
+    /* Raw JSON object text of __metadata__ when present (may be "{}"). */
+    char *metadata_json;
 } h3_st_header;
+
+/* Best-effort parse of Kijai / Comfy quantization markers from metadata. */
+typedef struct {
+    int has_metadata;
+    char format[64];
+    int group_size;          /* -1 if unknown */
+    int convrot;             /* 1 / 0 / -1 */
+    int convrot_groupsize;   /* -1 if unknown */
+} h3_st_quant_info;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size);
 void h3_st_free_header(h3_st_header *header);
 const h3_st_tensor *h3_st_find(const h3_st_header *header, const char *name);
 uint64_t h3_st_tensor_elements(const h3_st_tensor *tensor);
+uint64_t h3_st_tensor_nbytes(const h3_st_tensor *tensor);
 int h3_st_read_data(const h3_st_header *header, const h3_st_tensor *tensor,
                     void *data, size_t bytes, char *error, size_t error_size);
 size_t h3_dtype_size(h3_dtype dtype);
 const char *h3_dtype_name(h3_dtype dtype);
 
+/* Load named tensor as host F32 (accepts F32 / BF16 / F16). Caller frees. */
+float *h3_st_load_f32(const h3_st_header *header, const char *name,
+                      size_t *out_elements, h3_dtype *out_dtype, char *error,
+                      size_t error_size);
+
+/* Fill quant_info from header->metadata_json (and optional tensor-name hints). */
+void h3_st_quant_info_init(h3_st_quant_info *info);
+int h3_st_quant_info_from_header(const h3_st_header *header,
+                                 h3_st_quant_info *info);
+
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

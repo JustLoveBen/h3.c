@@ -1,9 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "h3_safetensors.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +199,7 @@ static h3_dtype h3_parse_dtype(const char *name) {
     if (!strcmp(name, "I64")) return H3_DTYPE_I64;
     if (!strcmp(name, "U64")) return H3_DTYPE_U64;
     if (!strcmp(name, "F64")) return H3_DTYPE_F64;
+    if (!strcmp(name, "F8_E4M3")) return H3_DTYPE_F8_E4M3;
     return H3_DTYPE_UNKNOWN;
 }
 
@@ -201,7 +207,8 @@ size_t h3_dtype_size(h3_dtype dtype) {
     switch (dtype) {
         case H3_DTYPE_BOOL:
         case H3_DTYPE_I8:
-        case H3_DTYPE_U8: return 1;
+        case H3_DTYPE_U8:
+        case H3_DTYPE_F8_E4M3: return 1;
         case H3_DTYPE_I16:
         case H3_DTYPE_U16:
         case H3_DTYPE_F16:
@@ -232,6 +239,7 @@ const char *h3_dtype_name(h3_dtype dtype) {
         case H3_DTYPE_I64: return "I64";
         case H3_DTYPE_U64: return "U64";
         case H3_DTYPE_F64: return "F64";
+        case H3_DTYPE_F8_E4M3: return "F8_E4M3";
         case H3_DTYPE_UNKNOWN: return "UNKNOWN";
     }
     return "UNKNOWN";
@@ -419,7 +427,18 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         }
         if (!strcmp(name, "__metadata__")) {
             free(name);
+            h3_json_ws(&cursor);
+            const char *meta_start = cursor.at;
             if (!h3_json_skip(&cursor)) goto fail;
+            size_t meta_len = (size_t)(cursor.at - meta_start);
+            free(header->metadata_json);
+            header->metadata_json = malloc(meta_len + 1);
+            if (!header->metadata_json) {
+                h3_json_fail(&cursor, "out of memory capturing metadata");
+                goto fail;
+            }
+            memcpy(header->metadata_json, meta_start, meta_len);
+            header->metadata_json[meta_len] = '\0';
         } else {
             h3_st_tensor tensor;
             memset(&tensor, 0, sizeof(tensor));
@@ -466,6 +485,7 @@ void h3_st_free_header(h3_st_header *header) {
     }
     free(header->tensors);
     free(header->path);
+    free(header->metadata_json);
     memset(header, 0, sizeof(*header));
 }
 
@@ -486,6 +506,162 @@ uint64_t h3_st_tensor_elements(const h3_st_tensor *tensor) {
         elements *= tensor->shape[dimension];
     }
     return elements;
+}
+
+uint64_t h3_st_tensor_nbytes(const h3_st_tensor *tensor) {
+    if (!tensor) return 0;
+    return tensor->data_end - tensor->data_begin;
+}
+
+void h3_st_quant_info_init(h3_st_quant_info *info) {
+    if (!info) return;
+    memset(info, 0, sizeof(*info));
+    info->group_size = -1;
+    info->convrot = -1;
+    info->convrot_groupsize = -1;
+}
+
+static const char *h3_json_find_key(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+    size_t key_len = strlen(key);
+    const char *at = json;
+    while ((at = strstr(at, key)) != NULL) {
+        int quoted = 0;
+        if (at > json && at[-1] == '"' && at[key_len] == '"') {
+            quoted = 1;
+        } else if (at > json + 1 && at[-2] == '\\' && at[-1] == '"' &&
+                   at[key_len] == '\\' && at[key_len + 1] == '"') {
+            /* Nested JSON stored as an escaped string value. */
+            quoted = 2;
+        }
+        if (quoted) {
+            const char *after = at + key_len + (quoted == 2 ? 2 : 1);
+            while (*after == ' ' || *after == '\t' || *after == '\n' ||
+                   *after == '\r') after++;
+            if (*after == ':') return after + 1;
+        }
+        at += key_len;
+    }
+    return NULL;
+}
+
+static int h3_json_read_string_value(const char *at, char *out, size_t out_size) {
+    if (!at || !out || !out_size) return 0;
+    while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') at++;
+    int escaped_quote = 0;
+    if (at[0] == '\\' && at[1] == '"') {
+        escaped_quote = 1;
+        at += 2;
+    } else if (*at == '"') {
+        at++;
+    } else {
+        return 0;
+    }
+    size_t length = 0;
+    while (*at) {
+        if (escaped_quote) {
+            if (at[0] == '\\' && at[1] == '"') break;
+        } else if (*at == '"') {
+            break;
+        }
+        if (*at == '\\' && at[1]) at++;
+        if (length + 1 >= out_size) return 0;
+        out[length++] = *at++;
+    }
+    if (!*at) return 0;
+    out[length] = '\0';
+    return 1;
+}
+
+static int h3_json_read_int_value(const char *at, int *out) {
+    if (!at || !out) return 0;
+    while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') at++;
+    if (*at < '0' || *at > '9') {
+        if (*at == 't' && !strncmp(at, "true", 4)) {
+            *out = 1;
+            return 1;
+        }
+        if (*at == 'f' && !strncmp(at, "false", 5)) {
+            *out = 0;
+            return 1;
+        }
+        return 0;
+    }
+    long value = 0;
+    while (*at >= '0' && *at <= '9') {
+        value = value * 10 + (*at - '0');
+        if (value > INT_MAX) return 0;
+        at++;
+    }
+    *out = (int)value;
+    return 1;
+}
+
+static void h3_st_quant_scan_blob(const char *blob, h3_st_quant_info *info) {
+    if (!blob || !info) return;
+    const char *format_at = h3_json_find_key(blob, "format");
+    if (!format_at) format_at = h3_json_find_key(blob, "quant_format");
+    if (format_at && !info->format[0]) {
+        h3_json_read_string_value(format_at, info->format, sizeof(info->format));
+    }
+    if (!info->format[0]) {
+        if (strstr(blob, "asym_w4a8_int8")) {
+            snprintf(info->format, sizeof(info->format), "asym_w4a8_int8");
+        } else if (strstr(blob, "nvfp4")) {
+            snprintf(info->format, sizeof(info->format), "nvfp4_awq_like");
+        }
+    }
+    const char *group_at = h3_json_find_key(blob, "group_size");
+    if (group_at && info->group_size < 0) {
+        h3_json_read_int_value(group_at, &info->group_size);
+    }
+    const char *convrot_at = h3_json_find_key(blob, "convrot");
+    if (convrot_at && info->convrot < 0) {
+        h3_json_read_int_value(convrot_at, &info->convrot);
+    }
+    const char *cgs_at = h3_json_find_key(blob, "convrot_groupsize");
+    if (cgs_at && info->convrot_groupsize < 0) {
+        h3_json_read_int_value(cgs_at, &info->convrot_groupsize);
+    }
+}
+
+int h3_st_quant_info_from_header(const h3_st_header *header,
+                                 h3_st_quant_info *info) {
+    if (!info) return 0;
+    h3_st_quant_info_init(info);
+    if (!header) return 0;
+    if (header->metadata_json && header->metadata_json[0]) {
+        info->has_metadata = 1;
+        h3_st_quant_scan_blob(header->metadata_json, info);
+    }
+    /* Tensor-name hints when metadata is missing or incomplete. */
+    int has_codebook = 0;
+    int has_s_rel = 0;
+    int has_s_channel = 0;
+    int has_weight_scale = 0;
+    int has_u8_weight = 0;
+    for (size_t index = 0; index < header->tensor_count; index++) {
+        const char *name = header->tensors[index].name;
+        if (!name) continue;
+        if (strstr(name, "weight_codebook")) has_codebook = 1;
+        if (strstr(name, "weight_s_rel")) has_s_rel = 1;
+        if (strstr(name, "weight_s_channel")) has_s_channel = 1;
+        if (strstr(name, "weight_scale")) has_weight_scale = 1;
+        if (header->tensors[index].dtype == H3_DTYPE_U8 &&
+            strstr(name, ".weight") && !strstr(name, "weight_")) {
+            has_u8_weight = 1;
+        }
+    }
+    if (!info->format[0]) {
+        if (has_codebook && has_s_rel && has_s_channel) {
+            snprintf(info->format, sizeof(info->format), "asym_w4a8_int8");
+        } else if (has_u8_weight && has_weight_scale) {
+            snprintf(info->format, sizeof(info->format), "nvfp4_awq_like");
+        } else if (has_weight_scale) {
+            snprintf(info->format, sizeof(info->format), "int8_scale_convrot_like");
+        }
+    }
+    return info->format[0] != '\0' || info->has_metadata;
 }
 
 int h3_st_read_data(const h3_st_header *header, const h3_st_tensor *tensor,
@@ -581,4 +757,115 @@ int h3_st_inventory_dir(const char *directory, h3_component_info *info,
         return 0;
     }
     return 1;
+}
+
+static float h3_st_bf16_bits_to_f32(uint16_t bits) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.u = ((uint32_t)bits) << 16;
+    return v.f;
+}
+
+static float h3_st_f16_bits_to_f32(uint16_t bits) {
+    const uint32_t sign = (uint32_t)(bits & 0x8000u) << 16;
+    const uint32_t exp = (bits >> 10) & 0x1fu;
+    const uint32_t mant = bits & 0x3ffu;
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    if (exp == 0) {
+        if (mant == 0) {
+            v.u = sign;
+            return v.f;
+        }
+        /* subnormal — match h3_w4a8_load_f32 */
+        float m = (float)mant / 1024.0f;
+        float val = ldexpf(m, -14);
+        v.f = val;
+        if (sign) v.f = -v.f;
+        return v.f;
+    }
+    if (exp == 31) {
+        v.u = sign | 0x7f800000u | (mant << 13);
+        return v.f;
+    }
+    v.u = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    return v.f;
+}
+
+float *h3_st_load_f32(const h3_st_header *header, const char *name,
+                      size_t *out_elements, h3_dtype *out_dtype, char *error,
+                      size_t error_size) {
+    const h3_st_tensor *tensor;
+    size_t elements;
+    float *out = NULL;
+    size_t i;
+
+    if (out_elements) *out_elements = 0;
+    if (out_dtype) *out_dtype = H3_DTYPE_UNKNOWN;
+    if (!header || !name) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid h3_st_load_f32 args");
+        return NULL;
+    }
+    tensor = h3_st_find(header, name);
+    if (!tensor) {
+        if (error && error_size)
+            snprintf(error, error_size, "missing tensor: %s", name);
+        return NULL;
+    }
+    if (tensor->dtype != H3_DTYPE_F32 && tensor->dtype != H3_DTYPE_BF16 &&
+        tensor->dtype != H3_DTYPE_F16) {
+        if (error && error_size)
+            snprintf(error, error_size, "%s dtype %s not convertible to F32",
+                     name, h3_dtype_name(tensor->dtype));
+        return NULL;
+    }
+    elements = (size_t)h3_st_tensor_elements(tensor);
+    if (elements == 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "%s is empty", name);
+        return NULL;
+    }
+    out = (float *)malloc(elements * sizeof(float));
+    if (!out) {
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory loading %s", name);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_F32) {
+        if (!h3_st_read_data(header, tensor, out, elements * sizeof(float),
+                             error, error_size)) {
+            free(out);
+            return NULL;
+        }
+    } else {
+        uint16_t *raw = (uint16_t *)malloc(elements * sizeof(uint16_t));
+        if (!raw) {
+            if (error && error_size)
+                snprintf(error, error_size, "out of memory reading %s", name);
+            free(out);
+            return NULL;
+        }
+        if (!h3_st_read_data(header, tensor, raw, elements * sizeof(uint16_t),
+                             error, error_size)) {
+            free(raw);
+            free(out);
+            return NULL;
+        }
+        if (tensor->dtype == H3_DTYPE_BF16) {
+            for (i = 0; i < elements; i++)
+                out[i] = h3_st_bf16_bits_to_f32(raw[i]);
+        } else {
+            for (i = 0; i < elements; i++)
+                out[i] = h3_st_f16_bits_to_f32(raw[i]);
+        }
+        free(raw);
+    }
+    if (out_elements) *out_elements = elements;
+    if (out_dtype) *out_dtype = tensor->dtype;
+    return out;
 }
