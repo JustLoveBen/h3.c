@@ -2,6 +2,7 @@
 #define H3_DIT_W4A8_H
 
 #include "h3_gpu_cuda.h"
+#include "h3_lora.h"
 #include "h3_w4a8.h"
 #include "h3_w4a8_cache.h"
 #include "h3_w4a8_dequant.h"
@@ -28,8 +29,9 @@ extern "C" {
  * H3_DIT_W4A8_FORCE_HOST_BLOCK=1 restores the per-op H2D/D2H host staging path.
  * End-to-end forward keeps patch→layers→final activations on device by default
  * (H3_DIT_W4A8_HOST_FWD=1 restores host hidden staging between stages).
- * SDPA backend: H3_CUDA_SDPA_BACKEND=auto|flash|tc|cudnn|sage2
- *   (default auto→flash; production timing uses cudnn; sage2 is opt-in).
+ * SDPA backend: H3_CUDA_SDPA_BACKEND=auto|cudnn|sage3|sol_cute|…
+ *   (auto→cudnn Tier-0; sage3/sol_cute = Tier-1 product accel; sage2/sol
+ *    forbidden as product). See h3_sdpa.h.
  * Optional token window: H3_DIT_W4A8_ATTN_WINDOW=W (0=global; quality risk).
  * Distance attention (YCNodes Gaussian RF, video span only):
  *   H3_DIT_DIST_ATTN=1 (default off). H3_DIT_DIST_SCALE=15 H3_DIT_DIST_TEMPORAL=3
@@ -217,9 +219,46 @@ void h3_dit_w4a8_set_denoise_step(h3_dit_w4a8 *ctx, int step);
 void h3_dit_w4a8_set_text_mod_tags(h3_dit_w4a8 *ctx, const uint8_t *tags,
                                    size_t n);
 
+/* Borrowed LoRA set (NULL = gold path, zero extra kernels). Uploads A/B to GPU. */
+int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
+                         size_t error_size);
+
+/* Ulysses SP comm vtable. Implemented by the caller on top of
+ * h3_ulysses_comm so this module stays free of NCCL symbols (links fine
+ * against the stub). cfg is the caller's h3_ulysses_cfg with an inited comm.
+ * a2a_* operate on the buffers previously bound per rank (F32 payload). */
+typedef struct h3_dit_w4a8_sp_comm {
+    void *cfg;
+    int (*bind)(void *cfg, int rank, const void *d_in, void *d_out, char *err,
+                size_t err_size);
+    int (*set_compute)(void *cfg, int rank, void *stream, char *err,
+                       size_t err_size);
+    int (*a2a_qkv)(void *cfg, size_t seq_local, size_t heads, size_t head_dim,
+                   char *err, size_t err_size);
+    int (*a2a_attn_out)(void *cfg, size_t seq_local, size_t heads,
+                        size_t head_dim, char *err, size_t err_size);
+} h3_dit_w4a8_sp_comm;
+
+/* Attach Ulysses rank contexts. rank_ctx[0] must be ctx itself; each rank
+ * holds a full INT8 ctx on its own CUDA device (devices[]). u<=1 detaches
+ * (today's single-GPU path, zero extra A2A). While attached,
+ * h3_dit_w4a8_layers_forward_f32 routes to the SP loop. Device-resident
+ * I/O is allowed (scatter/gather from io_d_act); H3_DIT_W4A8_HOST_FWD=1
+ * restores host hidden staging.
+ * Insertion point per block: QKV GEMM + LoRA residual → A2A → RoPE+SDPA on
+ * the first S_real rows only with H/U heads (zero-pad K rows must never
+ * enter softmax) → pad attn rows zeroed → reverse A2A → out-proj/MLP. */
+int h3_dit_w4a8_set_ulysses(h3_dit_w4a8 *ctx, h3_dit_w4a8 *const *rank_ctx,
+                            const int *devices, int u,
+                            const h3_dit_w4a8_sp_comm *comm, char *error,
+                            size_t error_size);
+
 int h3_dit_w4a8_prefetch(h3_dit_w4a8 *ctx, unsigned first_block,
                          unsigned n_blocks, double *elapsed_ms, char *error,
                          size_t error_size);
+int h3_dit_w4a8_stage_host(h3_dit_w4a8 *ctx, unsigned first_block,
+                           unsigned n_blocks, double *elapsed_ms, char *error,
+                           size_t error_size);
 int h3_dit_w4a8_get_cache_stats(h3_dit_w4a8 *ctx, h3_w4a8_cache_stats *stats,
                                 char *error, size_t error_size);
 

@@ -38,10 +38,23 @@ int h3_cuda_pregrow_dit_scratch(h3_cuda *cuda, size_t seq, size_t hidden,
                                 size_t heads, size_t head_dim, size_t ffn,
                                 char *error, size_t error_size);
 
+/* Upload ConvRot Hadamard on this handle (pageable H2D). Call from one
+ * thread per device before U>1 workers enqueue GEMM — two threads sharing
+ * the runtime bounce buffer IMA rank 1. U=1 hits this lazily in GEMM. */
+int h3_cuda_pregrow_hadamard(h3_cuda *cuda, int gs, char *error,
+                             size_t error_size);
+
 /* 1 if GEMM acc + SDPA scratch are already allocated (WS-first pregrow).
  * Refit must not subtract another 8GiB from remaining free — that is what
  * clamped cafe_p2 to window=19 after pregrow left 15GiB free. */
 int h3_cuda_dit_scratch_pregrown(const h3_cuda *cuda);
+
+/* Ulysses only: bind this handle's device, then drop scratch that landed
+ * on another GPU (quiet GEMM skips SetDevice and would IMA rank 1). */
+int h3_cuda_bind_device(h3_cuda *cuda, char *error, size_t error_size);
+int h3_cuda_dit_scratch_rehome(h3_cuda *cuda, char *error, size_t error_size);
+int h3_cuda_dit_scratch_check(h3_cuda *cuda, char *error, size_t error_size);
+int h3_cuda_recreate_blas(h3_cuda *cuda, char *error, size_t error_size);
 
 /* JIT the fused cuDNN SDPA graph for this logical seq (pads internally).
  * Safe to call while TE mmap is opening: keeps a separate plan slot so TE's
@@ -50,7 +63,8 @@ int h3_cuda_sdpa_prebuild(h3_cuda *cuda, size_t seq, size_t heads,
                           size_t head_dim, float scale, int causal,
                           char *error, size_t error_size);
 
-/* cuDNN frontend JIT needs libnvrtc.so.12. Preloaded at create(); NULL if missing. */
+/* cuDNN frontend JIT needs NVRTC (libnvrtc.so.13 on CUDA 13, .so.12 on 12.x).
+ * Preloaded at create(); NULL if missing. */
 const char *h3_cuda_nvrtc_path(void);
 int h3_cuda_nvrtc_ok(void);
 
@@ -69,6 +83,16 @@ int h3_cuda_gemm_f32(h3_cuda *cuda, const float *x, const float *weight,
                      size_t m, size_t n, size_t k, float *y, double *gemm_ms,
                      char *error, size_t error_size);
 
+/* Host NHWC Conv3d + bias. Weight is PyTorch [Cout,Cin,Kd,Kh,Kw].
+ * Input is already padded (causal time / reflect spatial). Output is
+ * [Od,Oh,Ow,Cout] with Od=(D-Kd)/st+1. Used by host VAE encode. */
+int h3_cuda_conv3d_nhwc_bias_f32(
+    h3_cuda *cuda, const float *input, uint32_t depth, uint32_t height,
+    uint32_t width, const float *weight, const float *bias, uint32_t cin,
+    uint32_t cout, uint32_t kd, uint32_t kh, uint32_t kw, uint32_t stride_t,
+    uint32_t stride_h, uint32_t stride_w, float *output, char *error,
+    size_t error_size);
+
 /* Like h3_cuda_gemm_f32 but W already on device (no weight H2D). */
 int h3_cuda_gemm_f32_dw(h3_cuda *cuda, const float *x, const float *d_weight,
                         size_t m, size_t n, size_t k, float *y, double *gemm_ms,
@@ -78,6 +102,12 @@ int h3_cuda_gemm_f32_dw(h3_cuda *cuda, const float *x, const float *d_weight,
 int h3_cuda_gemm_f32_dd(h3_cuda *cuda, const float *d_x, const float *d_weight,
                         size_t m, size_t n, size_t k, float *d_y,
                         double *gemm_ms, char *error, size_t error_size);
+
+/* y = alpha * (x @ W^T) + beta * y. LoRA second GEMM uses alpha=scale, beta=1. */
+int h3_cuda_gemm_f32_dd_ex(h3_cuda *cuda, const float *d_x,
+                           const float *d_weight, size_t m, size_t n, size_t k,
+                           float *d_y, float alpha, float beta, double *gemm_ms,
+                           char *error, size_t error_size);
 
 /* Device act ConvRot: d_y[m,k] = d_x @ H per group (cuBLAS strided).
  * d_x and d_y must not alias. */
@@ -116,6 +146,12 @@ int h3_cuda_graph_capture(const h3_cuda *cuda);
 /* Quiet: skip per-op EventSynchronize but allow buffer growth. */
 void h3_cuda_set_quiet(h3_cuda *cuda, int enabled);
 int h3_cuda_quiet(const h3_cuda *cuda);
+
+/* Borrowed compute stream for device-resident GEMM/SDPA. NULL restores
+ * the legacy default stream (U=1). Also binds cuBLAS / cuDNN. */
+int h3_cuda_set_op_stream(h3_cuda *cuda, void *stream, char *error,
+                          size_t error_size);
+void *h3_cuda_op_stream(const h3_cuda *cuda);
 
 /* Side streams (NonBlocking). index 0..3; NULL if unavailable.
  * Used to overlap weight prefetch / aux H2D with compute. */
@@ -206,6 +242,10 @@ void h3_cuda_host_free(void *p, int pinned);
  * host staging. Safe to call multiple times. */
 int h3_cuda_w4a8_weight_ensure_ready(h3_cuda_w4a8_weight *weight, char *error,
                                      size_t error_size);
+
+/* 1 if d_w_i8 / d_s_channel live on want_dev. Ulysses rank checks. */
+int h3_cuda_w4a8_weight_on_device(const h3_cuda_w4a8_weight *weight,
+                                  int want_dev, char *error, size_t error_size);
 
 /* Synchronize the H2D/unpack side stream only (does not sync default). */
 int h3_cuda_copy_stream_synchronize(h3_cuda *cuda, char *error,
@@ -324,11 +364,26 @@ int h3_cuda_sdpa_gqa_causal_f16_dev(h3_cuda *cuda, const float *d_query,
                                     size_t error_size);
 
 /* SDPA backend preference via env H3_CUDA_SDPA_BACKEND=
- *   auto|flash|tc|cudnn|sage2|sol
- *   (default auto → flash; cudnn needs cuDNN9 frontend; sage2/sol = opt-in). */
+ *   auto|cudnn|sage3|sol_cute|flash|tc|sage2|sol
+ *   Tier-0: auto→cudnn (never auto-picks lossy backends).
+ *   Tier-1 product accel: sage3, sol_cute (first-class; see h3_sdpa.h).
+ *   Forbidden as product: sage2 (ref), sol (nested-loop fake). */
 const char *h3_cuda_sdpa_backend_name(void);
+/* Log resolved backend + device caps once (generate / create). */
+void h3_cuda_sdpa_log_selection(int device_index);
 /* Last Sol-Attn exact-tile fraction (query×block), or -1 if unused. */
 double h3_cuda_sol_last_exact_frac(void);
+/* Official SM89 CuTe Sol-Attn opt-in: reset layer clock at each denoise step. */
+void h3_cuda_sol_cute_set_step(int step);
+/* Print cute_sm89 hits / dense_skip / fallback counts (stderr). */
+void h3_cuda_sol_cute_dump_stats(void);
+/* Official SageAttention3 (Blackwell FP4) plugin stats. */
+void h3_cuda_sage3_dump_stats(void);
+/* Opt-in DiT breakdown: H3_SOL_PROFILE=1. Extra EventSynchronize; not a
+ * speedup path. Per-step line + totals on dump. */
+int h3_cuda_sol_profile_enabled(void);
+void h3_cuda_sol_profile_add_unpack(double ms);
+void h3_cuda_sol_profile_finish_step(int step, double step_ms);
 
 /* Device-side DiT elementwise (host F32 in/out). Used by W4A8 bypass.
  * modulation is [mod_rows, slots, width]; row_map[i] selects modality row. */

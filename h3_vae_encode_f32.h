@@ -22,6 +22,10 @@ int h3_vae_encode_f32(
     char *error, size_t error_size);
 void h3_vae_latent_f32_free(h3_vae_latent_f32 *latent);
 
+/* Bind generate's h3_cuda so encode reuses the same context.
+ * Pass NULL to drop the binding (does not free an owned lazy ctx). */
+void h3_vae_encode_f32_bind_cuda(void *cuda);
+
 /* 与 Metal h3_dit_patchify_video 同一循环顺序：t, h+=2, w+=2, c, dh, dw */
 int h3_vae_patchify_video_96(const float *latent_24thw, int time,
                              int height, int width, float *rows_seq96,

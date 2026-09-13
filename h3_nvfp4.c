@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "h3_nvfp4.h"
 #include "h3_nvfp4_cuda.h"
 
@@ -12,6 +15,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef MAP_POPULATE
+#ifdef __linux__
+#define MAP_POPULATE 0x8000
+#else
+#define MAP_POPULATE 0
+#endif
+#endif
 
 static void fail(char *error, size_t error_size, const char *msg) {
     if (!error || !error_size) return;
@@ -168,16 +178,31 @@ int h3_nvfp4_store_open(const char *path, h3_nvfp4_store *store, char *error,
     snprintf(store->path, sizeof(store->path), "%s", path);
     if (!h3_st_read_header(path, &store->header, error, error_size)) return 0;
     h3_st_quant_info_from_header(&store->header, &store->quant);
-    /* Best-effort mmap: speeds TE linear/embed reads; falls back to pread. */
+    /* Best-effort mmap: speeds TE linear/embed reads; falls back to pread.
+     * MAP_POPULATE (Linux) faults the ~15GiB TE file sequentially at open so
+     * later packed H2D is not page-fault bound / thrashing to 50s+. */
     store->map_fd = open(path, O_RDONLY);
     if (store->map_fd >= 0 && fstat(store->map_fd, &st) == 0 && st.st_size > 0) {
-        void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
+        int map_flags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+        {
+            const char *np = getenv("H3_TE_MMAP_POPULATE");
+            if (!(np && np[0] == '0')) map_flags |= MAP_POPULATE;
+        }
+#endif
+#ifdef POSIX_FADV_WILLNEED
+        (void)posix_fadvise(store->map_fd, 0, 0, POSIX_FADV_WILLNEED);
+#endif
+        void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, map_flags,
                          store->map_fd, 0);
         if (map != MAP_FAILED) {
             store->map = (const uint8_t *)map;
             store->map_len = (size_t)st.st_size;
 #ifdef MADV_SEQUENTIAL
             (void)madvise((void *)store->map, store->map_len, MADV_SEQUENTIAL);
+#endif
+#ifdef MADV_WILLNEED
+            (void)madvise((void *)store->map, store->map_len, MADV_WILLNEED);
 #endif
         } else {
             close(store->map_fd);
@@ -996,7 +1021,10 @@ int h3_nvfp4_linear_f32(const h3_nvfp4_store *store, const h3_nvfp4_linear *lin,
     int ok = 0;
 
     if (!store || !lin || !x || !y || m == 0) {
-        fail(error, error_size, "invalid nvfp4_linear args");
+        snprintf(error, error_size,
+                 "invalid nvfp4_linear args store=%p lin=%p x=%p y=%p m=%zu",
+                 (const void *)store, (const void *)lin, (const void *)x,
+                 (const void *)y, m);
         return 0;
     }
     /* CUDA backend applies AWQ pre_quant on-device (same math, no host
@@ -1191,8 +1219,13 @@ static float *nvfp4_encode_layers_impl(
         return hidden;
     }
 
-    /* Device-resident text TE is the default (H3_NVFP4_HOST_ACT=1 reverts). */
-    if (!use_mm && h3_nvfp4_cuda_enabled()) {
+    /* Device-resident text TE is the default (H3_NVFP4_HOST_ACT=1 reverts).
+     * Vision is already memcpy'd into `hidden` (nvfp4_inject_vision). The
+     * host loop below also applies Qwen mRoPE + deepstack on layers 0–2;
+     * CUDA act uses 1D RoPE. F2VA/Ref2VA still have VAE COND in DiT — the
+     * previous `!use_mm` gate fell through to per-linear CUDA GEMM and
+     * died with a stale "invalid nvfp4_linear args" on 1401-token F2VA. */
+    if (h3_nvfp4_cuda_enabled()) {
         const char *host_act = getenv("H3_NVFP4_HOST_ACT");
         const char *dev_act = getenv("H3_NVFP4_DEV_ACT");
         int want_dev = !(host_act && host_act[0] == '1') &&
@@ -1202,6 +1235,12 @@ static float *nvfp4_encode_layers_impl(
             if (h3_nvfp4_cuda_encode_text_layers(store, hidden, tokens, n_layers,
                                                  error, error_size)) {
                 t1 = clock();
+                if (use_mm)
+                    fprintf(stderr,
+                            "te_mm: cuda_dev_act=1 tokens=%zu "
+                            "(vision injected; 1D RoPE not Qwen mRoPE/"
+                            "deepstack host-loop)\n",
+                            tokens);
                 if (stats) {
                     stats->n_layers = n_layers;
                     stats->layers_ms = nvfp4_elapsed_ms(t0, t1);
@@ -1259,8 +1298,8 @@ static float *nvfp4_encode_layers_impl(
     {
         struct timespec ts;
         double wall0;
-        const char *v = getenv("H3_NVFP4_VERBOSE");
-        int verbose = v && v[0] == '1';
+        const char *verbose_env = getenv("H3_NVFP4_VERBOSE");
+        int verbose = verbose_env && verbose_env[0] == '1';
         clock_gettime(CLOCK_MONOTONIC, &ts);
         wall0 = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
         if (verbose) {
@@ -1281,8 +1320,8 @@ static float *nvfp4_encode_layers_impl(
         char base[192];
         h3_nvfp4_linear lin;
         struct timespec ts0, ts1;
-        const char *v = getenv("H3_NVFP4_VERBOSE");
-        int verbose = v && v[0] == '1';
+        const char *verbose_env = getenv("H3_NVFP4_VERBOSE");
+        int verbose = verbose_env && verbose_env[0] == '1';
         clock_gettime(CLOCK_MONOTONIC, &ts0);
         if (verbose) {
             fprintf(stderr, "te_layer_begin %u/%u tokens=%zu\n", layer + 1,

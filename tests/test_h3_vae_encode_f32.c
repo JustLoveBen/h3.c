@@ -8,7 +8,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+/* h3_gpu_cuda.a pulls ConvRot helpers we do not exercise. */
+float *h3_w4a8_hadamard_normalized(int size, char *error, size_t error_size) {
+    (void)size;
+    if (error && error_size) snprintf(error, error_size, "hadamard stub");
+    return NULL;
+}
+float *h3_w4a8_hadamard_sylvester_normalized(int size, char *error,
+                                             size_t error_size) {
+    (void)size;
+    if (error && error_size) snprintf(error, error_size, "hadamard stub");
+    return NULL;
+}
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+static double test_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 #define LATENT_CH 24
 #define PATCH 96
@@ -137,7 +161,8 @@ static int load_jpeg_rgb01(const char *jpeg, int height, int width,
              "-pix_fmt rgb24 \"%s\"",
              jpeg, width, height, tmp);
     if (system(cmd) != 0) {
-        snprintf(err, es, "ffmpeg failed converting jpeg to 256x256 rgb");
+        snprintf(err, es, "ffmpeg failed converting jpeg to %dx%d rgb", width,
+                 height);
         unlink(tmp);
         return 0;
     }
@@ -164,8 +189,12 @@ static int load_jpeg_rgb01(const char *jpeg, int height, int width,
 
 static void test_encode_tile(const char *vae_path, const char *jpeg_path,
                              const char *ref_path, const char *dump_latent,
-                             const char *dump_rows) {
-    const int frames = 1, height = 256, width = 256;
+                             const char *dump_rows, int height, int width) {
+    const int frames = 1;
+    if (height < 32 || width < 32 || (height % 16) || (width % 16)) {
+        fail_msg("encode height/width must be multiples of 16 and >=32");
+        return;
+    }
     const int want_t = (frames + 3) / 4;
     const int want_h = height / 16;
     const int want_w = width / 16;
@@ -178,7 +207,7 @@ static void test_encode_tile(const char *vae_path, const char *jpeg_path,
     h3_vae_latent_f32 lat = {0};
     char error[512];
     size_t i;
-    double max_abs = 0.0, mean = 0.0, sq = 0.0;
+    double max_abs = 0.0, mean = 0.0, sq = 0.0, t0;
     if (!rgb || !rows) {
         fail_msg("OOM tile rgb/rows");
         free(rgb);
@@ -194,11 +223,12 @@ static void test_encode_tile(const char *vae_path, const char *jpeg_path,
             free(rows);
             return;
         }
-        puts("encode input: jpeg resized 256x256");
+        printf("encode input: jpeg resized %dx%d\n", width, height);
     } else {
         fill_tile_rgb(rgb, frames, height, width);
-        puts("encode input: synthetic 256x256");
+        printf("encode input: synthetic %dx%d\n", width, height);
     }
+    t0 = test_now_ms();
     if (!h3_vae_encode_f32(vae_path, rgb, frames, height, width, &lat, error,
                            sizeof(error))) {
         char buf[640];
@@ -233,8 +263,23 @@ static void test_encode_tile(const char *vae_path, const char *jpeg_path,
     }
     mean /= (double)lat_n;
     sq = sqrt(sq / (double)lat_n - mean * mean);
-    printf("encode tile 256: shape [24,%d,%d,%d] mean=%.5g std=%.5g\n",
-           lat.time, lat.height, lat.width, mean, sq);
+    {
+        uint64_t cs = 1469598103934665603ull;
+        for (i = 0; i < lat_n; i++) {
+            uint32_t bits;
+            memcpy(&bits, &lat.values[i], sizeof(bits));
+            cs ^= (uint64_t)bits;
+            cs *= 1099511628211ull;
+        }
+        printf("encode tile: shape [24,%d,%d,%d] mean=%.5g std=%.5g "
+               "wall_ms=%.1f host=%s checksum=0x%016llx\n",
+               lat.time, lat.height, lat.width, mean, sq, test_now_ms() - t0,
+               (getenv("H3_VAE_ENCODE_HOST") &&
+                getenv("H3_VAE_ENCODE_HOST")[0] == '1')
+                   ? "1"
+                   : "0",
+               (unsigned long long)cs);
+    }
     if (!h3_vae_patchify_video_96(lat.values, lat.time, lat.height, lat.width,
                                   rows, row_n)) {
         fail_msg("patchify of encoded latent failed");
@@ -278,20 +323,21 @@ static void test_encode_tile(const char *vae_path, const char *jpeg_path,
     h3_vae_latent_f32_free(&lat);
     free(rgb);
     free(rows);
-    if (!g_fail) puts("ok: encode 256 tile + patchify 96-d rows");
+    if (!g_fail)
+        printf("ok: encode %dx%d + patchify 96-d rows\n", width, height);
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--vae FILE] [--jpeg FILE] [--ref-latent FILE] "
-            "[--dump-latent FILE] [--dump-rows FILE]\n",
+            "[--dump-latent FILE] [--dump-rows FILE] [--width N] [--height N]\n",
             argv0);
 }
 
 int main(int argc, char **argv) {
     const char *vae = NULL, *jpeg = NULL, *ref = NULL, *dump_lat = NULL,
                *dump_rows = NULL;
-    int i;
+    int i, height = 256, width = 256;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--vae") && i + 1 < argc)
             vae = argv[++i];
@@ -303,6 +349,10 @@ int main(int argc, char **argv) {
             dump_lat = argv[++i];
         else if (!strcmp(argv[i], "--dump-rows") && i + 1 < argc)
             dump_rows = argv[++i];
+        else if (!strcmp(argv[i], "--width") && i + 1 < argc)
+            width = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--height") && i + 1 < argc)
+            height = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -314,7 +364,7 @@ int main(int argc, char **argv) {
     test_patchify_order();
     test_augment_formula();
     if (vae)
-        test_encode_tile(vae, jpeg, ref, dump_lat, dump_rows);
+        test_encode_tile(vae, jpeg, ref, dump_lat, dump_rows, height, width);
     else
         puts("skip: encode tile (pass --vae to run)");
     return g_fail ? 1 : 0;

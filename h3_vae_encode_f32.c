@@ -1,5 +1,6 @@
 #include "h3_vae_encode_f32.h"
 
+#include "h3_gpu_cuda.h"
 #include "h3_safetensors.h"
 
 #include <math.h>
@@ -8,6 +9,55 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+static double encode_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static h3_cuda *g_enc_cuda;
+static int g_enc_cuda_owned;
+static int g_enc_cuda_logged;
+static int g_enc_cuda_fail_logged;
+
+void h3_vae_encode_f32_bind_cuda(void *cuda) {
+    if (g_enc_cuda_owned && g_enc_cuda && g_enc_cuda != (h3_cuda *)cuda)
+        h3_cuda_free(g_enc_cuda);
+    g_enc_cuda = (h3_cuda *)cuda;
+    g_enc_cuda_owned = 0;
+    g_enc_cuda_logged = 0;
+    g_enc_cuda_fail_logged = 0;
+}
+
+static int encode_want_host(void) {
+    const char *e = getenv("H3_VAE_ENCODE_HOST");
+    return e && e[0] == '1';
+}
+
+static h3_cuda *encode_cuda(void) {
+    char err[256];
+    if (encode_want_host()) return NULL;
+    if (g_enc_cuda) return g_enc_cuda;
+    err[0] = '\0';
+    g_enc_cuda = h3_cuda_create(0, err, sizeof(err));
+    if (!g_enc_cuda) {
+        if (!g_enc_cuda_fail_logged) {
+            fprintf(stderr, "vae_encode: cuda create failed (%s); host conv\n",
+                    err[0] ? err : "unknown");
+            fflush(stderr);
+            g_enc_cuda_fail_logged = 1;
+        }
+        return NULL;
+    }
+    g_enc_cuda_owned = 1;
+    return g_enc_cuda;
+}
 
 enum {
     RGB_CHANNELS = 3,
@@ -416,7 +466,30 @@ static int conv3d_nhwc(const float *input, uint32_t depth, uint32_t height,
     uint32_t oh = (height - kh) / conv->stride_h + 1;
     uint32_t ow = (width - kw) / conv->stride_w + 1;
     int ot, oy, ox, oc;
+    h3_cuda *cuda;
     if (depth < kd || height < kh || width < kw) return 0;
+    cuda = encode_cuda();
+    if (cuda && conv->weight && conv->bias) {
+        char err[256];
+        err[0] = '\0';
+        if (h3_cuda_conv3d_nhwc_bias_f32(
+                cuda, input, depth, height, width, conv->weight, conv->bias,
+                cin, cout, kd, kh, kw, conv->stride_t, conv->stride_h,
+                conv->stride_w, output, err, sizeof(err))) {
+            if (!g_enc_cuda_logged) {
+                fprintf(stderr, "vae_encode: backend=cuda_conv3d\n");
+                fflush(stderr);
+                g_enc_cuda_logged = 1;
+            }
+            return 1;
+        }
+        if (!g_enc_cuda_fail_logged) {
+            fprintf(stderr, "vae_encode: cuda_conv3d failed (%s); host conv\n",
+                    err[0] ? err : "unknown");
+            fflush(stderr);
+            g_enc_cuda_fail_logged = 1;
+        }
+    }
     if (kd == 1 && kh == 1 && kw == 1 && conv->stride_t == 1 &&
         conv->stride_h == 1 && conv->stride_w == 1) {
         int spatial = (int)depth * (int)height * (int)width;
@@ -900,16 +973,50 @@ static int stitch_latents(float **tiles, int latent_time,
     return 1;
 }
 
+static encoder_context g_enc_ctx;
+static char g_enc_path[768];
+static int g_enc_ready;
+
+static int encoder_cached(const char *path, encoder_context **out,
+                          char *error, size_t error_size) {
+    h3_st_header header;
+    double t0;
+    if (!path || !out) return 0;
+    if (g_enc_ready && strcmp(g_enc_path, path) == 0) {
+        *out = &g_enc_ctx;
+        return 1;
+    }
+    if (g_enc_ready) {
+        cleanup_encoder(&g_enc_ctx);
+        g_enc_ready = 0;
+        g_enc_path[0] = '\0';
+    }
+    memset(&header, 0, sizeof(header));
+    t0 = encode_now_ms();
+    if (!h3_st_read_header(path, &header, error, error_size) ||
+        !load_weights(&g_enc_ctx, &header, error, error_size)) {
+        cleanup_encoder(&g_enc_ctx);
+        h3_st_free_header(&header);
+        return 0;
+    }
+    h3_st_free_header(&header);
+    snprintf(g_enc_path, sizeof(g_enc_path), "%s", path);
+    g_enc_ready = 1;
+    *out = &g_enc_ctx;
+    fprintf(stderr, "vae_encode: loaded encoder weights ms=%.1f\n",
+            encode_now_ms() - t0);
+    fflush(stderr);
+    return 1;
+}
+
 int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
                       int frames, int height, int width,
                       h3_vae_latent_f32 *out, char *error, size_t error_size) {
-    h3_st_header header;
-    encoder_context encoder;
+    encoder_context *encoder = NULL;
     tile_axis y_axis, x_axis;
     float **tiles = NULL;
     int ok, tile_count, latent_time = 0, y, x, completed;
-    memset(&header, 0, sizeof(header));
-    memset(&encoder, 0, sizeof(encoder));
+    double t_all;
     memset(&y_axis, 0, sizeof(y_axis));
     memset(&x_axis, 0, sizeof(x_axis));
     if (error && error_size) error[0] = '\0';
@@ -920,6 +1027,7 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
         fail(error, error_size, "invalid visual encoder arguments");
         return 0;
     }
+    t_all = encode_now_ms();
     ok = tile_axis_build(height, &y_axis, error, error_size) &&
          tile_axis_build(width, &x_axis, error, error_size);
     if (!ok) {
@@ -927,10 +1035,7 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
         tile_axis_free(&x_axis);
         return 0;
     }
-    if (!h3_st_read_header(vae_path, &header, error, error_size) ||
-        !load_weights(&encoder, &header, error, error_size)) {
-        cleanup_encoder(&encoder);
-        h3_st_free_header(&header);
+    if (!encoder_cached(vae_path, &encoder, error, error_size)) {
         tile_axis_free(&y_axis);
         tile_axis_free(&x_axis);
         return 0;
@@ -939,12 +1044,16 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
     tiles = calloc((size_t)tile_count, sizeof(*tiles));
     if (!tiles) {
         fail(error, error_size, "out of memory allocating visual encoder tiles");
-        cleanup_encoder(&encoder);
-        h3_st_free_header(&header);
         tile_axis_free(&y_axis);
         tile_axis_free(&x_axis);
         return 0;
     }
+    fprintf(stderr,
+            "vae_encode: canvas=%dx%d frames=%d tiles=%dx%d tile_px=%d "
+            "host=%d\n",
+            width, height, frames, x_axis.count, y_axis.count, y_axis.length,
+            encode_want_host());
+    fflush(stderr);
     ok = 1;
     for (y = 0, completed = 0; ok && y < y_axis.count; y++)
         for (x = 0; ok && x < x_axis.count; x++, completed++) {
@@ -953,8 +1062,9 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
                 x_axis.starts[x], y_axis.length, x_axis.length, error,
                 error_size);
             int current_time = 0;
+            double t_tile = encode_now_ms();
             if (tile)
-                tiles[completed] = encode_tile(&encoder, tile, frames,
+                tiles[completed] = encode_tile(encoder, tile, frames,
                                                y_axis.length, x_axis.length,
                                                &current_time, error,
                                                error_size);
@@ -962,6 +1072,10 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
             ok = tiles[completed] != NULL &&
                  (!latent_time || latent_time == current_time);
             if (ok) latent_time = current_time;
+            fprintf(stderr, "vae_encode_tile %d/%d y=%d x=%d ms=%.1f ok=%d\n",
+                    completed + 1, tile_count, y, x, encode_now_ms() - t_tile,
+                    ok);
+            fflush(stderr);
         }
     if (ok)
         ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis, out, error,
@@ -971,10 +1085,13 @@ int h3_vae_encode_f32(const char *vae_path, const float *rgb01_chtw,
         for (index = 0; index < tile_count; index++) free(tiles[index]);
     }
     free(tiles);
-    cleanup_encoder(&encoder);
-    h3_st_free_header(&header);
     tile_axis_free(&y_axis);
     tile_axis_free(&x_axis);
     if (!ok) h3_vae_latent_f32_free(out);
+    else {
+        fprintf(stderr, "vae_encode: done canvas=%dx%d tiles=%d ms=%.1f\n",
+                width, height, tile_count, encode_now_ms() - t_all);
+        fflush(stderr);
+    }
     return ok;
 }

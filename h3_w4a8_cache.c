@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
 
 typedef struct {
     int8_t *h_w;
@@ -928,6 +931,92 @@ int h3_w4a8_cache_prefetch(h3_w4a8_cache *cache, unsigned first_block,
     t1 = clock();
     if (elapsed_ms)
         *elapsed_ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    return 1;
+}
+
+static int stage_one_host_int8(h3_w4a8_cache *cache, unsigned block,
+                               h3_w4a8_linear_kind kind, char *error,
+                               size_t error_size) {
+    char detail[384];
+    h3_dit_int8_linear lin;
+    const char *suffix = h3_w4a8_linear_kind_suffix(kind);
+    h3_w4a8_int8_host_linear *host;
+    size_t w_bytes, s_bytes;
+    if (!suffix) {
+        fail(error, error_size, "invalid linear kind");
+        return 0;
+    }
+    if (!h3_dit_int8_find_block_linear(cache->int8_store, block, suffix, &lin,
+                                       detail, sizeof(detail))) {
+        snprintf(error, error_size, "blocks.%u.%s: %s", block,
+                 h3_w4a8_linear_kind_name(kind), detail);
+        return 0;
+    }
+    host = &cache->slots[block].host[kind];
+    if (host->h_w && host->h_s && host->n == lin.n && host->k == lin.k)
+        return 1;
+    w_bytes = lin.n * lin.k;
+    s_bytes = lin.n * sizeof(float);
+    free_int8_host_linear(host);
+    host->h_w = (int8_t *)h3_cuda_host_alloc(w_bytes, &host->pinned_w);
+    host->h_s = (float *)h3_cuda_host_alloc(s_bytes, &host->pinned_s);
+    if (!host->h_w || !host->h_s) {
+        free_int8_host_linear(host);
+        host->h_w = (int8_t *)malloc(w_bytes);
+        host->h_s = (float *)malloc(s_bytes);
+        host->pinned_w = host->pinned_s = 0;
+        if (!host->h_w || !host->h_s) {
+            free_int8_host_linear(host);
+            fail(error, error_size, "OOM INT8 host stage");
+            return 0;
+        }
+    }
+    if (!h3_dit_int8_read_tensor(cache->int8_store, lin.weight, host->h_w,
+                                 w_bytes, detail, sizeof(detail)) ||
+        !h3_dit_int8_read_tensor(cache->int8_store, lin.scale, host->h_s,
+                                 s_bytes, detail, sizeof(detail))) {
+        snprintf(error, error_size, "INT8 host stage read: %s", detail);
+        free_int8_host_linear(host);
+        return 0;
+    }
+    host->n = lin.n;
+    host->k = lin.k;
+    cache->int8_disk_loads++;
+    return 1;
+}
+
+int h3_w4a8_cache_stage_host_int8(h3_w4a8_cache *cache, unsigned first_block,
+                                  unsigned n_blocks, double *elapsed_ms,
+                                  char *error, size_t error_size) {
+    unsigned end, b;
+    int k;
+    if (elapsed_ms) *elapsed_ms = 0.0;
+    if (!cache || !cache->int8_store) {
+        fail(error, error_size, "INT8 cache required for host stage");
+        return 0;
+    }
+    if (first_block >= cache->n_blocks) {
+        fail(error, error_size, "first_block out of range");
+        return 0;
+    }
+    end = first_block + n_blocks;
+    if (end > cache->n_blocks) end = cache->n_blocks;
+    {
+        struct timespec ts0, ts1;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        for (b = first_block; b < end; b++) {
+            for (k = 0; k < H3_W4A8_LINEAR_COUNT; k++) {
+                if (!stage_one_host_int8(cache, b, (h3_w4a8_linear_kind)k,
+                                         error, error_size))
+                    return 0;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        if (elapsed_ms)
+            *elapsed_ms =
+                (double)(ts1.tv_sec - ts0.tv_sec) * 1000.0 +
+                (double)(ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+    }
     return 1;
 }
 

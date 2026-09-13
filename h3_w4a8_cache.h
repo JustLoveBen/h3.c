@@ -80,6 +80,12 @@ int h3_w4a8_cache_prefetch(h3_w4a8_cache *cache, unsigned first_block,
                            unsigned n_blocks, double *elapsed_ms, char *error,
                            size_t error_size);
 
+/* Disk → pinned host only (no GPU). Safe during TE: does not steal VRAM.
+ * Later prefetch/get_linear become host_hits + H2D. */
+int h3_w4a8_cache_stage_host_int8(h3_w4a8_cache *cache, unsigned first_block,
+                                  unsigned n_blocks, double *elapsed_ms,
+                                  char *error, size_t error_size);
+
 /* Ensure block is resident (evict per policy) and return device weight.
  * Pointer owned by cache until free/evict. */
 const h3_cuda_w4a8_weight *h3_w4a8_cache_get_linear(h3_w4a8_cache *cache,

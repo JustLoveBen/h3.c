@@ -1,12 +1,18 @@
 #include "h3_vision_cuda.h"
 
+#include "h3_gpu_cuda.h"
 #include "h3_safetensors.h"
+#include "h3_sdpa.h"
 
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -68,8 +74,220 @@ static int detect_prefix(const h3_st_header *header, char *prefix,
     return 0;
 }
 
-static void gemm_nt(const float *x, const float *w, const float *bias,
-                    size_t m, size_t n, size_t k, float *y) {
+static h3_cuda *g_vis_cuda = NULL;
+static double g_vis_sdpa_ms = 0.0;
+static int g_vis_sdpa_calls = 0;
+static char g_vis_sdpa_backend[64] = "host";
+
+static int vision_want_cuda(void) {
+    const char *force = getenv("H3_VISION_HOST");
+    return g_vis_cuda && !(force && force[0] == '1');
+}
+
+/* Default: cuDNN when CUDA bound. H3_VISION_SDPA=host keeps cublas GEMM but
+ * host OpenMP SDPA (A/B / rollback of the SDPA knife only). */
+static int vision_want_sdpa_cuda(void) {
+    const char *e;
+    if (!vision_want_cuda()) return 0;
+    e = getenv("H3_VISION_SDPA");
+    if (e && (e[0] == 'h' || e[0] == 'H') &&
+        (e[1] == 'o' || e[1] == 'O'))
+        return 0;
+    return 1;
+}
+
+/* Vision shapes are H=16 D=72 — force Tier-0 cudnn (not DiT sage3/sol). */
+static void vision_sdpa_push_cudnn(char *prev_out, size_t prev_n, int *had_prev) {
+    const char *prev = getenv("H3_CUDA_SDPA_BACKEND");
+    *had_prev = 0;
+    if (prev_out && prev_n) prev_out[0] = '\0';
+    if (prev && prev[0]) {
+        *had_prev = 1;
+        if (prev_out && prev_n)
+            snprintf(prev_out, prev_n, "%s", prev);
+    }
+    setenv("H3_CUDA_SDPA_BACKEND", "cudnn", 1);
+    h3_sdpa_cache_invalidate();
+}
+
+static void vision_sdpa_pop_cudnn(const char *prev, int had_prev) {
+    if (had_prev && prev && prev[0])
+        setenv("H3_CUDA_SDPA_BACKEND", prev, 1);
+    else
+        unsetenv("H3_CUDA_SDPA_BACKEND");
+    h3_sdpa_cache_invalidate();
+}
+
+typedef struct {
+    float *n1w, *n1b, *qkv_w, *qkv_b, *ow, *ob;
+    float *n2w, *n2b, *fc1w, *fc1b, *fc2w, *fc2b;
+} vis_layer_w;
+
+typedef struct {
+    float *nw, *nb, *fc1w, *fc1b, *fc2w, *fc2b;
+} vis_merger_w;
+
+typedef struct {
+    char path[1024];
+    char prefix[32];
+    float *pos;
+    float *patch_w;
+    float *patch_b;
+    vis_layer_w layer[VISION_LAYERS];
+    vis_merger_w merger;
+    vis_merger_w deepstack[3];
+    int ready;
+} vis_w_cache;
+
+static vis_w_cache g_vis_w;
+
+void h3_vision_encode_f32_bind_cuda(void *cuda) {
+    g_vis_cuda = (h3_cuda *)cuda;
+}
+
+static void vis_w_free(vis_w_cache *c) {
+    int i;
+    if (!c) return;
+    free(c->pos);
+    free(c->patch_w);
+    free(c->patch_b);
+    free(c->merger.nw);
+    free(c->merger.nb);
+    free(c->merger.fc1w);
+    free(c->merger.fc1b);
+    free(c->merger.fc2w);
+    free(c->merger.fc2b);
+    for (i = 0; i < 3; i++) {
+        free(c->deepstack[i].nw);
+        free(c->deepstack[i].nb);
+        free(c->deepstack[i].fc1w);
+        free(c->deepstack[i].fc1b);
+        free(c->deepstack[i].fc2w);
+        free(c->deepstack[i].fc2b);
+    }
+    for (i = 0; i < VISION_LAYERS; i++) {
+        vis_layer_w *L = &c->layer[i];
+        free(L->n1w);
+        free(L->n1b);
+        free(L->qkv_w);
+        free(L->qkv_b);
+        free(L->ow);
+        free(L->ob);
+        free(L->n2w);
+        free(L->n2b);
+        free(L->fc1w);
+        free(L->fc1b);
+        free(L->fc2w);
+        free(L->fc2b);
+    }
+    memset(c, 0, sizeof(*c));
+}
+
+static int load_merger_w(const h3_st_header *header, const char *prefix,
+                         int deepstack, vis_merger_w *m, char *error,
+                         size_t error_size) {
+    size_t nw = deepstack ? (size_t)MERGE_DIM : (size_t)VISION_HIDDEN;
+    m->nw = load_f32(header, prefix, "norm.weight", nw, error, error_size);
+    m->nb = load_f32(header, prefix, "norm.bias", nw, error, error_size);
+    m->fc1w = load_f32(header, prefix, "linear_fc1.weight",
+                       (size_t)MERGE_DIM * MERGE_DIM, error, error_size);
+    m->fc1b = load_f32(header, prefix, "linear_fc1.bias", MERGE_DIM, error,
+                       error_size);
+    m->fc2w = load_f32(header, prefix, "linear_fc2.weight",
+                       (size_t)OUTPUT_WIDTH * MERGE_DIM, error, error_size);
+    m->fc2b = load_f32(header, prefix, "linear_fc2.bias", OUTPUT_WIDTH, error,
+                       error_size);
+    return m->nw && m->nb && m->fc1w && m->fc1b && m->fc2w && m->fc2b;
+}
+
+static int vis_w_ensure(const h3_st_header *header, const char *path,
+                        const char *prefix, char *error, size_t error_size) {
+    int i;
+    char bp[128];
+    struct timespec t0, t1;
+    if (g_vis_w.ready && g_vis_w.path[0] && path &&
+        !strcmp(g_vis_w.path, path) && !strcmp(g_vis_w.prefix, prefix))
+        return 1;
+    vis_w_free(&g_vis_w);
+    if (path)
+        snprintf(g_vis_w.path, sizeof(g_vis_w.path), "%s", path);
+    snprintf(g_vis_w.prefix, sizeof(g_vis_w.prefix), "%s", prefix);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    g_vis_w.pos = load_f32(header, prefix, "pos_embed.weight",
+                           (size_t)POSITION_COUNT * VISION_HIDDEN, error,
+                           error_size);
+    g_vis_w.patch_w = load_f32(header, prefix, "patch_embed.proj.weight",
+                               (size_t)VISION_HIDDEN * PATCH_DIM, error,
+                               error_size);
+    g_vis_w.patch_b = load_f32(header, prefix, "patch_embed.proj.bias",
+                               VISION_HIDDEN, error, error_size);
+    if (!g_vis_w.pos || !g_vis_w.patch_w || !g_vis_w.patch_b) {
+        vis_w_free(&g_vis_w);
+        return 0;
+    }
+    for (i = 0; i < VISION_LAYERS; i++) {
+        vis_layer_w *L = &g_vis_w.layer[i];
+        snprintf(bp, sizeof(bp), "%sblocks.%d.", prefix, i);
+        L->n1w = load_f32(header, bp, "norm1.weight", VISION_HIDDEN, error,
+                          error_size);
+        L->n1b = load_f32(header, bp, "norm1.bias", VISION_HIDDEN, error,
+                          error_size);
+        L->qkv_w = load_f32(header, bp, "attn.qkv.weight",
+                            (size_t)VISION_HIDDEN * 3 * VISION_HIDDEN, error,
+                            error_size);
+        L->qkv_b = load_f32(header, bp, "attn.qkv.bias", VISION_HIDDEN * 3,
+                            error, error_size);
+        L->ow = load_f32(header, bp, "attn.proj.weight",
+                         (size_t)VISION_HIDDEN * VISION_HIDDEN, error,
+                         error_size);
+        L->ob = load_f32(header, bp, "attn.proj.bias", VISION_HIDDEN, error,
+                         error_size);
+        L->n2w = load_f32(header, bp, "norm2.weight", VISION_HIDDEN, error,
+                          error_size);
+        L->n2b = load_f32(header, bp, "norm2.bias", VISION_HIDDEN, error,
+                          error_size);
+        L->fc1w = load_f32(header, bp, "mlp.linear_fc1.weight",
+                           (size_t)VISION_INTERMEDIATE * VISION_HIDDEN, error,
+                           error_size);
+        L->fc1b = load_f32(header, bp, "mlp.linear_fc1.bias",
+                           VISION_INTERMEDIATE, error, error_size);
+        L->fc2w = load_f32(header, bp, "mlp.linear_fc2.weight",
+                           (size_t)VISION_HIDDEN * VISION_INTERMEDIATE, error,
+                           error_size);
+        L->fc2b = load_f32(header, bp, "mlp.linear_fc2.bias", VISION_HIDDEN,
+                            error, error_size);
+        if (!L->n1w || !L->n1b || !L->qkv_w || !L->qkv_b || !L->ow || !L->ob ||
+            !L->n2w || !L->n2b || !L->fc1w || !L->fc1b || !L->fc2w ||
+            !L->fc2b) {
+            vis_w_free(&g_vis_w);
+            return 0;
+        }
+    }
+    snprintf(bp, sizeof(bp), "%smerger.", prefix);
+    if (!load_merger_w(header, bp, 0, &g_vis_w.merger, error, error_size)) {
+        vis_w_free(&g_vis_w);
+        return 0;
+    }
+    for (i = 0; i < 3; i++) {
+        snprintf(bp, sizeof(bp), "%sdeepstack_merger_list.%d.", prefix, i);
+        if (!load_merger_w(header, bp, 1, &g_vis_w.deepstack[i], error,
+                           error_size)) {
+            vis_w_free(&g_vis_w);
+            return 0;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_vis_w.ready = 1;
+    fprintf(stderr, "vision_w_cache: loaded layers=%d ms=%.1f\n",
+            VISION_LAYERS,
+            (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    fflush(stderr);
+    return 1;
+}
+
+static void gemm_nt_host(const float *x, const float *w, const float *bias,
+                         size_t m, size_t n, size_t k, float *y) {
     size_t r, c, i;
 #ifdef _OPENMP
 #pragma omp parallel for private(c, i)
@@ -84,6 +302,28 @@ static void gemm_nt(const float *x, const float *w, const float *bias,
             y[r * n + c] = s;
         }
     }
+}
+
+static void gemm_nt(const float *x, const float *w, const float *bias,
+                    size_t m, size_t n, size_t k, float *y) {
+    int want_cuda = vision_want_cuda();
+    if (want_cuda && m > 0 && n > 0 && k > 0) {
+        char err[192];
+        size_t r, c;
+        err[0] = '\0';
+        if (h3_cuda_gemm_f32(g_vis_cuda, x, w, m, n, k, y, NULL, err,
+                             sizeof(err))) {
+            if (bias) {
+                for (r = 0; r < m; r++)
+                    for (c = 0; c < n; c++)
+                        y[r * n + c] += bias[c];
+            }
+            return;
+        }
+        fprintf(stderr, "vision_gemm: cuda fallback host (%s)\n",
+                err[0] ? err : "unknown");
+    }
+    gemm_nt_host(x, w, bias, m, n, k, y);
 }
 
 static void layer_norm(const float *x, const float *w, const float *b,
@@ -279,8 +519,8 @@ static void vision_qkv_rope(const float *qkv, const float *rope_cos,
     }
 }
 
-static void sdpa(const float *query, const float *key, const float *value,
-                 size_t rows, float *out) {
+static void sdpa_host(const float *query, const float *key, const float *value,
+                      size_t rows, float *out) {
     const float scale = 1.0f / sqrtf((float)VISION_HEAD_DIM);
     size_t head, row, col, d;
 #ifdef _OPENMP
@@ -322,54 +562,62 @@ static void sdpa(const float *query, const float *key, const float *value,
     }
 }
 
-static int run_merger(const h3_st_header *header, const char *vis_prefix,
-                      const float *hidden, size_t patch_rows, int deepstack,
-                      int merger_index, float *output, char *error,
-                      size_t error_size) {
+static void sdpa(const float *query, const float *key, const float *value,
+                 size_t rows, float *out) {
+    const float scale = 1.0f / sqrtf((float)VISION_HEAD_DIM);
+    if (vision_want_sdpa_cuda() && rows > 0) {
+        char err[256];
+        char be[64];
+        double ms = 0.0;
+        err[0] = '\0';
+        be[0] = '\0';
+        /* Backend already forced to cudnn for the encode window. */
+        if (h3_cuda_sdpa_f16_ex(g_vis_cuda, query, key, value, rows,
+                                (size_t)VISION_HEADS, (size_t)VISION_HEAD_DIM,
+                                scale, 0, out, &ms, be, sizeof(be), err,
+                                sizeof(err))) {
+            g_vis_sdpa_ms += ms;
+            g_vis_sdpa_calls++;
+            if (be[0])
+                snprintf(g_vis_sdpa_backend, sizeof(g_vis_sdpa_backend), "%s",
+                         be);
+            return;
+        }
+        fprintf(stderr, "vision_sdpa: cuda fallback host (%s)\n",
+                err[0] ? err : "unknown");
+        fflush(stderr);
+    }
+    sdpa_host(query, key, value, rows, out);
+    if (!g_vis_sdpa_calls)
+        snprintf(g_vis_sdpa_backend, sizeof(g_vis_sdpa_backend), "%s", "host");
+}
+
+static int run_merger(const vis_merger_w *mw, const float *hidden,
+                      size_t patch_rows, int deepstack, float *output,
+                      char *error, size_t error_size) {
     size_t merged_rows = patch_rows / (MERGE * MERGE);
     uint32_t norm_width = deepstack ? MERGE_DIM : VISION_HIDDEN;
     uint32_t norm_rows = deepstack ? (uint32_t)merged_rows : (uint32_t)patch_rows;
-    char prefix[128];
-    float *norm_w, *norm_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
     float *norm, *fc1;
     int ok = 0;
-    if (deepstack)
-        snprintf(prefix, sizeof(prefix), "%sdeepstack_merger_list.%d.",
-                 vis_prefix, merger_index);
-    else
-        snprintf(prefix, sizeof(prefix), "%smerger.", vis_prefix);
-    norm_w = load_f32(header, prefix, "norm.weight", norm_width, error,
-                      error_size);
-    norm_b = load_f32(header, prefix, "norm.bias", norm_width, error,
-                      error_size);
-    fc1_w = load_f32(header, prefix, "linear_fc1.weight",
-                     (size_t)MERGE_DIM * MERGE_DIM, error, error_size);
-    fc1_b = load_f32(header, prefix, "linear_fc1.bias", MERGE_DIM, error,
-                     error_size);
-    fc2_w = load_f32(header, prefix, "linear_fc2.weight",
-                     (size_t)OUTPUT_WIDTH * MERGE_DIM, error, error_size);
-    fc2_b = load_f32(header, prefix, "linear_fc2.bias", OUTPUT_WIDTH, error,
-                     error_size);
+    if (!mw || !mw->nw || !mw->nb || !mw->fc1w || !mw->fc1b || !mw->fc2w ||
+        !mw->fc2b) {
+        fail(error, error_size, "Qwen vision merger weights missing");
+        return 0;
+    }
     norm = (float *)malloc((size_t)patch_rows * VISION_HIDDEN * sizeof(float));
     fc1 = (float *)malloc(merged_rows * MERGE_DIM * sizeof(float));
-    if (!norm_w || !norm_b || !fc1_w || !fc1_b || !fc2_w || !fc2_b || !norm ||
-        !fc1) {
-        if (!error || !error[0])
-            fail(error, error_size, "cannot allocate Qwen vision merger");
+    if (!norm || !fc1) {
+        fail(error, error_size, "cannot allocate Qwen vision merger");
         goto cleanup;
     }
-    layer_norm(hidden, norm_w, norm_b, norm_rows, norm_width, 1e-6f, norm);
-    gemm_nt(norm, fc1_w, fc1_b, merged_rows, MERGE_DIM, MERGE_DIM, fc1);
+    layer_norm(hidden, mw->nw, mw->nb, norm_rows, norm_width, 1e-6f, norm);
+    gemm_nt(norm, mw->fc1w, mw->fc1b, merged_rows, MERGE_DIM, MERGE_DIM, fc1);
     gelu(fc1, merged_rows * MERGE_DIM, 0);
-    gemm_nt(fc1, fc2_w, fc2_b, merged_rows, OUTPUT_WIDTH, MERGE_DIM, output);
+    gemm_nt(fc1, mw->fc2w, mw->fc2b, merged_rows, OUTPUT_WIDTH, MERGE_DIM,
+            output);
     ok = 1;
 cleanup:
-    free(norm_w);
-    free(norm_b);
-    free(fc1_w);
-    free(fc1_b);
-    free(fc2_w);
-    free(fc2_b);
     free(norm);
     free(fc1);
     return ok;
@@ -386,11 +634,12 @@ int h3_vision_encode_f32(
     h3_st_header header;
     char vis_prefix[32];
     size_t gh, gw, rows, merged_rows, layer;
-    float *patches = NULL, *pos_table = NULL, *position = NULL;
+    float *patches = NULL, *position = NULL;
     float *rope_cos = NULL, *rope_sin = NULL;
-    float *patch_w = NULL, *patch_b = NULL, *hidden = NULL;
+    float *hidden = NULL;
     float *norm = NULL, *qkv = NULL, *query = NULL, *key = NULL, *value = NULL;
     float *heads = NULL, *branch = NULL, *fc1 = NULL;
+    struct timespec t_enc0, t_enc1;
     int ok = 0;
 
     memset(&header, 0, sizeof(header));
@@ -417,28 +666,26 @@ int h3_vision_encode_f32(
                                 "model.visual.)");
         goto done;
     }
+    if (!vis_w_ensure(&header, vision_weights, vis_prefix, error, error_size)) {
+        if (!error || !error[0])
+            fail(error, error_size, "cannot cache Qwen vision weights");
+        goto done;
+    }
     patches = (float *)malloc(rows * PATCH_DIM * sizeof(float));
-    pos_table = load_f32(&header, vis_prefix, "pos_embed.weight",
-                         (size_t)POSITION_COUNT * VISION_HIDDEN, error,
-                         error_size);
     position = (float *)malloc(rows * VISION_HIDDEN * sizeof(float));
     rope_cos = (float *)malloc(rows * VISION_ROPE_HALF * sizeof(float));
     rope_sin = (float *)malloc(rows * VISION_ROPE_HALF * sizeof(float));
-    patch_w = load_f32(&header, vis_prefix, "patch_embed.proj.weight",
-                       (size_t)VISION_HIDDEN * PATCH_DIM, error, error_size);
-    patch_b = load_f32(&header, vis_prefix, "patch_embed.proj.bias",
-                       VISION_HIDDEN, error, error_size);
     hidden = (float *)malloc(rows * VISION_HIDDEN * sizeof(float));
-    if (!patches || !pos_table || !position || !rope_cos || !rope_sin ||
-        !patch_w || !patch_b || !hidden ||
+    if (!patches || !position || !rope_cos || !rope_sin || !hidden ||
         !prepare_patch_rows(pixels_t3hw, frames, height, width, patches) ||
-        !prepare_position_rows(pos_table, (int)gh, (int)gw, position)) {
+        !prepare_position_rows(g_vis_w.pos, (int)gh, (int)gw, position)) {
         if (!error || !error[0])
             fail(error, error_size, "cannot prepare Qwen vision patch inputs");
         goto done;
     }
     prepare_rope((int)gh, (int)gw, rope_cos, rope_sin);
-    gemm_nt(patches, patch_w, patch_b, rows, VISION_HIDDEN, PATCH_DIM, hidden);
+    gemm_nt(patches, g_vis_w.patch_w, g_vis_w.patch_b, rows, VISION_HIDDEN,
+            PATCH_DIM, hidden);
     {
         size_t i;
         for (i = 0; i < rows * VISION_HIDDEN; i++)
@@ -446,14 +693,8 @@ int h3_vision_encode_f32(
     }
     free(patches);
     patches = NULL;
-    free(pos_table);
-    pos_table = NULL;
     free(position);
     position = NULL;
-    free(patch_w);
-    patch_w = NULL;
-    free(patch_b);
-    patch_b = NULL;
 
     norm = (float *)malloc(rows * VISION_HIDDEN * sizeof(float));
     qkv = (float *)malloc(rows * VISION_HIDDEN * 3 * sizeof(float));
@@ -467,90 +708,85 @@ int h3_vision_encode_f32(
         fail(error, error_size, "cannot allocate Qwen vision activations");
         goto done;
     }
-    fprintf(stderr, "vision_encode_begin frames=%d %dx%d patch_rows=%zu "
-                    "merged=%zu layers=%d\n",
-            frames, height, width, rows, merged_rows, VISION_LAYERS);
+    g_vis_sdpa_ms = 0.0;
+    g_vis_sdpa_calls = 0;
+    snprintf(g_vis_sdpa_backend, sizeof(g_vis_sdpa_backend), "%s",
+             vision_want_sdpa_cuda() ? "cudnn?" : "host");
+    fprintf(stderr,
+            "vision_encode_begin frames=%d %dx%d patch_rows=%zu "
+            "merged=%zu layers=%d gemm=%s sdpa=%s\n",
+            frames, height, width, rows, merged_rows, VISION_LAYERS,
+            vision_want_cuda() ? "cublas" : "host",
+            vision_want_sdpa_cuda() ? "cudnn" : "host");
     fflush(stderr);
-    for (layer = 0; layer < (size_t)VISION_LAYERS; layer++) {
-        char bp[96];
-        float *n1w, *n1b, *qkv_w, *qkv_b, *ow, *ob, *n2w, *n2b, *fc1w, *fc1b,
-            *fc2w, *fc2b;
-        size_t i;
-        fprintf(stderr, "vision_layer %zu/%d rows=%zu\n", layer + 1,
-                VISION_LAYERS, rows);
-        fflush(stderr);
-        snprintf(bp, sizeof(bp), "%sblocks.%zu.", vis_prefix, layer);
-        n1w = load_f32(&header, bp, "norm1.weight", VISION_HIDDEN, error,
-                       error_size);
-        n1b = load_f32(&header, bp, "norm1.bias", VISION_HIDDEN, error,
-                       error_size);
-        qkv_w = load_f32(&header, bp, "attn.qkv.weight",
-                         (size_t)VISION_HIDDEN * 3 * VISION_HIDDEN, error,
-                         error_size);
-        qkv_b = load_f32(&header, bp, "attn.qkv.bias", VISION_HIDDEN * 3, error,
-                         error_size);
-        ow = load_f32(&header, bp, "attn.proj.weight",
-                      (size_t)VISION_HIDDEN * VISION_HIDDEN, error, error_size);
-        ob = load_f32(&header, bp, "attn.proj.bias", VISION_HIDDEN, error,
-                      error_size);
-        n2w = load_f32(&header, bp, "norm2.weight", VISION_HIDDEN, error,
-                       error_size);
-        n2b = load_f32(&header, bp, "norm2.bias", VISION_HIDDEN, error,
-                       error_size);
-        fc1w = load_f32(&header, bp, "mlp.linear_fc1.weight",
-                        (size_t)VISION_INTERMEDIATE * VISION_HIDDEN, error,
-                        error_size);
-        fc1b = load_f32(&header, bp, "mlp.linear_fc1.bias", VISION_INTERMEDIATE,
-                        error, error_size);
-        fc2w = load_f32(&header, bp, "mlp.linear_fc2.weight",
-                        (size_t)VISION_HIDDEN * VISION_INTERMEDIATE, error,
-                        error_size);
-        fc2b = load_f32(&header, bp, "mlp.linear_fc2.bias", VISION_HIDDEN, error,
-                        error_size);
-        if (!n1w || !n1b || !qkv_w || !qkv_b || !ow || !ob || !n2w || !n2b ||
-            !fc1w || !fc1b || !fc2w || !fc2b) {
-            free(n1w); free(n1b); free(qkv_w); free(qkv_b); free(ow); free(ob);
-            free(n2w); free(n2b); free(fc1w); free(fc1b); free(fc2w); free(fc2b);
+    {
+        char prev_be[64];
+        int had_prev = 0;
+        int push_cudnn = vision_want_sdpa_cuda();
+        if (push_cudnn)
+            vision_sdpa_push_cudnn(prev_be, sizeof(prev_be), &had_prev);
+        clock_gettime(CLOCK_MONOTONIC, &t_enc0);
+        for (layer = 0; layer < (size_t)VISION_LAYERS; layer++) {
+            const vis_layer_w *L = &g_vis_w.layer[layer];
+            size_t i;
+            if (layer == 0 || layer + 1 == (size_t)VISION_LAYERS ||
+                layer == 8 || layer == 16 || layer == 24)
+                fprintf(stderr, "vision_layer %zu/%d rows=%zu\n", layer + 1,
+                        VISION_LAYERS, rows);
+            layer_norm(hidden, L->n1w, L->n1b, rows, VISION_HIDDEN, 1e-6f, norm);
+            gemm_nt(norm, L->qkv_w, L->qkv_b, rows, VISION_HIDDEN * 3,
+                    VISION_HIDDEN, qkv);
+            vision_qkv_rope(qkv, rope_cos, rope_sin, rows, query, key, value);
+            sdpa(query, key, value, rows, heads);
+            gemm_nt(heads, L->ow, L->ob, rows, VISION_HIDDEN, VISION_HIDDEN,
+                    branch);
+            for (i = 0; i < rows * VISION_HIDDEN; i++)
+                hidden[i] += branch[i];
+            layer_norm(hidden, L->n2w, L->n2b, rows, VISION_HIDDEN, 1e-6f, norm);
+            gemm_nt(norm, L->fc1w, L->fc1b, rows, VISION_INTERMEDIATE,
+                    VISION_HIDDEN, fc1);
+            gelu(fc1, rows * VISION_INTERMEDIATE, 1);
+            gemm_nt(fc1, L->fc2w, L->fc2b, rows, VISION_HIDDEN,
+                    VISION_INTERMEDIATE, branch);
+            for (i = 0; i < rows * VISION_HIDDEN; i++)
+                hidden[i] += branch[i];
+            if (layer == 8 || layer == 16 || layer == 24) {
+                int index = layer == 8 ? 0 : layer == 16 ? 1 : 2;
+                if (!run_merger(&g_vis_w.deepstack[index], hidden, rows, 1,
+                                deepstack_out[index], error, error_size)) {
+                    if (push_cudnn)
+                        vision_sdpa_pop_cudnn(prev_be, had_prev);
+                    goto done;
+                }
+            }
+        }
+        if (!run_merger(&g_vis_w.merger, hidden, rows, 0, merged_out, error,
+                        error_size)) {
+            if (push_cudnn)
+                vision_sdpa_pop_cudnn(prev_be, had_prev);
             goto done;
         }
-        layer_norm(hidden, n1w, n1b, rows, VISION_HIDDEN, 1e-6f, norm);
-        gemm_nt(norm, qkv_w, qkv_b, rows, VISION_HIDDEN * 3, VISION_HIDDEN, qkv);
-        vision_qkv_rope(qkv, rope_cos, rope_sin, rows, query, key, value);
-        sdpa(query, key, value, rows, heads);
-        gemm_nt(heads, ow, ob, rows, VISION_HIDDEN, VISION_HIDDEN, branch);
-        for (i = 0; i < rows * VISION_HIDDEN; i++)
-            hidden[i] += branch[i];
-        layer_norm(hidden, n2w, n2b, rows, VISION_HIDDEN, 1e-6f, norm);
-        gemm_nt(norm, fc1w, fc1b, rows, VISION_INTERMEDIATE, VISION_HIDDEN, fc1);
-        gelu(fc1, rows * VISION_INTERMEDIATE, 1);
-        gemm_nt(fc1, fc2w, fc2b, rows, VISION_HIDDEN, VISION_INTERMEDIATE,
-                branch);
-        for (i = 0; i < rows * VISION_HIDDEN; i++)
-            hidden[i] += branch[i];
-        free(n1w); free(n1b); free(qkv_w); free(qkv_b); free(ow); free(ob);
-        free(n2w); free(n2b); free(fc1w); free(fc1b); free(fc2w); free(fc2b);
-        if (layer == 8 || layer == 16 || layer == 24) {
-            int index = layer == 8 ? 0 : layer == 16 ? 1 : 2;
-            if (!run_merger(&header, vis_prefix, hidden, rows, 1, index,
-                            deepstack_out[index], error, error_size))
-                goto done;
-        }
+        clock_gettime(CLOCK_MONOTONIC, &t_enc1);
+        if (push_cudnn)
+            vision_sdpa_pop_cudnn(prev_be, had_prev);
     }
-    if (!run_merger(&header, vis_prefix, hidden, rows, 0, 0, merged_out, error,
-                    error_size))
-        goto done;
+    fprintf(stderr,
+            "vision_encode: done layers_ms=%.1f gemm=%s sdpa=%s "
+            "sdpa_ms=%.1f sdpa_calls=%d\n",
+            (t_enc1.tv_sec - t_enc0.tv_sec) * 1000.0 +
+                (t_enc1.tv_nsec - t_enc0.tv_nsec) / 1e6,
+            vision_want_cuda() ? "cublas" : "host", g_vis_sdpa_backend,
+            g_vis_sdpa_ms, g_vis_sdpa_calls);
+    fflush(stderr);
     *grid_h = (int)gh;
     *grid_w = (int)gw;
     *tokens = merged_rows;
     ok = 1;
 done:
     free(patches);
-    free(pos_table);
     free(position);
     free(rope_cos);
     free(rope_sin);
-    free(patch_w);
-    free(patch_b);
     free(hidden);
     free(norm);
     free(qkv);

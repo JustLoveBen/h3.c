@@ -9,8 +9,31 @@
 #include <string.h>
 #include <time.h>
 
+/* Touch TE mmap pages so packed H2D is not page-fault / reclaim thrash
+ * (5090 cafe warm saw upload_ms spike to ~50s when DiT/VAE evicted TE). */
+static double nvfp4_prefault_mmap(const uint8_t *map, size_t map_len) {
+    struct timespec t0, t1;
+    size_t stride, i;
+    volatile unsigned acc = 0;
+    const char *env;
+    if (!map || map_len == 0) return 0.0;
+    env = getenv("H3_TE_PREFAULT");
+    if (env && env[0] == '0') return 0.0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* 2MiB stride: kernel readahead fills the gap under MADV_SEQUENTIAL. */
+    stride = (size_t)2 << 20;
+    for (i = 0; i < map_len; i += stride) acc += map[i];
+    if (map_len > 0) acc += map[map_len - 1];
+    (void)acc;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return ((double)t1.tv_sec * 1000.0 + (double)t1.tv_nsec / 1e6) -
+           ((double)t0.tv_sec * 1000.0 + (double)t0.tv_nsec / 1e6);
+}
+
 static h3_cuda *g_te_cuda = NULL;
 static int g_forced_host = 0;
+static void (*g_after_packed_hook)(void *) = NULL;
+static void *g_after_packed_user = NULL;
 
 /* Growable host cache: unswizzled scales + pre_quant + packed weights
  * (CFG 2nd encode hits). A tiny device d_w LRU cannot cover 50L×7 unique
@@ -735,7 +758,15 @@ extern "C" int h3_nvfp4_cuda_enable(h3_cuda *cuda, char *error,
 extern "C" void h3_nvfp4_cuda_disable(void) {
     h3_nvfp4_cuda_cache_clear();
     g_te_cuda = NULL;
+    g_after_packed_hook = NULL;
+    g_after_packed_user = NULL;
     h3_nvfp4_set_linear_backend(NULL, NULL);
+}
+
+extern "C" void h3_nvfp4_cuda_set_after_packed_hook(void (*fn)(void *),
+                                                    void *user) {
+    g_after_packed_hook = fn;
+    g_after_packed_user = user;
 }
 
 extern "C" int h3_nvfp4_cuda_enabled(void) {
@@ -1026,6 +1057,22 @@ static int nvfp4_te_packed_preload(const h3_nvfp4_store *store,
         return 0;
     }
     g_d_te_w_arena_bytes = need;
+
+    {
+        double prefault_ms = 0.0;
+        if (store->map && store->map_len > 0) {
+#ifdef MADV_WILLNEED
+            (void)madvise((void *)store->map, store->map_len, MADV_WILLNEED);
+#endif
+            prefault_ms = nvfp4_prefault_mmap(store->map, store->map_len);
+            if (!logged && prefault_ms > 0.0) {
+                fprintf(stderr, "te_packed: prefault_ms=%.1f bytes=%.2fGiB\n",
+                        prefault_ms,
+                        (double)store->map_len / (1024.0 * 1024.0 * 1024.0));
+                fflush(stderr);
+            }
+        }
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &ts0);
     idx = 0;
@@ -1551,6 +1598,13 @@ extern "C" int h3_nvfp4_cuda_encode_text_layers(const h3_nvfp4_store *store,
         logged = 1;
     }
     (void)nvfp4_te_packed_preload(store, n_layers, error, error_size);
+    if (g_after_packed_hook) {
+        void (*fn)(void *) = g_after_packed_hook;
+        void *user = g_after_packed_user;
+        g_after_packed_hook = NULL;
+        g_after_packed_user = NULL;
+        fn(user);
+    }
     if (!nvfp4_te_ln_preload(store, n_layers, error, error_size)) {
         if (error) error[0] = '\0';
         g_ln_cached_layers = 0;

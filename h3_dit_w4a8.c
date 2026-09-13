@@ -1,19 +1,58 @@
 #include "h3_dit_w4a8.h"
 
 #include "h3_dit_int8.h"
+#include "h3_lora.h"
 
 #include <cuda_runtime_api.h>
 
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
 
 static int env_flag_is_one(const char *name) {
     const char *e = getenv(name);
     return e && e[0] == '1' && e[1] == '\0';
+}
+
+/* U>1 only: uly_do_phase sets these so block_phase_* can name the kernel
+ * that IMA'd. U=1 leaves rank<0 (no logs, no extra sync). */
+static int g_uly_log_rank = -1;
+static int g_uly_log_phase = 0;
+static unsigned g_uly_log_block = 0;
+static int g_uly_phase_sync = 0;
+
+static void uly_klog(const char *kernel, const char *state) {
+    if (g_uly_log_rank < 0 || !kernel)
+        return;
+    fprintf(stderr, "uly_phase: phase%d r%d block%u kernel=%s %s\n",
+            g_uly_log_phase, g_uly_log_rank, g_uly_log_block, kernel,
+            state ? state : "");
+    fflush(stderr);
+}
+
+static int uly_ksync(const char *kernel, char *err, size_t errn) {
+    cudaError_t ce;
+    if (g_uly_log_rank < 0)
+        return 1;
+    uly_klog(kernel, "launched");
+    if (!g_uly_phase_sync)
+        return 1;
+    ce = cudaDeviceSynchronize();
+    if (ce != cudaSuccess) {
+        snprintf(err, errn, "r%d phase%d %s: %s", g_uly_log_rank,
+                 g_uly_log_phase, kernel, cudaGetErrorString(ce));
+        uly_klog(kernel, "IMA");
+        return 0;
+    }
+    uly_klog(kernel, "sync_ok");
+    return 1;
 }
 
 static int env_int_default(const char *name, int def) {
@@ -195,6 +234,22 @@ struct h3_dit_w4a8 {
     unsigned char aux_disk_logged;
     /* 0=unset, 1=all-aux prestaged, 2=dual-bank fallback. */
     unsigned char aux_prestage_mode;
+    /* Turbo LoRA residual (NULL = gold; no extra kernels). */
+    const h3_lora_set *lora;
+    float *d_lora_A[H3_DIT_W4A8_N_BLOCKS][4];
+    float *d_lora_B[H3_DIT_W4A8_N_BLOCKS][4];
+    int lora_r[H3_DIT_W4A8_N_BLOCKS][4];
+    int lora_n[H3_DIT_W4A8_N_BLOCKS][4];
+    int lora_k[H3_DIT_W4A8_N_BLOCKS][4];
+    float *d_lora_t;
+    size_t d_lora_t_cap;
+    int lora_max_r;
+    /* Ulysses SP group (only on rank 0 ctx; uly_ctx[0] == this). Rank ctxs
+     * are owned by the caller (generate). uly_u<=1 → today's path. */
+    struct h3_dit_w4a8 *uly_ctx[8];
+    int uly_dev[8];
+    int uly_u;
+    h3_dit_w4a8_sp_comm uly_comm;
 };
 
 static uint32_t dit_text_row_mod(const h3_dit_w4a8 *ctx, size_t i,
@@ -369,6 +424,16 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
     if (ctx->d_tr_reduced_b) cudaFree(ctx->d_tr_reduced_b);
     if (ctx->d_rope_cos) cudaFree(ctx->d_rope_cos);
     if (ctx->d_rope_sin) cudaFree(ctx->d_rope_sin);
+    {
+        unsigned b, p;
+        for (b = 0; b < H3_DIT_W4A8_N_BLOCKS; b++) {
+            for (p = 0; p < 4; p++) {
+                if (ctx->d_lora_A[b][p]) cudaFree(ctx->d_lora_A[b][p]);
+                if (ctx->d_lora_B[b][p]) cudaFree(ctx->d_lora_B[b][p]);
+            }
+        }
+    }
+    if (ctx->d_lora_t) cudaFree(ctx->d_lora_t);
     free(ctx->adaln_audio_scratch);
     free(ctx->adaln_visual_cond_scratch);
     free(ctx->adaln_audio_cond_scratch);
@@ -376,6 +441,198 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
         if (ctx->aux_valid[i]) h3_dit_w4a8_block_aux_free(&ctx->aux_cache[i]);
     }
     free(ctx);
+}
+
+static const h3_lora_pair *dit_lora_pair(const h3_lora_block *b, int which) {
+    if (!b) return NULL;
+    if (which == 0) return &b->qkv;
+    if (which == 1) return &b->out;
+    if (which == 2) return &b->fc1;
+    if (which == 3) return &b->fc2;
+    return NULL;
+}
+
+static void dit_lora_gpu_clear(h3_dit_w4a8 *ctx) {
+    unsigned b, p;
+    if (!ctx) return;
+    for (b = 0; b < H3_DIT_W4A8_N_BLOCKS; b++) {
+        for (p = 0; p < 4; p++) {
+            if (ctx->d_lora_A[b][p]) {
+                cudaFree(ctx->d_lora_A[b][p]);
+                ctx->d_lora_A[b][p] = NULL;
+            }
+            if (ctx->d_lora_B[b][p]) {
+                cudaFree(ctx->d_lora_B[b][p]);
+                ctx->d_lora_B[b][p] = NULL;
+            }
+            ctx->lora_r[b][p] = ctx->lora_n[b][p] = ctx->lora_k[b][p] = 0;
+        }
+    }
+    if (ctx->d_lora_t) {
+        cudaFree(ctx->d_lora_t);
+        ctx->d_lora_t = NULL;
+    }
+    ctx->d_lora_t_cap = 0;
+    ctx->lora_max_r = 0;
+    ctx->lora = NULL;
+}
+
+int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
+                         size_t error_size) {
+    unsigned b, p;
+    int max_r = 0;
+    size_t pre;
+    if (!ctx) {
+        fail(error, error_size, "dit set_lora: null ctx");
+        return 0;
+    }
+    dit_lora_gpu_clear(ctx);
+    if (!lora)
+        return 1;
+    if (ctx->cuda && !h3_cuda_bind_device(ctx->cuda, error, error_size))
+        return 0;
+    ctx->lora = lora;
+    for (b = 0; b < H3_LORA_N_BLOCKS; b++) {
+        for (p = 0; p < 4; p++) {
+            const h3_lora_pair *pair = dit_lora_pair(&lora->blocks[b], (int)p);
+            size_t a_n, b_n;
+            if (!pair || !pair->A || !pair->B || pair->r < 1) {
+                dit_lora_gpu_clear(ctx);
+                fail(error, error_size, "dit set_lora: incomplete pair");
+                return 0;
+            }
+            a_n = (size_t)pair->r * (size_t)pair->k;
+            b_n = (size_t)pair->n * (size_t)pair->r;
+            if (cudaMalloc((void **)&ctx->d_lora_A[b][p],
+                           a_n * sizeof(float)) != cudaSuccess ||
+                cudaMalloc((void **)&ctx->d_lora_B[b][p],
+                           b_n * sizeof(float)) != cudaSuccess) {
+                dit_lora_gpu_clear(ctx);
+                fail(error, error_size, "dit set_lora: OOM uploading A/B");
+                return 0;
+            }
+            if (cudaMemcpy(ctx->d_lora_A[b][p], pair->A, a_n * sizeof(float),
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(ctx->d_lora_B[b][p], pair->B, b_n * sizeof(float),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                dit_lora_gpu_clear(ctx);
+                fail(error, error_size, "dit set_lora: H2D A/B failed");
+                return 0;
+            }
+            ctx->lora_r[b][p] = pair->r;
+            ctx->lora_n[b][p] = pair->n;
+            ctx->lora_k[b][p] = pair->k;
+            if (pair->r > max_r)
+                max_r = pair->r;
+        }
+    }
+    ctx->lora_max_r = max_r;
+    pre = 16384u * (size_t)max_r;
+    if (cudaMalloc((void **)&ctx->d_lora_t, pre * sizeof(float)) != cudaSuccess) {
+        dit_lora_gpu_clear(ctx);
+        fail(error, error_size, "dit set_lora: OOM T workspace");
+        return 0;
+    }
+    ctx->d_lora_t_cap = pre;
+    return 1;
+}
+
+int h3_dit_w4a8_set_ulysses(h3_dit_w4a8 *ctx, h3_dit_w4a8 *const *rank_ctx,
+                            const int *devices, int u,
+                            const h3_dit_w4a8_sp_comm *comm, char *error,
+                            size_t error_size) {
+    int i;
+    if (!ctx) {
+        fail(error, error_size, "set_ulysses: null ctx");
+        return 0;
+    }
+    memset(ctx->uly_ctx, 0, sizeof(ctx->uly_ctx));
+    memset(ctx->uly_dev, 0, sizeof(ctx->uly_dev));
+    memset(&ctx->uly_comm, 0, sizeof(ctx->uly_comm));
+    ctx->uly_u = 0;
+    if (u <= 1)
+        return 1;
+    if (u > 8) {
+        fail(error, error_size, "set_ulysses: u>8");
+        return 0;
+    }
+    if (!rank_ctx || !devices || !comm || !comm->cfg || !comm->bind ||
+        !comm->a2a_qkv || !comm->a2a_attn_out) {
+        fail(error, error_size, "set_ulysses: missing rank/comm");
+        return 0;
+    }
+    if (rank_ctx[0] != ctx) {
+        fail(error, error_size, "set_ulysses: rank_ctx[0] must be ctx");
+        return 0;
+    }
+    for (i = 0; i < u; i++) {
+        if (!rank_ctx[i]) {
+            fail(error, error_size, "set_ulysses: null rank ctx");
+            return 0;
+        }
+        ctx->uly_ctx[i] = rank_ctx[i];
+        ctx->uly_dev[i] = devices[i];
+    }
+    ctx->uly_comm = *comm;
+    ctx->uly_u = u;
+    return 1;
+}
+
+static int dit_lora_residual_dev(h3_dit_w4a8 *ctx, unsigned block, int which,
+                                 const float *d_x, float *d_y, size_t seq,
+                                 char *error, size_t error_size) {
+    int r, n, k;
+    size_t need;
+    char detail[256];
+    float scale;
+    if (!ctx || !ctx->lora)
+        return 1;
+    if (block >= H3_DIT_W4A8_N_BLOCKS || which < 0 || which > 3) {
+        fail(error, error_size, "lora residual: bad block/which");
+        return 0;
+    }
+    r = ctx->lora_r[block][which];
+    n = ctx->lora_n[block][which];
+    k = ctx->lora_k[block][which];
+    if (r < 1 || n < 1 || k < 1 || !ctx->d_lora_A[block][which] ||
+        !ctx->d_lora_B[block][which]) {
+        fail(error, error_size, "lora residual: missing GPU pair");
+        return 0;
+    }
+    need = seq * (size_t)r;
+    if (need > ctx->d_lora_t_cap) {
+        if (h3_cuda_graph_capture(ctx->cuda)) {
+            fail(error, error_size, "lora residual: T ws too small for graph");
+            return 0;
+        }
+        if (ctx->cuda && !h3_cuda_bind_device(ctx->cuda, error, error_size))
+            return 0;
+        if (ctx->d_lora_t)
+            cudaFree(ctx->d_lora_t);
+        ctx->d_lora_t = NULL;
+        if (cudaMalloc((void **)&ctx->d_lora_t, need * sizeof(float)) !=
+            cudaSuccess) {
+            ctx->d_lora_t_cap = 0;
+            fail(error, error_size, "lora residual: OOM T");
+            return 0;
+        }
+        ctx->d_lora_t_cap = need;
+    }
+    scale = ctx->lora->scale;
+    if (!h3_cuda_gemm_f32_dd(ctx->cuda, d_x, ctx->d_lora_A[block][which], seq,
+                             (size_t)r, (size_t)k, ctx->d_lora_t, NULL, detail,
+                             sizeof(detail))) {
+        snprintf(error, error_size, "lora XA^T: %s", detail);
+        return 0;
+    }
+    if (!h3_cuda_gemm_f32_dd_ex(ctx->cuda, ctx->d_lora_t,
+                                ctx->d_lora_B[block][which], seq, (size_t)n,
+                                (size_t)r, d_y, scale, 1.0f, NULL, detail,
+                                sizeof(detail))) {
+        snprintf(error, error_size, "lora TB^T: %s", detail);
+        return 0;
+    }
+    return 1;
 }
 
 void h3_dit_w4a8_set_token_reduction(h3_dit_w4a8 *ctx, int enabled) {
@@ -438,6 +695,7 @@ int h3_dit_w4a8_token_reduction_enabled(const h3_dit_w4a8 *ctx) {
 
 void h3_dit_w4a8_set_denoise_step(h3_dit_w4a8 *ctx, int step) {
     if (ctx) ctx->denoise_step = step < 0 ? 0 : step;
+    h3_cuda_sol_cute_set_step(step);
 }
 
 void h3_dit_w4a8_set_text_mod_tags(h3_dit_w4a8 *ctx, const uint8_t *tags,
@@ -506,6 +764,8 @@ static int ensure_block_ws(h3_dit_w4a8 *ctx, size_t bytes, char *error,
     }
     if (bytes == 0) return 1;
     if (ctx->d_block_ws && ctx->d_block_ws_bytes >= bytes) return 1;
+    if (ctx->cuda && !h3_cuda_bind_device(ctx->cuda, error, error_size))
+        return 0;
     /* Allocate first, free old only on success. Free-then-malloc after
      * cuDNN graphs were built fragmented cafe VRAM and triggered
      * make_room window 29→16. 64MiB slack absorbs seq-pad growth. */
@@ -629,12 +889,27 @@ int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx) {
 int h3_dit_w4a8_prefetch(h3_dit_w4a8 *ctx, unsigned first_block,
                          unsigned n_blocks, double *elapsed_ms_out,
                          char *error, size_t error_size) {
+    int ok;
     if (!ctx || !ctx->cache) {
         fail(error, error_size, "dit w4a8 is NULL");
         return 0;
     }
-    return h3_w4a8_cache_prefetch(ctx->cache, first_block, n_blocks,
-                                  elapsed_ms_out, error, error_size);
+    ok = h3_w4a8_cache_prefetch(ctx->cache, first_block, n_blocks,
+                                elapsed_ms_out, error, error_size);
+    if (ok && elapsed_ms_out && *elapsed_ms_out > 0.0)
+        h3_cuda_sol_profile_add_unpack(*elapsed_ms_out);
+    return ok;
+}
+
+int h3_dit_w4a8_stage_host(h3_dit_w4a8 *ctx, unsigned first_block,
+                           unsigned n_blocks, double *elapsed_ms_out,
+                           char *error, size_t error_size) {
+    if (!ctx || !ctx->cache) {
+        fail(error, error_size, "dit w4a8 is NULL");
+        return 0;
+    }
+    return h3_w4a8_cache_stage_host_int8(ctx->cache, first_block, n_blocks,
+                                         elapsed_ms_out, error, error_size);
 }
 
 int h3_dit_w4a8_get_cache_stats(h3_dit_w4a8 *ctx, h3_w4a8_cache_stats *stats,
@@ -1594,98 +1869,157 @@ int h3_dit_w4a8_sdpa_f32(const float *query, const float *key,
     return 1;
 }
 
-/* Device compute for one resident block (no H2D/D2H). Used by eager + graph. */
-static int block_device_compute(
-    h3_dit_w4a8 *ctx, const h3_cuda_w4a8_weight *w_qkv,
-    const h3_cuda_w4a8_weight *w_out, const h3_cuda_w4a8_weight *w_fc1,
-    const h3_cuda_w4a8_weight *w_fc2, float *d_x, float *d_y, float *d_mod,
-    uint32_t *d_map, float *d_cos, float *d_sin, float *d_n1, float *d_n2,
-    float *d_qn, float *d_kn, float *d_a, float *d_b, float *d_qkv,
-    float *d_wide, size_t seq, h3_dit_w4a8_block_stats *stats, char *error,
-    size_t error_size) {
+/* Phase 1: AdaLN(attn) + QKV GEMM (+LoRA residual) on local rows.
+ * Ulysses insertion point is directly after this (A2A on d_qkv). */
+static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
+                           const h3_cuda_w4a8_weight *w_qkv, float *d_x,
+                           float *d_mod, uint32_t *d_map, float *d_n1,
+                           float *d_a, float *d_qkv, size_t seq,
+                           h3_dit_w4a8_block_stats *stats, char *error,
+                           size_t error_size) {
     const size_t hidden = H3_DIT_W4A8_HIDDEN;
-    const size_t heads = H3_DIT_W4A8_HEADS;
-    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
-    const size_t inner = H3_DIT_W4A8_INNER;
-    const size_t ffn = H3_DIT_W4A8_FFN;
     const size_t slots = H3_DIT_W4A8_SLOTS;
-    const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
     const float eps = 1e-5f;
-    const float attn_scale = 1.0f / sqrtf((float)head_dim);
     double prep = 0.0, gemm = 0.0, op = 0.0;
     char backend[32];
     char detail[384];
 
+    uly_klog("adaln_attn", "enter");
     if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_x, d_n1, d_mod, d_map, seq, hidden,
                                slots, 0, 1, eps, d_a, &op, detail,
                                sizeof(detail))) {
         snprintf(error, error_size, "adaln_attn: %s", detail);
         return 0;
     }
+    if (!uly_ksync("adaln_attn", error, error_size))
+        return 0;
     if (stats) stats->adaln_attn_ms = op;
 
     prep = gemm = 0.0;
+    uly_klog("qkv_gemm", "enter");
     if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
             ctx->cuda, w_qkv, d_a, ctx->convrot_gs, seq, d_qkv, &prep, &gemm,
             backend, sizeof(backend), detail, sizeof(detail))) {
         snprintf(error, error_size, "qkv: %s", detail);
         return 0;
     }
+    if (!uly_ksync("qkv_gemm", error, error_size))
+        return 0;
+    if (ctx->lora) {
+        uly_klog("qkv_lora", "enter");
+        if (!dit_lora_residual_dev(ctx, block, 0, d_a, d_qkv, seq, error,
+                                   error_size))
+            return 0;
+        if (!uly_ksync("qkv_lora", error, error_size))
+            return 0;
+    }
     if (stats) {
         stats->qkv_ms = gemm;
         stats->act_prep_ms += prep;
         snprintf(stats->qkv_backend, sizeof(stats->qkv_backend), "%s", backend);
     }
+    return 1;
+}
 
-    {
-        float *d_attn = d_wide; /* out-proj act; FFN reuses d_wide fully */
-        int attn_window = env_int_default("H3_DIT_W4A8_ATTN_WINDOW", 0);
-        char be[32];
-        double rope_ms = 0.0;
-        be[0] = '\0';
-        /* RoPE → FP16 scratch + SDPA (skip f32 Q/K/V materialize + cast). */
-        if (!h3_cuda_qkv_rope_sdpa_f16_dev(
-                ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq, heads, head_dim,
-                rope_half, eps, attn_scale, attn_window, d_attn, &rope_ms, &op,
-                be, sizeof(be), detail, sizeof(detail))) {
-            snprintf(error, error_size, "rope_sdpa: %s", detail);
-            return 0;
-        }
-        if (stats) {
-            stats->rope_ms = rope_ms;
-            stats->sdpa_ms = op;
-            snprintf(stats->sdpa_backend, sizeof(stats->sdpa_backend), "%s",
-                     be[0] ? be : "cuda_rope_sdpa_f16");
-        }
+/* Phase 2: RoPE + SDPA. seq_attn/heads_attn are the attention geometry
+ * (U=1: local seq × full heads; Ulysses: S_real gathered rows × H/U heads —
+ * pad rows are excluded here so zero-K rows never pollute softmax). */
+static int block_phase_attn(h3_dit_w4a8 *ctx, const float *d_qkv,
+                            const float *d_qn, const float *d_kn,
+                            const float *d_cos, const float *d_sin,
+                            size_t seq_attn, size_t heads_attn, float *d_attn,
+                            h3_dit_w4a8_block_stats *stats, char *error,
+                            size_t error_size) {
+    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
+    const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
+    const float eps = 1e-5f;
+    const float attn_scale = 1.0f / sqrtf((float)head_dim);
+    int attn_window = env_int_default("H3_DIT_W4A8_ATTN_WINDOW", 0);
+    char be[32];
+    char detail[384];
+    double rope_ms = 0.0, op = 0.0;
+    be[0] = '\0';
+    /* RoPE → FP16 scratch + SDPA (skip f32 Q/K/V materialize + cast). */
+    uly_klog("rope_sdpa", "enter");
+    if (!h3_cuda_qkv_rope_sdpa_f16_dev(
+            ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq_attn, heads_attn,
+            head_dim, rope_half, eps, attn_scale, attn_window, d_attn, &rope_ms,
+            &op, be, sizeof(be), detail, sizeof(detail))) {
+        snprintf(error, error_size, "rope_sdpa: %s", detail);
+        return 0;
+    }
+    if (!uly_ksync("rope_sdpa", error, error_size))
+        return 0;
+    if (stats) {
+        stats->rope_ms = rope_ms;
+        stats->sdpa_ms = op;
+        snprintf(stats->sdpa_backend, sizeof(stats->sdpa_backend), "%s",
+                 be[0] ? be : "cuda_rope_sdpa_f16");
+    }
+    return 1;
+}
 
-        prep = gemm = 0.0;
-        if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
-                ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_a, &prep,
-                &gemm, backend, sizeof(backend), detail, sizeof(detail))) {
-            snprintf(error, error_size, "out: %s", detail);
+/* Phase 3: out-proj (+LoRA) + gates + MLP (+LoRA) on local rows.
+ * d_attn is the attention output for the local rows ([seq, H*D]). */
+static int block_phase_out_mlp(
+    h3_dit_w4a8 *ctx, unsigned block, const h3_cuda_w4a8_weight *w_out,
+    const h3_cuda_w4a8_weight *w_fc1, const h3_cuda_w4a8_weight *w_fc2,
+    float *d_x, float *d_y, float *d_mod, uint32_t *d_map, float *d_n2,
+    float *d_a, float *d_b, float *d_qkv, float *d_wide, float *d_attn,
+    size_t seq, h3_dit_w4a8_block_stats *stats, char *error,
+    size_t error_size) {
+    const size_t hidden = H3_DIT_W4A8_HIDDEN;
+    const size_t ffn = H3_DIT_W4A8_FFN;
+    const size_t slots = H3_DIT_W4A8_SLOTS;
+    const float eps = 1e-5f;
+    double prep = 0.0, gemm = 0.0, op = 0.0;
+    char backend[32];
+    char detail[384];
+
+    prep = gemm = 0.0;
+    uly_klog("out_gemm", "enter");
+    if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+            ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_a, &prep,
+            &gemm, backend, sizeof(backend), detail, sizeof(detail))) {
+        snprintf(error, error_size, "out: %s", detail);
+        return 0;
+    }
+    if (!uly_ksync("out_gemm", error, error_size))
+        return 0;
+    if (ctx->lora) {
+        uly_klog("out_lora", "enter");
+        if (!dit_lora_residual_dev(ctx, block, 1, d_attn, d_a, seq, error,
+                                   error_size))
             return 0;
-        }
-        if (stats) {
-            stats->out_ms = gemm;
-            stats->act_prep_ms += prep;
-            snprintf(stats->out_backend, sizeof(stats->out_backend), "%s",
-                     backend);
-        }
+        if (!uly_ksync("out_lora", error, error_size))
+            return 0;
+    }
+    if (stats) {
+        stats->out_ms = gemm;
+        stats->act_prep_ms += prep;
+        snprintf(stats->out_backend, sizeof(stats->out_backend), "%s",
+                 backend);
     }
 
+    uly_klog("gate_attn", "enter");
     if (!h3_cuda_gate_f32_dev(ctx->cuda, d_x, d_a, d_mod, d_map, seq, hidden,
                               slots, 2, d_b, &op, detail, sizeof(detail))) {
         snprintf(error, error_size, "gate_attn: %s", detail);
         return 0;
     }
+    if (!uly_ksync("gate_attn", error, error_size))
+        return 0;
     if (stats) stats->gate_attn_ms = op;
 
+    uly_klog("adaln_mlp", "enter");
     if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_b, d_n2, d_mod, d_map, seq, hidden,
                                slots, 3, 4, eps, d_a, &op, detail,
                                sizeof(detail))) {
         snprintf(error, error_size, "adaln_mlp: %s", detail);
         return 0;
     }
+    if (!uly_ksync("adaln_mlp", error, error_size))
+        return 0;
     if (stats) stats->adaln_mlp_ms = op;
 
     {
@@ -1693,11 +2027,22 @@ static int block_device_compute(
         float *d_act = d_qkv;
 
         prep = gemm = 0.0;
+        uly_klog("fc1_gemm", "enter");
         if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
                 ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_fc1, &prep, &gemm,
                 backend, sizeof(backend), detail, sizeof(detail))) {
             snprintf(error, error_size, "fc1: %s", detail);
             return 0;
+        }
+        if (!uly_ksync("fc1_gemm", error, error_size))
+            return 0;
+        if (ctx->lora) {
+            uly_klog("fc1_lora", "enter");
+            if (!dit_lora_residual_dev(ctx, block, 2, d_a, d_fc1, seq, error,
+                                       error_size))
+                return 0;
+            if (!uly_ksync("fc1_lora", error, error_size))
+                return 0;
         }
         if (stats) {
             stats->fc1_ms = gemm;
@@ -1707,19 +2052,33 @@ static int block_device_compute(
         }
 
         prep = gemm = 0.0;
+        uly_klog("swiglu", "enter");
         if (!h3_cuda_swiglu_f32_dev(ctx->cuda, d_fc1, seq, ffn, d_act, &op,
                                     detail, sizeof(detail))) {
             snprintf(error, error_size, "swiglu: %s", detail);
             return 0;
         }
+        if (!uly_ksync("swiglu", error, error_size))
+            return 0;
         if (stats) stats->swiglu_ms = op;
 
         prep = gemm = 0.0;
+        uly_klog("fc2_gemm", "enter");
         if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
                 ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_a, &prep, &gemm,
                 backend, sizeof(backend), detail, sizeof(detail))) {
             snprintf(error, error_size, "fc2: %s", detail);
             return 0;
+        }
+        if (!uly_ksync("fc2_gemm", error, error_size))
+            return 0;
+        if (ctx->lora) {
+            uly_klog("fc2_lora", "enter");
+            if (!dit_lora_residual_dev(ctx, block, 3, d_act, d_a, seq, error,
+                                       error_size))
+                return 0;
+            if (!uly_ksync("fc2_lora", error, error_size))
+                return 0;
         }
         if (stats) {
             stats->fc2_ms = gemm;
@@ -1729,13 +2088,39 @@ static int block_device_compute(
         }
     }
 
+    uly_klog("gate_mlp", "enter");
     if (!h3_cuda_gate_f32_dev(ctx->cuda, d_b, d_a, d_mod, d_map, seq, hidden,
                               slots, 5, d_y, &op, detail, sizeof(detail))) {
         snprintf(error, error_size, "gate_mlp: %s", detail);
         return 0;
     }
+    if (!uly_ksync("gate_mlp", error, error_size))
+        return 0;
     if (stats) stats->gate_mlp_ms = op;
     return 1;
+}
+
+/* Device compute for one resident block (no H2D/D2H). Used by eager + graph.
+ * Pure composition of the three phases — identical instruction stream to the
+ * pre-split single function (U=1 gold path unchanged). */
+static int block_device_compute(
+    h3_dit_w4a8 *ctx, unsigned block, const h3_cuda_w4a8_weight *w_qkv,
+    const h3_cuda_w4a8_weight *w_out, const h3_cuda_w4a8_weight *w_fc1,
+    const h3_cuda_w4a8_weight *w_fc2, float *d_x, float *d_y, float *d_mod,
+    uint32_t *d_map, float *d_cos, float *d_sin, float *d_n1, float *d_n2,
+    float *d_qn, float *d_kn, float *d_a, float *d_b, float *d_qkv,
+    float *d_wide, size_t seq, h3_dit_w4a8_block_stats *stats, char *error,
+    size_t error_size) {
+    if (!block_phase_qkv(ctx, block, w_qkv, d_x, d_mod, d_map, d_n1, d_a,
+                         d_qkv, seq, stats, error, error_size))
+        return 0;
+    if (!block_phase_attn(ctx, d_qkv, d_qn, d_kn, d_cos, d_sin, seq,
+                          (size_t)H3_DIT_W4A8_HEADS, d_wide, stats, error,
+                          error_size))
+        return 0;
+    return block_phase_out_mlp(ctx, block, w_out, w_fc1, w_fc2, d_x, d_y,
+                               d_mod, d_map, d_n2, d_a, d_b, d_qkv, d_wide,
+                               d_wide, seq, stats, error, error_size);
 }
 
 static void destroy_block_graph(h3_dit_w4a8 *ctx) {
@@ -1887,7 +2272,7 @@ static int block_forward_gpu_resident(
                 h3_cuda_set_graph_capture(ctx->cuda, 1);
                 quiet_set = 1;
                 if (!block_device_compute(
-                        ctx, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
+                        ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
                         d_cos, d_sin, d_n1, d_n2, d_qn, d_kn, d_a, d_b, d_qkv,
                         d_wide, seq, NULL, detail, sizeof(detail))) {
                     /* Graph optional — fall back to eager without aborting. */
@@ -1916,7 +2301,7 @@ static int block_forward_gpu_resident(
                 gst = cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
                 if (gst == cudaSuccess) {
                     int cok = block_device_compute(
-                        ctx, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
+                        ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
                         d_cos, d_sin, d_n1, d_n2, d_qn, d_kn, d_a, d_b, d_qkv,
                         d_wide, seq, NULL, detail, sizeof(detail));
                     gst = cudaStreamEndCapture(0, &g);
@@ -1972,7 +2357,7 @@ static int block_forward_gpu_resident(
                     cudaEventRecord(wall0, 0);
             }
             if (!block_device_compute(
-                    ctx, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
+                    ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y, d_mod, d_map,
                     d_cos, d_sin, d_n1, d_n2, d_qn, d_kn, d_a, d_b, d_qkv,
                     d_wide, seq, want_quiet ? NULL : stats, detail,
                     sizeof(detail))) {
@@ -3017,6 +3402,902 @@ int h3_dit_w4a8_final_audio_cuda(h3_dit_w4a8 *ctx, const h3_dit_w4a8_core *core,
                            H3_DIT_W4A8_AUDIO_CH, y, error, error_size);
 }
 
+static int uly_set_dev(const h3_dit_w4a8 *ctx, int rank) {
+    if (!ctx || rank < 0 || rank >= ctx->uly_u)
+        return 0;
+    return cudaSetDevice(ctx->uly_dev[rank]) == cudaSuccess;
+}
+
+typedef struct {
+    float *d_x, *d_y, *d_mod, *d_cos, *d_sin;
+    float *d_n1, *d_n2, *d_qn, *d_kn;
+    float *d_a, *d_b, *d_qkv, *d_wide;
+    uint32_t *d_map;
+} uly_rank_ws;
+
+enum { ULY_PH_QKV = 1, ULY_PH_ATTN = 2, ULY_PH_MLP = 3 };
+
+typedef struct {
+    h3_dit_w4a8 *root;
+    h3_dit_w4a8 *rc; /* uly_ctx[rank] only; never root's device buffers */
+    uly_rank_ws *ws;
+    h3_dit_w4a8_sp_comm *comm;
+    int rank;
+    int phase;
+    unsigned block;
+    const float *modulation;
+    const h3_dit_w4a8_block_aux *aux;
+    const h3_cuda_w4a8_weight *w_qkv, *w_out, *w_fc1, *w_fc2;
+    size_t seq_local, seq_real, seq_pad;
+    size_t heads, heads_attn, head_dim, hidden, mod_elems;
+    void *compute_stream;
+    void *ev_comp;
+    void *ev_host;
+    int ok;
+    char err[384];
+} uly_job;
+
+static int uly_ptr_dev(int rank, int want, const void *p, const char *name,
+                       char *err, size_t errn);
+
+/* Per-rank GEMM/SDPA. Each thread binds its own device + ctx (U=1 never
+ * enters this file path). A2A stays a collection point on the caller. */
+static int uly_do_phase(uly_job *j) {
+    h3_dit_w4a8 *rc;
+    uly_rank_ws *w;
+    char detail[384];
+    int want;
+    if (!j || !j->root || !j->rc || !j->ws) {
+        if (j)
+            snprintf(j->err, sizeof j->err, "ulysses: bad rank job");
+        return 0;
+    }
+    if (!uly_set_dev(j->root, j->rank)) {
+        snprintf(j->err, sizeof j->err, "ulysses: cudaSetDevice");
+        return 0;
+    }
+    rc = j->rc;
+    w = j->ws;
+    want = j->root->uly_dev[j->rank];
+    if (!h3_cuda_bind_device(rc->cuda, j->err, sizeof j->err))
+        return 0;
+    if (!h3_cuda_dit_scratch_check(rc->cuda, j->err, sizeof j->err))
+        return 0;
+    if (!uly_ptr_dev(j->rank, want, w->d_x, "d_x", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_qkv, "d_qkv", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_wide, "d_wide", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_a, "d_a", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_mod, "d_mod", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_n1, "d_n1", j->err, sizeof j->err) ||
+        !uly_ptr_dev(j->rank, want, w->d_map, "d_map", j->err, sizeof j->err))
+        return 0;
+    if (rc->lora) {
+        int which = (j->phase == ULY_PH_QKV) ? 0 : 1;
+        if (!uly_ptr_dev(j->rank, want, rc->d_lora_A[j->block][which], "lora_A",
+                         j->err, sizeof j->err) ||
+            !uly_ptr_dev(j->rank, want, rc->d_lora_B[j->block][which], "lora_B",
+                         j->err, sizeof j->err) ||
+            !uly_ptr_dev(j->rank, want, rc->d_lora_t, "lora_T", j->err,
+                         sizeof j->err))
+            return 0;
+    }
+    g_uly_log_rank = j->rank;
+    g_uly_log_phase = j->phase;
+    g_uly_log_block = j->block;
+    g_uly_phase_sync = env_flag_is_one("H3_ULYSSES_PHASE_SYNC");
+    uly_klog(j->phase == ULY_PH_QKV
+                 ? "phase1_qkv"
+                 : (j->phase == ULY_PH_ATTN ? "phase2_attn" : "phase3_mlp"),
+             "begin");
+    detail[0] = '\0';
+    /* Prefetch / cache_refit / x-scatter land on the default stream.
+     * Compute is a non-blocking stream, so enqueue a default→compute
+     * wait before any GEMM (no host drain). */
+    if (j->compute_stream && j->ev_host &&
+        (cudaEventRecord((cudaEvent_t)j->ev_host, 0) != cudaSuccess ||
+         cudaStreamWaitEvent((cudaStream_t)j->compute_stream,
+                             (cudaEvent_t)j->ev_host, 0) != cudaSuccess)) {
+        snprintf(j->err, sizeof j->err, "ulysses: default→compute fence");
+        return 0;
+    }
+    if (j->phase == ULY_PH_QKV) {
+        if (!j->w_qkv) {
+            snprintf(j->err, sizeof j->err, "ulysses: missing QKV weight");
+            return 0;
+        }
+        if (!block_phase_qkv(rc, j->block, j->w_qkv, w->d_x, w->d_mod, w->d_map,
+                             w->d_n1, w->d_a, w->d_qkv, j->seq_local, NULL,
+                             detail, sizeof(detail))) {
+            snprintf(j->err, sizeof j->err, "ulysses r%d phase1: %s", j->rank,
+                     detail);
+            return 0;
+        }
+        return 1;
+    }
+    if (j->phase == ULY_PH_ATTN) {
+        size_t pad_elems;
+        if (!block_phase_attn(rc, w->d_qkv, w->d_qn, w->d_kn, w->d_cos,
+                              w->d_sin, j->seq_real, j->heads_attn, w->d_wide,
+                              NULL, detail, sizeof(detail))) {
+            snprintf(j->err, sizeof j->err, "ulysses r%d phase2: %s", j->rank,
+                     detail);
+            return 0;
+        }
+        pad_elems = (j->seq_pad - j->seq_real) * j->heads_attn * j->head_dim;
+        if (pad_elems &&
+            cudaMemsetAsync(
+                w->d_wide + j->seq_real * j->heads_attn * j->head_dim, 0,
+                pad_elems * sizeof(float),
+                (cudaStream_t)j->compute_stream) != cudaSuccess) {
+            snprintf(j->err, sizeof j->err, "ulysses: pad attn zero");
+            return 0;
+        }
+        return 1;
+    }
+    if (j->phase == ULY_PH_MLP) {
+        if (!j->w_out || !j->w_fc1 || !j->w_fc2) {
+            snprintf(j->err, sizeof j->err, "ulysses: missing MLP weights");
+            return 0;
+        }
+        if (!block_phase_out_mlp(rc, j->block, j->w_out, j->w_fc1, j->w_fc2,
+                                 w->d_x, w->d_y, w->d_mod, w->d_map, w->d_n2,
+                                 w->d_a, w->d_b, w->d_qkv, w->d_wide, w->d_wide,
+                                 j->seq_local, NULL, detail, sizeof(detail))) {
+            snprintf(j->err, sizeof j->err, "ulysses r%d phase3: %s", j->rank,
+                     detail);
+            return 0;
+        }
+        {
+            float *tmp = w->d_x;
+            w->d_x = w->d_y;
+            w->d_y = tmp;
+        }
+        return 1;
+    }
+    snprintf(j->err, sizeof j->err, "ulysses: bad phase");
+    return 0;
+}
+
+static double uly_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+/* After enqueue: default stream waits for this rank's compute stream so
+ * A2A pack (comm stream ← default event) sees GEMM/SDPA. */
+static int uly_join_compute_to_default(uly_job *jobs, int u, char *error,
+                                       size_t error_size) {
+    int r;
+    for (r = 0; r < u; r++) {
+        if (!uly_set_dev(jobs[r].root, r)) {
+            fail(error, error_size, "ulysses: set device");
+            return 0;
+        }
+        if (jobs[r].compute_stream && jobs[r].ev_comp) {
+            if (cudaEventRecord((cudaEvent_t)jobs[r].ev_comp,
+                                (cudaStream_t)jobs[r].compute_stream) !=
+                    cudaSuccess ||
+                cudaStreamWaitEvent(0, (cudaEvent_t)jobs[r].ev_comp, 0) !=
+                    cudaSuccess) {
+                fail(error, error_size, "ulysses: compute→default");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* After A2A: compute stream waits for default (unpack landed). */
+static int uly_join_default_to_compute(uly_job *jobs, int u, char *error,
+                                       size_t error_size) {
+    int r;
+    for (r = 0; r < u; r++) {
+        if (!uly_set_dev(jobs[r].root, r)) {
+            fail(error, error_size, "ulysses: set device");
+            return 0;
+        }
+        if (jobs[r].compute_stream && jobs[r].ev_host) {
+            if (cudaEventRecord((cudaEvent_t)jobs[r].ev_host, 0) !=
+                    cudaSuccess ||
+                cudaStreamWaitEvent((cudaStream_t)jobs[r].compute_stream,
+                                    (cudaEvent_t)jobs[r].ev_host, 0) !=
+                    cudaSuccess) {
+                fail(error, error_size, "ulysses: default→compute");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Why GEMM/SDPA did not overlap (old pthread + per-rank host wait):
+ *   1. uly_do_phase was launch+wait per rank (sync memcpy / join too
+ *      early). Rank r+1 did not enqueue until rank r's GPU finished.
+ *   2. A host sync on rank r drained that device before cudaSetDevice
+ *      of rank r+1, so the two default streams never ran together.
+ *   3. Per-phase pthread_create/join re-attached the CUDA ctx every
+ *      block and held the runtime lock across those waits.
+ * Fix: enqueue every rank first (setDevice + kernels, no host wait),
+ * THEN DeviceSynchronize all ranks. Side streams IMA'd cublasLt/cuDNN
+ * on sm_120; default stream matches A2A and U=1. U=1 never enters. */
+static int uly_join_ranks(uly_job *jobs, int u, char *error, size_t error_size) {
+    int r;
+    for (r = 0; r < u; r++) {
+        if (!uly_set_dev(jobs[r].root, r)) {
+            fail(error, error_size, "ulysses: set device");
+            return 0;
+        }
+        if (jobs[r].compute_stream) {
+            cudaError_t ce =
+                cudaStreamSynchronize((cudaStream_t)jobs[r].compute_stream);
+            if (ce != cudaSuccess) {
+                snprintf(error, error_size, "ulysses: join r%d: %s", r,
+                         cudaGetErrorString(ce));
+                return 0;
+            }
+        } else {
+            cudaError_t ce = cudaDeviceSynchronize();
+            if (ce != cudaSuccess) {
+                snprintf(error, error_size, "ulysses: join r%d: %s", r,
+                         cudaGetErrorString(ce));
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Pageable aux H2D must be single-threaded: two threads sharing the
+ * runtime bounce buffer IMA'd rank 1. Call before spawning workers. */
+static int uly_h2d_aux(uly_job *j) {
+    uly_rank_ws *w;
+    if (!j || !j->root || !j->ws)
+        return 0;
+    if (j->phase != ULY_PH_QKV)
+        return 1;
+    if (!uly_set_dev(j->root, j->rank)) {
+        snprintf(j->err, sizeof j->err, "ulysses: aux setDevice");
+        return 0;
+    }
+    w = j->ws;
+    if (cudaMemcpy(w->d_mod, j->modulation, j->mod_elems * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(w->d_n1, j->aux->norm1, j->hidden * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(w->d_n2, j->aux->norm2, j->hidden * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(w->d_qn, j->aux->q_norm, j->head_dim * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(w->d_kn, j->aux->k_norm, j->head_dim * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        snprintf(j->err, sizeof j->err, "ulysses: aux H2D");
+        return 0;
+    }
+    return 1;
+}
+
+/* Cache lookup + weight ready-wait on the main thread. Workers must not
+ * load_block / ensure_ready (pageable unpack H2D + EventDestroy). */
+static int uly_resolve_weights(uly_job *j) {
+    h3_dit_w4a8 *rc;
+    if (!j || !j->root) {
+        if (j)
+            snprintf(j->err, sizeof j->err, "ulysses: bad resolve");
+        return 0;
+    }
+    if (!uly_set_dev(j->root, j->rank)) {
+        snprintf(j->err, sizeof j->err, "ulysses: resolve setDevice");
+        return 0;
+    }
+    rc = j->rc;
+    if (!rc) {
+        snprintf(j->err, sizeof j->err, "ulysses: resolve missing rc");
+        return 0;
+    }
+    j->w_qkv = j->w_out = j->w_fc1 = j->w_fc2 = NULL;
+    if (j->phase == ULY_PH_ATTN)
+        return 1;
+    if (j->phase == ULY_PH_QKV) {
+        j->w_qkv = get_weight(rc, j->block, H3_W4A8_LINEAR_QKV, j->err,
+                              sizeof j->err);
+        if (!j->w_qkv)
+            return 0;
+        /* Drain this rank's copy stream only. ensure_ready EventDestroy
+         * here left rank-1 GEMM reading W still on streams[0] (IMA).
+         * GEMM wait_ready keeps the event. U=1 never enters. */
+        if (!h3_cuda_copy_stream_synchronize(rc->cuda, j->err, sizeof j->err))
+            return 0;
+        if (!h3_cuda_w4a8_weight_on_device(j->w_qkv, j->root->uly_dev[j->rank],
+                                           j->err, sizeof j->err))
+            return 0;
+        return 1;
+    }
+    if (j->phase == ULY_PH_MLP) {
+        j->w_out = get_weight(rc, j->block, H3_W4A8_LINEAR_OUT, j->err,
+                              sizeof j->err);
+        j->w_fc1 = j->w_out ? get_weight(rc, j->block, H3_W4A8_LINEAR_FC1,
+                                         j->err, sizeof j->err)
+                            : NULL;
+        j->w_fc2 = j->w_fc1 ? get_weight(rc, j->block, H3_W4A8_LINEAR_FC2,
+                                         j->err, sizeof j->err)
+                            : NULL;
+        if (!j->w_fc2)
+            return 0;
+        if (!h3_cuda_copy_stream_synchronize(rc->cuda, j->err, sizeof j->err) ||
+            !h3_cuda_w4a8_weight_on_device(j->w_out, j->root->uly_dev[j->rank],
+                                           j->err, sizeof j->err) ||
+            !h3_cuda_w4a8_weight_on_device(j->w_fc1, j->root->uly_dev[j->rank],
+                                           j->err, sizeof j->err) ||
+            !h3_cuda_w4a8_weight_on_device(j->w_fc2, j->root->uly_dev[j->rank],
+                                           j->err, sizeof j->err))
+            return 0;
+        return 1;
+    }
+    snprintf(j->err, sizeof j->err, "ulysses: bad phase");
+    return 0;
+}
+
+/* Bind A2A after all ranks have joined compute. Doing this from workers
+ * raced on comm->cfg while kernels were still in flight. */
+static int uly_bind_phase(uly_job *jobs, int u, int phase, char *error,
+                          size_t error_size) {
+    int r;
+    if (phase != ULY_PH_QKV && phase != ULY_PH_ATTN)
+        return 1;
+    /* After join only: writing shared comm->cfg while GEMM still uses
+     * d_qkv/d_wide IMA'd rank 1 (pointer registered on the wrong device). */
+    for (r = 0; r < u; r++) {
+        uly_rank_ws *w = jobs[r].ws;
+        const void *p = (phase == ULY_PH_QKV) ? (const void *)w->d_qkv
+                                              : (const void *)w->d_wide;
+        const char *name = (phase == ULY_PH_QKV) ? "d_qkv" : "d_wide";
+        int want = jobs[r].root->uly_dev[r];
+        if (!uly_set_dev(jobs[r].root, r)) {
+            fail(error, error_size, "ulysses: bind setDevice");
+            return 0;
+        }
+        if (!uly_ptr_dev(r, want, p, name, error, error_size))
+            return 0;
+        if (!jobs[r].comm->bind(jobs[r].comm->cfg, jobs[r].rank, p, (void *)p,
+                                error, error_size))
+            return 0;
+    }
+    return 1;
+}
+
+static int uly_ptr_dev(int rank, int want, const void *p, const char *name,
+                       char *err, size_t errn) {
+    struct cudaPointerAttributes a;
+    cudaError_t ce;
+    if (!p)
+        return 1;
+    memset(&a, 0, sizeof(a));
+    ce = cudaPointerGetAttributes(&a, p);
+    if (ce != cudaSuccess) {
+        snprintf(err, errn, "ulysses r%d %s: %s", rank, name,
+                 cudaGetErrorString(ce));
+        return 0;
+    }
+    if (a.type != cudaMemoryTypeDevice && a.type != cudaMemoryTypeManaged) {
+        snprintf(err, errn, "ulysses r%d %s: type=%d", rank, name, (int)a.type);
+        return 0;
+    }
+    if (a.device != want) {
+        snprintf(err, errn, "ulysses r%d %s: on dev %d want %d", rank, name,
+                 a.device, want);
+        return 0;
+    }
+    return 1;
+}
+
+static int uly_sync_rank(uly_job *j, char *error, size_t error_size) {
+    cudaError_t ce;
+    if (!uly_set_dev(j->root, j->rank)) {
+        fail(error, error_size, "ulysses: set device");
+        return 0;
+    }
+    ce = cudaDeviceSynchronize();
+    if (ce != cudaSuccess) {
+        snprintf(error, error_size, "ulysses: join r%d phase%d: %s", j->rank,
+                 j->phase, cudaGetErrorString(ce));
+        uly_klog("join", "IMA");
+        return 0;
+    }
+    uly_klog("join", "ok");
+    return 1;
+}
+
+/* Main thread: serial aux H2D + weight resolve (pageable / cache).
+ * H3_ULYSSES_SERIAL=1: one rank to completion before the next (isolate
+ * shared-handle vs bad pointer). Default: enqueue all, then join all.
+ * Each job uses uly_ctx[rank] cublas/scratch/weight cache only. */
+static int uly_run_ranks(uly_job *jobs, int u, int phase, char *error,
+                         size_t error_size, int join_each) {
+    int r;
+    const int serial = env_flag_is_one("H3_ULYSSES_SERIAL");
+    if (!jobs || u < 1 || u > 8) {
+        fail(error, error_size, "ulysses: bad rank fanout");
+        return 0;
+    }
+    (void)join_each;
+    for (r = 0; r < u; r++) {
+        jobs[r].phase = phase;
+        jobs[r].ok = 0;
+        jobs[r].err[0] = '\0';
+        if (!uly_h2d_aux(&jobs[r])) {
+            snprintf(error, error_size, "%s",
+                     jobs[r].err[0] ? jobs[r].err : "ulysses: aux H2D");
+            return 0;
+        }
+        if (!uly_resolve_weights(&jobs[r])) {
+            snprintf(error, error_size, "%s",
+                     jobs[r].err[0] ? jobs[r].err : "ulysses: resolve");
+            return 0;
+        }
+        if (serial) {
+            fprintf(stderr, "uly_run: serial phase%d r%d block%u enqueue\n",
+                    phase, r, jobs[r].block);
+            fflush(stderr);
+            if (!uly_do_phase(&jobs[r])) {
+                snprintf(error, error_size, "%s",
+                         jobs[r].err[0] ? jobs[r].err : "ulysses: enqueue");
+                return 0;
+            }
+            if (!uly_sync_rank(&jobs[r], error, error_size))
+                return 0;
+            g_uly_log_rank = -1;
+        }
+    }
+    if (serial)
+        return 1;
+    for (r = 0; r < u; r++) {
+        fprintf(stderr, "uly_run: concurrent phase%d r%d block%u enqueue\n",
+                phase, r, jobs[r].block);
+        fflush(stderr);
+        if (!uly_do_phase(&jobs[r])) {
+            snprintf(error, error_size, "%s",
+                     jobs[r].err[0] ? jobs[r].err : "ulysses: enqueue");
+            g_uly_log_rank = -1;
+            return 0;
+        }
+    }
+    for (r = 0; r < u; r++) {
+        g_uly_log_rank = jobs[r].rank;
+        g_uly_log_phase = phase;
+        g_uly_log_block = jobs[r].block;
+        if (!uly_sync_rank(&jobs[r], error, error_size)) {
+            g_uly_log_rank = -1;
+            return 0;
+        }
+    }
+    g_uly_log_rank = -1;
+    return 1;
+}
+
+/* U>1 SP loop. Pad rows never enter SDPA (S_real only). Same-block ranks
+ * run GEMM/SDPA concurrently; A2A is still a barrier. */
+static int layers_forward_ulysses(
+    h3_dit_w4a8 *ctx, unsigned first_block, unsigned n_blocks, size_t t_row,
+    const float *x, size_t seq, const uint32_t *row_map, const float *rope_cos,
+    const float *rope_sin, float *y, int auto_prefetch,
+    h3_dit_w4a8_layers_stats *stats, char *error, size_t error_size) {
+    const int u = ctx->uly_u;
+    const size_t hidden = H3_DIT_W4A8_HIDDEN;
+    const size_t heads = H3_DIT_W4A8_HEADS;
+    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
+    const size_t inner = H3_DIT_W4A8_INNER;
+    const size_t ffn = H3_DIT_W4A8_FFN;
+    const size_t wide = ffn * 2;
+    const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
+    const size_t seq_real = seq;
+    const size_t seq_pad = (seq + 63u) / 64u * 64u;
+    const size_t seq_local = seq_pad / (size_t)u;
+    const size_t heads_attn = heads / (size_t)u;
+    const size_t mod_elems = dit_adaln_mod_elems(ctx);
+    uly_rank_ws ws[8];
+    uly_job jobs[8];
+    cudaStream_t uly_st[8];
+    cudaEvent_t uly_ev_c[8], uly_ev_h[8];
+    float *modulation = NULL;
+    int mod_pinned = 0;
+    h3_dit_w4a8_sp_comm *comm = &ctx->uly_comm;
+    int orig = -1, ok = 0, r;
+    double ms_qkv = 0.0, ms_a2a_q = 0.0, ms_attn = 0.0, ms_a2a_a = 0.0,
+           ms_mlp = 0.0;
+    int uly_warmed = 0;
+    unsigned b;
+    clock_t t0, t1, t_all0, t_all1;
+    char detail[384];
+    const int want_quiet = !env_flag_is_one("H3_DIT_W4A8_VERBOSE_TIMING");
+    const int rank_serial = env_flag_is_one("H3_ULYSSES_SERIAL");
+
+    memset(ws, 0, sizeof(ws));
+    memset(jobs, 0, sizeof(jobs));
+    memset(uly_st, 0, sizeof(uly_st));
+    memset(uly_ev_c, 0, sizeof(uly_ev_c));
+    memset(uly_ev_h, 0, sizeof(uly_ev_h));
+    cudaGetDevice(&orig);
+    t_all0 = clock();
+    if (ctx->token_reduction) {
+        fail(error, error_size, "ulysses: token-reduction not supported");
+        return 0;
+    }
+    if (!rope_cos || !rope_sin) {
+        fail(error, error_size, "ulysses: rope tables required");
+        return 0;
+    }
+    {
+        int have_dev_in = ctx->io_d_act_a && (ctx->io_flags & 1);
+        int have_dev_out = ctx->io_d_act_b && (ctx->io_flags & 2);
+        if (!x && !have_dev_in) {
+            fail(error, error_size, "ulysses: missing host x / device act_a");
+            return 0;
+        }
+        if (!y && !have_dev_out) {
+            fail(error, error_size, "ulysses: missing host y / device act_b");
+            return 0;
+        }
+    }
+    if (u < 2 || heads % (size_t)u != 0 || seq_pad % (size_t)u != 0) {
+        fail(error, error_size, "ulysses: bad U/heads/pad geometry");
+        return 0;
+    }
+    if (!comm->bind || !comm->a2a_qkv || !comm->a2a_attn_out || !comm->cfg) {
+        fail(error, error_size, "ulysses: comm vtable incomplete");
+        return 0;
+    }
+    if (cudaMallocHost((void **)&modulation, mod_elems * sizeof(float)) ==
+        cudaSuccess) {
+        mod_pinned = 1;
+    } else {
+        modulation = (float *)malloc(mod_elems * sizeof(float));
+    }
+    if (!modulation) {
+        fail(error, error_size, "ulysses: OOM modulation");
+        return 0;
+    }
+
+    for (r = 0; r < u; r++) {
+        h3_dit_w4a8 *rc = ctx->uly_ctx[r];
+        char *base;
+        size_t off = 0, need = 0;
+        size_t start, nreal;
+        if (!uly_set_dev(ctx, r)) {
+            fail(error, error_size, "ulysses: cudaSetDevice");
+            goto done;
+        }
+        need += seq_local * hidden * sizeof(float) * 2;
+        need += mod_elems * sizeof(float);
+        need += ((seq_local * sizeof(uint32_t) + 7) & ~(size_t)7);
+        need += seq_real * rope_half * sizeof(float) * 2;
+        need += (hidden * 2 + head_dim * 2) * sizeof(float);
+        need += seq_local * hidden * sizeof(float) * 2;
+        need += seq_local * inner * 3 * sizeof(float);
+        need += seq_local * wide * sizeof(float);
+        if (!ensure_block_ws(rc, need, error, error_size))
+            goto done;
+        if (rc->int8_store && rc->cache &&
+            !h3_w4a8_cache_refit_after_workspace(rc->cache, detail,
+                                                 sizeof(detail))) {
+            snprintf(error, error_size, "INT8 cache refit: %s", detail);
+            goto done;
+        }
+        /* Drop any scratch that landed on another GPU during TE/open,
+         * then recreate cublas on this rank's device. U=1 never enters. */
+        if (!h3_cuda_bind_device(rc->cuda, detail, sizeof(detail))) {
+            snprintf(error, error_size, "ulysses bind: %s", detail);
+            goto done;
+        }
+        h3_cuda_release_heavy_workspace(rc->cuda);
+        if (!h3_cuda_dit_scratch_rehome(rc->cuda, detail, sizeof(detail))) {
+            snprintf(error, error_size, "scratch rehome: %s", detail);
+            goto done;
+        }
+        if (!h3_cuda_recreate_blas(rc->cuda, detail, sizeof(detail))) {
+            snprintf(error, error_size, "ulysses blas: %s", detail);
+            goto done;
+        }
+        if (!h3_cuda_pregrow_dit_scratch(rc->cuda, seq_real, hidden, heads_attn,
+                                         head_dim, ffn, detail,
+                                         sizeof(detail))) {
+            snprintf(error, error_size, "dit scratch: %s", detail);
+            goto done;
+        }
+        if (rc->convrot_gs > 0 &&
+            !h3_cuda_pregrow_hadamard(rc->cuda, rc->convrot_gs, detail,
+                                      sizeof(detail))) {
+            snprintf(error, error_size, "hadamard: %s", detail);
+            goto done;
+        }
+        base = (char *)rc->d_block_ws;
+#define H3_ULY_F32(n)                                                          \
+    (off += (n) * sizeof(float), (float *)(base + (off - (n) * sizeof(float))))
+        ws[r].d_x = H3_ULY_F32(seq_local * hidden);
+        ws[r].d_y = H3_ULY_F32(seq_local * hidden);
+        ws[r].d_mod = H3_ULY_F32(mod_elems);
+        {
+            size_t map_bytes = (seq_local * sizeof(uint32_t) + 7) & ~(size_t)7;
+            ws[r].d_map = (uint32_t *)(base + off);
+            off += map_bytes;
+        }
+        ws[r].d_cos = H3_ULY_F32(seq_real * rope_half);
+        ws[r].d_sin = H3_ULY_F32(seq_real * rope_half);
+        ws[r].d_n1 = H3_ULY_F32(hidden);
+        ws[r].d_n2 = H3_ULY_F32(hidden);
+        ws[r].d_qn = H3_ULY_F32(head_dim);
+        ws[r].d_kn = H3_ULY_F32(head_dim);
+        ws[r].d_a = H3_ULY_F32(seq_local * hidden);
+        ws[r].d_b = H3_ULY_F32(seq_local * hidden);
+        ws[r].d_qkv = H3_ULY_F32(seq_local * inner * 3);
+        ws[r].d_wide = H3_ULY_F32(seq_local * wide);
+#undef H3_ULY_F32
+        start = (size_t)r * seq_local;
+        nreal = 0;
+        if (start < seq_real) {
+            nreal = seq_real - start;
+            if (nreal > seq_local)
+                nreal = seq_local;
+        }
+        if (nreal) {
+            cudaError_t ce;
+            if (x) {
+                ce = cudaMemcpy(ws[r].d_x, x + start * hidden,
+                                nreal * hidden * sizeof(float),
+                                cudaMemcpyHostToDevice);
+            } else {
+                /* Rank-0 full act → shard. Peer if enabled, else driver
+                 * stages through host (GeForce PCIe typically no P2P). */
+                ce = cudaMemcpy(ws[r].d_x,
+                                ctx->io_d_act_a + start * hidden,
+                                nreal * hidden * sizeof(float),
+                                cudaMemcpyDefault);
+            }
+            if (ce != cudaSuccess) {
+                fail(error, error_size, "ulysses: x scatter");
+                goto done;
+            }
+        }
+        if (nreal < seq_local &&
+            cudaMemset(ws[r].d_x + nreal * hidden, 0,
+                       (seq_local - nreal) * hidden * sizeof(float)) !=
+                cudaSuccess) {
+            fail(error, error_size, "ulysses: x pad");
+            goto done;
+        }
+        if (row_map) {
+            if (nreal &&
+                cudaMemcpy(ws[r].d_map, row_map + start,
+                           nreal * sizeof(uint32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                fail(error, error_size, "ulysses: map H2D");
+                goto done;
+            }
+            if (nreal < seq_local &&
+                cudaMemset(ws[r].d_map + nreal, 0,
+                           (seq_local - nreal) * sizeof(uint32_t)) !=
+                    cudaSuccess) {
+                fail(error, error_size, "ulysses: map pad");
+                goto done;
+            }
+        } else {
+            ws[r].d_map = NULL;
+        }
+        if (cudaMemcpy(ws[r].d_cos, rope_cos,
+                       seq_real * rope_half * sizeof(float),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(ws[r].d_sin, rope_sin,
+                       seq_real * rope_half * sizeof(float),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            fail(error, error_size, "ulysses: rope H2D");
+            goto done;
+        }
+        if (want_quiet)
+            h3_cuda_set_quiet(rc->cuda, 1);
+        jobs[r].root = ctx;
+        jobs[r].rc = rc;
+        jobs[r].ws = &ws[r];
+        jobs[r].comm = comm;
+        jobs[r].rank = r;
+        jobs[r].seq_local = seq_local;
+        jobs[r].seq_real = seq_real;
+        jobs[r].seq_pad = seq_pad;
+        jobs[r].heads = heads;
+        jobs[r].heads_attn = heads_attn;
+        jobs[r].head_dim = head_dim;
+        jobs[r].hidden = hidden;
+        jobs[r].mod_elems = mod_elems;
+        /* Default stream per device (same as U=1). Overlap comes from
+         * enqueue-all-then-join-all, not from a side stream: cublasLt /
+         * cuDNN IMA'd on cudaStreamNonBlocking. A2A pack already waits
+         * on stream 0. */
+        jobs[r].compute_stream = NULL;
+        jobs[r].ev_comp = NULL;
+        jobs[r].ev_host = NULL;
+    }
+    printf("ulysses_rank_parallel: U=%d serial=%d enqueue=%s streams=0 "
+           "phase_sync=%d\n",
+           u, rank_serial, rank_serial ? "per-rank" : "all-then-join",
+           env_flag_is_one("H3_ULYSSES_PHASE_SYNC"));
+    fflush(stdout);
+
+    if (auto_prefetch) {
+        for (r = 0; r < u; r++) {
+            double ignore = 0.0;
+            unsigned n_pref = n_blocks;
+            unsigned win;
+            if (!uly_set_dev(ctx, r))
+                goto done;
+            win = h3_w4a8_cache_window_size(ctx->uly_ctx[r]->cache);
+            if (win > 0 && win < n_pref)
+                n_pref = win;
+            if (!h3_dit_w4a8_prefetch(ctx->uly_ctx[r], first_block, n_pref,
+                                      &ignore, error, error_size))
+                goto done;
+            if (stats && r == 0)
+                stats->prefetch_ms = ignore;
+        }
+    }
+
+    t0 = clock();
+    for (b = 0; b < n_blocks; b++) {
+        unsigned block = first_block + b;
+        const h3_dit_w4a8_block_aux *aux =
+            dit_aux_cached(ctx, block, error, error_size);
+        if (!aux)
+            goto done;
+        if (!project_block_adaln_metal(ctx, aux, t_row, modulation, error,
+                                       error_size))
+            goto done;
+        if (b + 1 < n_blocks) {
+            for (r = 0; r < u; r++) {
+                double ignore = 0.0;
+                if (!uly_set_dev(ctx, r))
+                    goto done;
+                if (!h3_dit_w4a8_prefetch(ctx->uly_ctx[r], block + 1, 1,
+                                          &ignore, error, error_size))
+                    goto done;
+            }
+        }
+        for (r = 0; r < u; r++) {
+            jobs[r].block = block;
+            jobs[r].modulation = modulation;
+            jobs[r].aux = aux;
+        }
+        {
+            double t0p = uly_now_ms(), t1p;
+            if (!uly_run_ranks(jobs, u, ULY_PH_QKV, error, error_size,
+                               !uly_warmed))
+                goto done;
+            uly_warmed = 1;
+            if (!uly_join_compute_to_default(jobs, u, error, error_size))
+                goto done;
+            if (!uly_bind_phase(jobs, u, ULY_PH_QKV, error, error_size))
+                goto done;
+            t1p = uly_now_ms();
+            ms_qkv += t1p - t0p;
+            t0p = t1p;
+            if (!comm->a2a_qkv(comm->cfg, seq_local, heads, head_dim, error,
+                               error_size))
+                goto done;
+            if (!uly_join_default_to_compute(jobs, u, error, error_size))
+                goto done;
+            t1p = uly_now_ms();
+            ms_a2a_q += t1p - t0p;
+            t0p = t1p;
+            if (!uly_run_ranks(jobs, u, ULY_PH_ATTN, error, error_size, 0))
+                goto done;
+            if (!uly_join_compute_to_default(jobs, u, error, error_size))
+                goto done;
+            if (!uly_bind_phase(jobs, u, ULY_PH_ATTN, error, error_size))
+                goto done;
+            t1p = uly_now_ms();
+            ms_attn += t1p - t0p;
+            t0p = t1p;
+            if (!comm->a2a_attn_out(comm->cfg, seq_local, heads, head_dim,
+                                    error, error_size))
+                goto done;
+            if (!uly_join_default_to_compute(jobs, u, error, error_size))
+                goto done;
+            t1p = uly_now_ms();
+            ms_a2a_a += t1p - t0p;
+            t0p = t1p;
+            if (!uly_run_ranks(jobs, u, ULY_PH_MLP, error, error_size, 0))
+                goto done;
+            t1p = uly_now_ms();
+            ms_mlp += t1p - t0p;
+        }
+    }
+
+    if (!uly_join_compute_to_default(jobs, u, error, error_size))
+        goto done;
+    for (r = 0; r < u; r++) {
+        size_t start = (size_t)r * seq_local;
+        size_t nreal = 0;
+        if (start < seq_real) {
+            nreal = seq_real - start;
+            if (nreal > seq_local)
+                nreal = seq_local;
+        }
+        if (!nreal)
+            continue;
+        if (!uly_set_dev(ctx, r))
+            goto done;
+        {
+            cudaError_t ce;
+            if (y) {
+                ce = cudaMemcpy(y + start * hidden, ws[r].d_x,
+                                nreal * hidden * sizeof(float),
+                                cudaMemcpyDeviceToHost);
+            } else {
+                ce = cudaMemcpy(ctx->io_d_act_b + start * hidden, ws[r].d_x,
+                                nreal * hidden * sizeof(float),
+                                cudaMemcpyDefault);
+            }
+            if (ce != cudaSuccess) {
+                fail(error, error_size, "ulysses: y gather");
+                goto done;
+            }
+        }
+    }
+    if (!y && ctx->io_d_act_b)
+        ctx->io_d_result = ctx->io_d_act_b;
+
+    t1 = clock();
+    t_all1 = clock();
+    if (stats) {
+        size_t i, n = seq_real * hidden;
+        size_t stride = n > 4096 ? (n / 4096) : 1;
+        stats->first_block = first_block;
+        stats->n_blocks = n_blocks;
+        stats->blocks_ms = elapsed_ms(t0, t1);
+        stats->total_ms = elapsed_ms(t_all0, t_all1);
+        stats->all_finite = 1;
+        if (y) {
+            for (i = 0; i < n; i += stride) {
+                if (!isfinite(y[i])) {
+                    stats->all_finite = 0;
+                    break;
+                }
+            }
+        }
+    }
+    printf("ulysses_split: U=%d qkv_enq=%.1f a2a_q(+qkv_gpu)=%.1f "
+           "attn_enq=%.1f a2a_a(+sdpa_gpu)=%.1f mlp_enq=%.1f ms\n",
+           u, ms_qkv, ms_a2a_q, ms_attn, ms_a2a_a, ms_mlp);
+    fflush(stdout);
+    ok = 1;
+done:
+    for (r = 0; r < u; r++) {
+        char ign[64];
+        if (ctx->uly_ctx[r] && ctx->uly_ctx[r]->cuda) {
+            h3_cuda_set_quiet(ctx->uly_ctx[r]->cuda, 0);
+            (void)h3_cuda_set_op_stream(ctx->uly_ctx[r]->cuda, NULL, ign,
+                                        sizeof(ign));
+        }
+        if (comm->set_compute)
+            (void)comm->set_compute(comm->cfg, r, NULL, ign, sizeof(ign));
+        if (uly_st[r] || uly_ev_c[r] || uly_ev_h[r]) {
+            if (ctx->uly_dev[r] >= 0)
+                cudaSetDevice(ctx->uly_dev[r]);
+            if (uly_st[r])
+                cudaStreamDestroy(uly_st[r]);
+            if (uly_ev_c[r])
+                cudaEventDestroy(uly_ev_c[r]);
+            if (uly_ev_h[r])
+                cudaEventDestroy(uly_ev_h[r]);
+        }
+    }
+    if (orig >= 0)
+        cudaSetDevice(orig);
+    if (mod_pinned)
+        cudaFreeHost(modulation);
+    else
+        free(modulation);
+    return ok;
+}
+
 int h3_dit_w4a8_layers_forward_f32(
     h3_dit_w4a8 *ctx, unsigned first_block, unsigned n_blocks, size_t t_row,
     const float *x, size_t seq, const uint32_t *row_map, const float *rope_cos,
@@ -3051,6 +4332,10 @@ int h3_dit_w4a8_layers_forward_f32(
         fail(error, error_size, "layers_forward block range out of bounds");
         return 0;
     }
+    if (ctx->uly_u > 1)
+        return layers_forward_ulysses(ctx, first_block, n_blocks, t_row, x, seq,
+                                      row_map, rope_cos, rope_sin, y,
+                                      auto_prefetch, stats, error, error_size);
 
     if (stats) {
         stats->first_block = first_block;
@@ -3329,7 +4614,7 @@ int h3_dit_w4a8_layers_forward_f32(
                     }
                     next_ready = 0;
                     if (!block_device_compute(
-                            ctx, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y,
+                            ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y,
                             d_mod[cur], d_map, d_cos, d_sin, d_n1[cur],
                             d_n2[cur], d_qn[cur], d_kn[cur], d_a, d_b, d_qkv,
                             d_wide, seq, NULL, detail, sizeof(detail))) {
@@ -3659,7 +4944,7 @@ int h3_dit_w4a8_layers_forward_f32(
                 goto done_dev;
             }
 
-            if (!block_device_compute(ctx, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y,
+            if (!block_device_compute(ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y,
                                       d_mod, d_map, d_cos, d_sin, d_n1, d_n2,
                                       d_qn, d_kn, d_a, d_b, d_qkv, d_wide, seq,
                                       NULL, detail, sizeof(detail))) {
@@ -4517,7 +5802,8 @@ int h3_dit_w4a8_forward_video_f32(
     clock_t t0, t1, tall0, tall1;
     int ok = 0;
     const int use_resident =
-        ctx && ctx->cuda && !env_flag_is_one("H3_DIT_W4A8_HOST_FWD") &&
+        ctx && ctx->cuda &&
+        !env_flag_is_one("H3_DIT_W4A8_HOST_FWD") &&
         !env_flag_is_one("H3_DIT_W4A8_HOST_DENSE") &&
         !env_flag_is_one("H3_DIT_W4A8_FORCE_HOST_BLOCK");
     float *d_final_x = NULL;
@@ -4745,7 +6031,8 @@ int h3_dit_w4a8_forward_avc_f32(
     clock_t t0, t1, tall0, tall1;
     int ok = 0;
     const int use_resident =
-        ctx && ctx->cuda && !env_flag_is_one("H3_DIT_W4A8_HOST_FWD") &&
+        ctx && ctx->cuda &&
+        !env_flag_is_one("H3_DIT_W4A8_HOST_FWD") &&
         !env_flag_is_one("H3_DIT_W4A8_HOST_DENSE") &&
         !env_flag_is_one("H3_DIT_W4A8_FORCE_HOST_BLOCK");
     float *d_final_x = NULL;

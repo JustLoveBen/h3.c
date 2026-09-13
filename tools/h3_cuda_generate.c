@@ -23,6 +23,15 @@
 #include "h3_vision_cuda.h"
 #include "h3_audio_vae_cuda.h"
 #include "h3_audio_vae_layout.h"
+#include "h3_cuda_device_caps.h"
+#include "h3_generate_preset.h"
+#include "h3_lora.h"
+#include "h3_sdpa.h"
+#include "h3_step_cache.h"
+#include "h3_tae.h"
+#include "h3_te_cache.h"
+#include "h3_ulysses.h"
+#include "h3_ulysses_comm.h"
 
 #include <cuda_runtime.h>
 #include <fcntl.h>
@@ -154,6 +163,47 @@ static void *sdpa_prebuild_th(void *arg) {
     j->ok = h3_cuda_sdpa_prebuild(j->cuda, j->seq, j->heads, j->dim, j->scale,
                                   j->causal, j->err, sizeof(j->err));
     return NULL;
+}
+
+/* TE-overlap: disk → pinned host only (no GPU). Step1 then H2D-only. */
+typedef struct {
+    h3_dit_w4a8 *dit;
+    unsigned first;
+    unsigned n;
+    double ms;
+    char err[256];
+    int ok;
+} dit_host_stage_job;
+
+static void *dit_host_stage_th(void *arg) {
+    dit_host_stage_job *j = (dit_host_stage_job *)arg;
+    if (!j || !j->dit) return NULL;
+    j->ok = h3_dit_w4a8_stage_host(j->dit, j->first, j->n, &j->ms, j->err,
+                                   sizeof(j->err));
+    return NULL;
+}
+
+typedef struct {
+    dit_host_stage_job *job;
+    pthread_t *th;
+    int *ok;
+    double *t0;
+} host_stage_kick;
+
+static void kick_dit_host_stage(void *arg) {
+    host_stage_kick *k = (host_stage_kick *)arg;
+    if (!k || !k->job || !k->job->dit || !k->th || !k->ok || !k->t0) return;
+    if (*k->ok) return;
+    *k->t0 = now_ms();
+    if (pthread_create(k->th, NULL, dit_host_stage_th, k->job) == 0) {
+        *k->ok = 1;
+        printf("dit_host_stage: after_te_packed disk→host blocks=%u "
+               "(no GPU; H3_DIT_HOST_STAGE_TE=0 disables)\n",
+               k->job->n);
+    } else {
+        printf("dit_host_stage: pthread_create failed; step1 will disk-load\n");
+    }
+    fflush(stdout);
 }
 
 static void *vae_willneed_th(void *arg) {
@@ -329,6 +379,18 @@ static const char *official_keyframe_flag(const char *first, const char *last) {
     if (first && last) return "--first-frame/--last-frame";
     if (last) return "--last-frame";
     return "--first-frame";
+}
+
+/* Last-frame COND RoPE time. Metal uses aligned last pixel
+ * (text_len + span_sum(T) - 5/3 == text_len + (aligned-1)*(5/3)).
+ * CUDA muxes frames_req of VAE output (5s: 120 of 124). Binding the
+ * padded last pixel (123) parks the lock in dropped frames 120–123
+ * (latent t=T-1); mux f119 is the previous 1-frame latent. Product
+ * last-frame must use mux last so 5.000s/120 actually shows it. */
+static float fl2va_last_condition_time(size_t text_len, int last_pixel) {
+    if (last_pixel < 0)
+        last_pixel = 0;
+    return (float)text_len + (5.0f / 3.0f) * (float)last_pixel;
 }
 
 #ifndef H3_CUDA_MAX_REF_IMAGES
@@ -676,6 +738,49 @@ static int write_wav_f32_stereo(const char *path, const float *pcm_ch_major,
     return 1;
 }
 
+static int gen_uly_bind(void *cfg, int rank, const void *d_in, void *d_out,
+                        char *err, size_t err_size) {
+    return h3_ulysses_comm_bind((h3_ulysses_cfg *)cfg, rank, d_in, d_out, err,
+                                err_size);
+}
+
+static int gen_uly_set_compute(void *cfg, int rank, void *stream, char *err,
+                               size_t err_size) {
+    return h3_ulysses_comm_set_compute((h3_ulysses_cfg *)cfg, rank, stream, err,
+                                       err_size);
+}
+
+static int gen_uly_a2a_qkv(void *cfg, size_t seq_local, size_t heads,
+                           size_t head_dim, char *err, size_t err_size) {
+    return h3_ulysses_a2a_qkv((h3_ulysses_cfg *)cfg, NULL, NULL, seq_local,
+                              heads, head_dim, 4, err, err_size);
+}
+
+static int gen_uly_a2a_attn(void *cfg, size_t seq_local, size_t heads,
+                            size_t head_dim, char *err, size_t err_size) {
+    return h3_ulysses_a2a_attn_out((h3_ulysses_cfg *)cfg, NULL, NULL, seq_local,
+                                   heads, head_dim, 4, err, err_size);
+}
+
+static void gen_uly_free_ranks(h3_dit_w4a8 *dit0, h3_dit_w4a8 **uly_dit,
+                               h3_cuda **uly_cuda) {
+    int ui;
+    char ignore[64];
+    if (dit0)
+        (void)h3_dit_w4a8_set_ulysses(dit0, NULL, NULL, 1, NULL, ignore,
+                                      sizeof(ignore));
+    for (ui = 1; ui < 8; ui++) {
+        if (uly_dit && uly_dit[ui]) {
+            h3_dit_w4a8_free(uly_dit[ui]);
+            uly_dit[ui] = NULL;
+        }
+        if (uly_cuda && uly_cuda[ui]) {
+            h3_cuda_free(uly_cuda[ui]);
+            uly_cuda[ui] = NULL;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     const char *dit_path = NULL, *vae_path = NULL, *te_path = NULL;
     const char *audio_vae_path = NULL;
@@ -684,6 +789,18 @@ int main(int argc, char **argv) {
     int audio_vae_explicit = 0;
     const char *out_dir = "out_cuda_t2v";
     const char *sdpa = "cudnn";
+    const char *preset_name = NULL;
+    const char *lora_path = NULL;
+    const char *vae_decode = "official";
+    const char *tae_path = NULL;
+    const char *te_cache_dir = NULL;
+    float lora_scale = 1.0f;
+    int steps_explicit = 0, sdpa_explicit = 0;
+    int ulysses = 1;
+    h3_generate_preset_out preset_out;
+    h3_lora_set lora_set;
+    int lora_loaded = 0;
+    h3_ulysses_cfg ulysses_cfg;
     const char *token_ids_file = NULL;
     const char *token_ids_list = NULL;
     const char *token_canary = NULL;
@@ -708,8 +825,9 @@ int main(int argc, char **argv) {
     int vae_repeats = 1;
     int steps = 2;
     int reuse = 0; /* 0=default full-eval baseline; --reuse N opt-in */
-    float magcache_thresh = 0.0f; /* 0=off; vLLM H3 TeaCache ref ~0.17 */
-    int magcache_calibrated = 0; /* 1=TeaCache-style poly on rel_l1 */
+    float magcache_thresh = 0.0f; /* 0=off; lite Mag; ≠ independent Tea */
+    int magcache_calibrated = 0; /* Tea-style poly under mag flag (legacy) */
+    h3_step_cache step_cache;    /* independent Tea / FB / Easy stub */
     int token_reduction = 0; /* Metal --token-reduction */
     int lock_first_frame = 0; /* debug G3-lite: keep t=0 latent slice fixed */
     int init_first_frame = 0; /* debug G3-lite: t=0 img2img from --init-latent */
@@ -793,12 +911,15 @@ int main(int argc, char **argv) {
     int mag_consec = 0;
     int mag_max_consec = 2; /* H3 Safe: at most 2 adjacent skips */
     int mag_fresh = 0; /* 1 after a small-delta eval; 0 after force_eval */
+    char step_cache_err[256];
 
     h3_w4a8_store *dit_store = NULL;
     h3_dit_int8_store *dit_int8 = NULL;
     int dit_is_int8 = 0;
     h3_cuda *cuda = NULL;
     h3_dit_w4a8 *dit = NULL;
+    h3_cuda *uly_cuda[8];
+    h3_dit_w4a8 *uly_dit[8];
     h3_dit_w4a8_core core;
     h3_w4a8_cache_config cfg;
     h3_nvfp4_store te_store;
@@ -824,11 +945,16 @@ int main(int argc, char **argv) {
     pthread_t sdpa_th = 0;
     pthread_t vae_th = 0;
     pthread_t audio_th = 0;
+    pthread_t host_stage_th = 0;
     int sdpa_th_ok = 0;
     int vae_th_ok = 0;
     int audio_th_ok = 0;
+    int host_stage_th_ok = 0;
     sdpa_prebuild_job sdpa_job;
     audio_decode_job audio_job;
+    dit_host_stage_job host_stage_job;
+    host_stage_kick host_stage_kick_job;
+    double host_stage_t0 = 0.0;
 
     memset(&core, 0, sizeof(core));
     memset(&te_store, 0, sizeof(te_store));
@@ -840,12 +966,24 @@ int main(int argc, char **argv) {
     memset(&ast, 0, sizeof(ast));
     memset(&sdpa_job, 0, sizeof(sdpa_job));
     memset(&audio_job, 0, sizeof(audio_job));
+    memset(&host_stage_job, 0, sizeof(host_stage_job));
+    memset(&host_stage_kick_job, 0, sizeof(host_stage_kick_job));
+    memset(&preset_out, 0, sizeof(preset_out));
+    memset(&lora_set, 0, sizeof(lora_set));
+    memset(&ulysses_cfg, 0, sizeof(ulysses_cfg));
+    memset(uly_cuda, 0, sizeof(uly_cuda));
+    memset(uly_dit, 0, sizeof(uly_dit));
+    ulysses_cfg.tp_size = 1;
+    ulysses_cfg.ulysses = 1;
+    ulysses_cfg.ring = 1;
     memset(vision_spans, 0, sizeof(vision_spans));
     memset(ref_rgb, 0, sizeof(ref_rgb));
     memset(ref_image_paths, 0, sizeof(ref_image_paths));
     memset(ref_audio_paths, 0, sizeof(ref_audio_paths));
     vision_ds[0] = vision_ds[1] = vision_ds[2] = NULL;
 
+    h3_step_cache_init(&step_cache);
+    step_cache_err[0] = '\0';
     for (iarg = 1; iarg < argc; iarg++) {
         if (!strcmp(argv[iarg], "--dit") && iarg + 1 < argc)
             dit_path = argv[++iarg];
@@ -869,8 +1007,10 @@ int main(int argc, char **argv) {
             vae_repeats = (int)strtol(argv[++iarg], NULL, 10);
             if (vae_repeats < 1) vae_repeats = 1;
         }
-        else if (!strcmp(argv[iarg], "--steps") && iarg + 1 < argc)
+        else if (!strcmp(argv[iarg], "--steps") && iarg + 1 < argc) {
             steps = (int)strtol(argv[++iarg], NULL, 10);
+            steps_explicit = 1;
+        }
         else if (!strcmp(argv[iarg], "--reuse") && iarg + 1 < argc) {
             reuse = (int)strtol(argv[++iarg], NULL, 10);
             if (reuse < 1) reuse = 1;
@@ -883,7 +1023,45 @@ int main(int argc, char **argv) {
                 magcache_thresh = 0.0f;
         } else if (!strcmp(argv[iarg], "--magcache-calibrated")) {
             magcache_calibrated = 1;
-        }         else if (!strcmp(argv[iarg], "--token-reduction")) {
+        } else if (!strcmp(argv[iarg], "--teacache-thresh") &&
+                   iarg + 1 < argc) {
+            if (step_cache.kind != H3_STEP_CACHE_OFF &&
+                step_cache.kind != H3_STEP_CACHE_TEA) {
+                fprintf(stderr,
+                        "h3: --teacache-thresh conflicts with other "
+                        "step-cache kind (%s)\n",
+                        h3_step_cache_kind_name(step_cache.kind));
+                return 1;
+            }
+            step_cache.kind = H3_STEP_CACHE_TEA;
+            step_cache.thresh = (float)strtod(argv[++iarg], NULL);
+            if (!(step_cache.thresh > 0.0f) || !isfinite(step_cache.thresh)) {
+                step_cache.thresh = 0.0f;
+                step_cache.kind = H3_STEP_CACHE_OFF;
+            }
+        } else if (!strcmp(argv[iarg], "--fbcache-thresh") &&
+                   iarg + 1 < argc) {
+            if (step_cache.kind != H3_STEP_CACHE_OFF &&
+                step_cache.kind != H3_STEP_CACHE_FB) {
+                fprintf(stderr,
+                        "h3: --fbcache-thresh conflicts with other "
+                        "step-cache kind (%s)\n",
+                        h3_step_cache_kind_name(step_cache.kind));
+                return 1;
+            }
+            step_cache.kind = H3_STEP_CACHE_FB;
+            step_cache.thresh = (float)strtod(argv[++iarg], NULL);
+            if (!(step_cache.thresh > 0.0f) || !isfinite(step_cache.thresh)) {
+                step_cache.thresh = 0.0f;
+                step_cache.kind = H3_STEP_CACHE_OFF;
+            }
+        } else if (!strcmp(argv[iarg], "--easycache-thresh") &&
+                   iarg + 1 < argc) {
+            /* Stub: always hard-fail at validate (NOT IMPLEMENTED). */
+            (void)strtod(argv[++iarg], NULL);
+            step_cache.kind = H3_STEP_CACHE_EASY;
+            step_cache.thresh = 1.0f;
+        } else if (!strcmp(argv[iarg], "--token-reduction")) {
             token_reduction = 1;
         } else if (!strcmp(argv[iarg], "--token-ids-file") && iarg + 1 < argc) {
             token_ids_file = argv[++iarg];
@@ -976,8 +1154,23 @@ int main(int argc, char **argv) {
             frames_override = (int)strtol(argv[++iarg], NULL, 10);
         else if (!strcmp(argv[iarg], "--audio-t") && iarg + 1 < argc)
             audio_t = (int)strtol(argv[++iarg], NULL, 10);
-        else if (!strcmp(argv[iarg], "--sdpa-backend") && iarg + 1 < argc)
+        else if (!strcmp(argv[iarg], "--sdpa-backend") && iarg + 1 < argc) {
             sdpa = argv[++iarg];
+            sdpa_explicit = 1;
+        } else if (!strcmp(argv[iarg], "--preset") && iarg + 1 < argc)
+            preset_name = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--lora") && iarg + 1 < argc)
+            lora_path = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--lora-scale") && iarg + 1 < argc)
+            lora_scale = (float)strtod(argv[++iarg], NULL);
+        else if (!strcmp(argv[iarg], "--ulysses") && iarg + 1 < argc)
+            ulysses = (int)strtol(argv[++iarg], NULL, 10);
+        else if (!strcmp(argv[iarg], "--vae-decode") && iarg + 1 < argc)
+            vae_decode = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--tae") && iarg + 1 < argc)
+            tae_path = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--te-cache") && iarg + 1 < argc)
+            te_cache_dir = argv[++iarg];
         else if (!strcmp(argv[iarg], "--window") && iarg + 1 < argc) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%s", argv[++iarg]);
@@ -1020,11 +1213,24 @@ int main(int argc, char **argv) {
                     "(default off; pass 1 for explicit full-eval schedule)\n"
                     "  --token-reduction  Metal-compatible horizontal video "
                     "token pooling in middle blocks\n"
-                    "  --magcache-thresh T  MagCache / TeaCache-style skip "
-                    "(0=off default; H3 Safe A/B try 0.08, max 2 consec)\n"
-                    "  --magcache-calibrated  Use poly(rel_l1) curve "
-                    "(more stable hits; still opt-in)\n"
+                    "  --magcache-thresh T  MagCache lite skip "
+                    "(0=off default; H3 Safe A/B try 0.08, max 2 consec). "
+                    "Not independent TeaCache; calibrated flag ≈ Tea-style "
+                    "poly under the mag CLI.\n"
+                    "  --magcache-calibrated  Use poly(rel_l1) under mag "
+                    "(legacy; prefer --teacache-thresh for independent Tea)\n"
                     "                      magcache ignored when --reuse > 1\n"
+                    "  --teacache-thresh T  Independent TeaCache "
+                    "(poly rel_L1 + AV veto; 0=off default). "
+                    "Hard-mutex with mag/fb/reuse>1. "
+                    "H3_TEACACHE_MAX_CONSEC (default 2). "
+                    "8-step: do NOT copy 50-step 0.10/0.17 as lossless.\n"
+                    "  --fbcache-thresh T   Conservative FBCache residual gate "
+                    "on velocity |ratio-1| (+AV veto; 0=off). "
+                    "Hard-mutex with tea/mag/reuse>1. "
+                    "H3_FBCACHE_MAX_CONSEC / H3_FBCACHE_WARMUP.\n"
+                    "  --easycache-thresh T  NOT IMPLEMENTED (hard error; "
+                    "refuses half-wired EasyCache on AV path)\n"
                     "  --context N        TE length *budget* (default %u). "
                     "With --token-ids*: uses exact id count (auto-raises up to "
                     "%u; NEVER silent-truncates). Smoke-only smaller N is OK; "
@@ -1044,6 +1250,33 @@ int main(int argc, char **argv) {
                     "Mux is always 24 fps, so --frames 17 → ~0.92s even with "
                     "--seconds 5. For 5s/10s product clips omit this.\n"
                     "  --seed N           Noise seed (default 0x483343554441)\n"
+                    "  --preset gold|turbo4\n"
+                    "      gold（可省略）= 今日金线路径，不改 steps/backend/cache。\n"
+                    "      turbo4 = 非金线极速档：steps=4 + sage3 + 要求 --lora；cache 关。\n"
+                    "      未蒸馏 --steps 4 而无 LoRA 不是产品。缺省不传 preset。\n"
+                    "      --preset fast4 已更名为 turbo4。\n"
+                    "  --lora FILE.safetensors   turbo4 必填；金线禁止依赖此文件\n"
+                    "  --lora-scale S            默认 1.0\n"
+                    "  --ulysses N        Sequence-parallel Ulysses (default 1).\n"
+                    "                     Experimental. Legal {1,2,4,8}; U=7 illegal.\n"
+                    "                     N=1 does not init NCCL. Does not change sdpa.\n"
+                    "                     N>1 drives DiT A2A after QKV+LoRA; SDPA uses\n"
+                    "                     S_real (pad rows excluded). Gold default stays 1.\n"
+                    "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
+                    "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
+                    "                     Text-only; vision/multimodal never cached.\n"
+                    "  --vae-decode official|tae  Default official. tae 仅 turbo4\n"
+                    "                     （TAE 不是金线成片）；需 --tae 权，禁止静默 official。\n"
+                    "  --tae FILE         TAE weights (turbo + --vae-decode tae)\n"
+                    "  --sdpa-backend B   DiT SDPA (h3_sdpa registry):\n"
+                    "                     Tier-0 quality: cudnn (default) | auto→cudnn\n"
+                    "                     Tier-1 accel:   sage3 | sol_cute  (first-class)\n"
+                    "                     Forbidden product: sage2 (ref), sol (nested-loop)\n"
+                    "                     Legacy debug: flash | tc\n"
+                    "                     Env H3_CUDA_SDPA_BACKEND. Never auto-picks lossy.\n"
+                    "                     sage3: H3_SAGE3_LIB + H3_SAGE3_ROOT (5090/FP4).\n"
+                    "                     sol_cute: H3_SOL_CUTE_LIB + H3_SOL_ATTN_ROOT "
+                    "(4090/sm_89).\n"
                     "  --cfg S            CFG scale. Two defaults: T2VA theme "
                     "path is 5 (underwater turtle / orange cat gates need it). "
                     "Official --first-frame F2VA / --last-frame L2VA / both "
@@ -1101,13 +1334,15 @@ int main(int argc, char **argv) {
                     "embedded soundtrack.\n"
                     "  --last-frame IMG   Official L2VA/FL2VA condition: jpeg → "
                     "VAE encode → DiT COND rows + Qwen vision TE. COVER-crop to "
-                    "canvas (Metal last-frame fit). keyframes=[frame_count-1]; "
-                    "condition_time = text_seq + video_span_sum - 5/3 "
-                    "(end of video RoPE axis, not t=0). Default --cfg 1. "
-                    "Not G3-lite; do not mix with lite flags or --ref-*. "
-                    "With --first-frame: FL2VA pack [text|cond0|cond1|audio|"
-                    "video], first STRETCH at text_seq, last COVER at the "
-                    "frozen L2VA formula. With --skip-dit: VAE roundtrip "
+                    "canvas (Metal last-frame fit). keyframes=[mux_last]; "
+                    "condition_time = text_seq + (mux_frames-1)*(5/3) so the "
+                    "lock sits on the delivered last frame (5s mux 120 of "
+                    "VAE 124; Metal aligned-last=123 is dropped). Default "
+                    "--cfg 1. Not G3-lite; do not mix with lite flags or "
+                    "--ref-*. With --first-frame: FL2VA pack "
+                    "[text|cond0|cond1|audio|video], first STRETCH at "
+                    "text_seq, last COVER at mux-last RoPE. With --skip-dit: "
+                    "VAE roundtrip "
                     "ceiling for the last-frame canvas (use decoded f0 vs "
                     "COVER; do not use temporally-blurred still-plant last "
                     "frame as the ceiling).\n"
@@ -1152,6 +1387,83 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[iarg]);
             return 2;
+        }
+    }
+
+    h3_step_cache_apply_env(&step_cache);
+    if (!h3_step_cache_validate(&step_cache, magcache_thresh,
+                               reuse_explicit ? reuse : 1, step_cache_err,
+                               sizeof(step_cache_err))) {
+        fprintf(stderr, "h3: step_cache: %s\n", step_cache_err);
+        return 2;
+    }
+
+    {
+        h3_generate_preset_in pin;
+        memset(&pin, 0, sizeof(pin));
+        pin.preset_name = preset_name;
+        pin.lora_path = lora_path;
+        pin.steps_explicit = steps_explicit;
+        pin.steps = steps;
+        pin.sdpa_explicit = sdpa_explicit;
+        pin.sdpa = sdpa;
+        pin.cfg_explicit = cfg_explicit;
+        pin.cfg_scale = cfg_scale;
+        pin.magcache_thresh = magcache_thresh;
+        pin.step_cache_kind = (int)step_cache.kind;
+        pin.reuse_interval = reuse_explicit ? reuse : 1;
+        if (!h3_generate_preset_apply(&pin, &preset_out, error, sizeof(error))) {
+            fprintf(stderr, "h3: %s\n", error);
+            return 1;
+        }
+        steps = preset_out.steps;
+        sdpa = preset_out.sdpa;
+        cfg_scale = preset_out.cfg_scale;
+        if (preset_out.lora_path)
+            lora_path = preset_out.lora_path;
+        if (preset_out.non_gold)
+            fprintf(stderr, "h3: preset=turbo4 非金线（MAE 金线不适用）\n");
+    }
+    if (ulysses < 1)
+        ulysses = 1;
+    ulysses_cfg.tp_size = 1;
+    ulysses_cfg.ulysses = ulysses;
+    ulysses_cfg.ring = 1;
+    ulysses_cfg.world_size = ulysses;
+    if (!h3_ulysses_validate(H3_DIT_W4A8_HEADS, H3_ULYSSES_PACKED_ALIGN, 1,
+                             ulysses, 1, error, sizeof(error))) {
+        fprintf(stderr, "h3: %s\n", error);
+        return 1;
+    }
+    if (ulysses > 1 && token_reduction) {
+        fprintf(stderr, "h3: --ulysses>1 与 --token-reduction 互斥\n");
+        return 1;
+    }
+    if (!te_cache_dir || !te_cache_dir[0]) {
+        const char *e = getenv("H3_TE_PROMPT_CACHE");
+        if (e && e[0])
+            te_cache_dir = e;
+    }
+    if (strcmp(vae_decode, "official") != 0 && strcmp(vae_decode, "tae") != 0) {
+        fprintf(stderr, "h3: --vae-decode must be official|tae\n");
+        return 1;
+    }
+    if (!strcmp(vae_decode, "tae")) {
+        if (!preset_out.non_gold) {
+            fprintf(stderr, "h3: TAE 不是金线成片（仅 --preset turbo4）\n");
+            return 1;
+        }
+        if (!tae_path || !tae_path[0]) {
+            fprintf(stderr, "h3: --vae-decode tae 需要 --tae 权（不静默 official）\n");
+            return 1;
+        }
+        {
+            void *tae_ctx = NULL;
+            if (!h3_tae_open(tae_path, &tae_ctx, error, sizeof(error))) {
+                fprintf(stderr, "h3: %s\n", error);
+                return 1;
+            }
+            h3_tae_close(tae_ctx);
         }
     }
 
@@ -1311,7 +1623,10 @@ int main(int argc, char **argv) {
         int mux_n;
         frames_req = frames_override > 0 ? frames_override : (seconds * 24);
         frames_aligned = align_frame_count(frames_req < 1 ? 1 : frames_req);
-        last_keyframe = frames_aligned > 0 ? frames_aligned - 1 : 0;
+        /* Bind last-frame to the muxed last pixel, not aligned-1 (dropped). */
+        last_keyframe = frames_req > 0 ? frames_req - 1 : 0;
+        if (frames_aligned > 0 && last_keyframe > frames_aligned - 1)
+            last_keyframe = frames_aligned - 1;
         latent_w = width / 16;
         latent_h = height / 16;
         latent_t = video_latent_t_from_frames(frames_aligned);
@@ -1352,6 +1667,35 @@ int main(int argc, char **argv) {
         dist_attn = 1;
 
     setenv("H3_CUDA_SDPA_BACKEND", sdpa, 1);
+    {
+        h3_cuda_device_caps caps;
+        h3_sdpa_backend_id sid;
+        int avail = 0;
+        char reason[320];
+        char caps_line[384];
+        if (h3_cuda_query_caps(device, &caps, error, sizeof(error))) {
+            h3_cuda_caps_format(&caps, caps_line, sizeof(caps_line));
+            printf("device_caps: %s\n", caps_line);
+            h3_sdpa_resolve(sdpa, &caps, &sid, &avail, reason, sizeof(reason));
+            printf("sdpa_select: request=%s resolved=%s available=%d (%s)\n",
+                   sdpa, h3_sdpa_backend_id_name(sid), avail, reason);
+            if (!avail && (sid == H3_SDPA_ID_SAGE3 || sid == H3_SDPA_ID_SOL_CUTE)) {
+                fprintf(stderr,
+                        "error: Tier-1 SDPA '%s' not available: %s\n"
+                        "  (will not silently use nested-loop/sage2 fake kernels)\n",
+                        h3_sdpa_backend_id_name(sid), reason);
+                return 1;
+            }
+            if (sid == H3_SDPA_ID_SAGE2 || sid == H3_SDPA_ID_SOL) {
+                fprintf(stderr,
+                        "warning: '%s' is forbidden as a product backend "
+                        "(reference / nested-loop fake)\n",
+                        h3_sdpa_backend_id_name(sid));
+            }
+        } else {
+            fprintf(stderr, "warning: device_caps probe failed: %s\n", error);
+        }
+    }
     effective_reuse = reuse_explicit ? reuse : 1;
     snprintf(reuse_label, sizeof(reuse_label), "%s",
              reuse_explicit ? "" : "off");
@@ -1367,18 +1711,27 @@ int main(int argc, char **argv) {
     {
         const char *aw = getenv("H3_DIT_W4A8_ATTN_WINDOW");
         printf("shape: %dx%d %ds → latent %dx%dx%d  dit_layers=%u te_layers=%u "
-               "vae_blocks=%u vae_repeats=%d steps=%d reuse=%s magcache=%.3g%s token_red=%d "
+               "vae_blocks=%u vae_repeats=%d steps=%d reuse=%s magcache=%.3g%s "
+               "step_cache=%s/%.3g token_red=%d "
                "sdpa=%s attn_window=%s dist_attn=%s overlap=%d cfg=%.3g seed=0x%llx "
-               "context_budget=%zu (default %u; hard_max %u)\n",
+               "context_budget=%zu (default %u; hard_max %u) preset=%s ulysses=%d "
+               "vae_decode=%s\n",
                width, height, seconds, latent_t, latent_h, latent_w, dit_layers,
                te_layers, vae_blocks, vae_repeats, steps, reuse_label,
                (double)magcache_thresh,
-               magcache_calibrated ? "(cal)" : "", token_reduction, sdpa,
+               magcache_calibrated ? "(cal)" : "",
+               h3_step_cache_kind_name(step_cache.kind),
+               (double)step_cache.thresh, token_reduction, sdpa,
                aw && *aw ? aw : "0", dist_attn ? "on" : "off", overlap,
                (double)cfg_scale,
                (unsigned long long)seed, context,
                (unsigned)H3_CUDA_TEXT_CONTEXT_DEFAULT,
-               (unsigned)H3_CUDA_TEXT_CONTEXT_HARD_MAX);
+               (unsigned)H3_CUDA_TEXT_CONTEXT_HARD_MAX,
+               preset_name && preset_name[0] ? preset_name : "none", ulysses,
+               vae_decode);
+        if (te_cache_dir && te_cache_dir[0])
+            printf("te_prompt_cache: dir=%s (opt-in; gold default off)\n",
+                   te_cache_dir);
         if (first_frame_path || last_frame_path || n_ref_images ||
             ref_video_path) {
             printf("cfg_defaults: t2va=5 f2va=1 l2va=1 fl2va=1 ref2va=1 "
@@ -1487,11 +1840,28 @@ int main(int argc, char **argv) {
     } else {
         printf("audio_pack: off (legacy text|video; theme may collapse)\n");
     }
+    if (ulysses > 1)
+        device = 0; /* N>1 ignores --device; devices 0..N-1 */
     cuda = h3_cuda_create(device, error, sizeof(error));
     if (!cuda) {
         fprintf(stderr, "cuda: %s\n", error);
         goto cleanup;
     }
+    if (ulysses > 1) {
+        int ids[8];
+        int ui;
+        for (ui = 0; ui < ulysses && ui < 8; ui++)
+            ids[ui] = ui;
+        if (!h3_ulysses_comm_init(&ulysses_cfg, ids, ulysses, error,
+                                  sizeof(error))) {
+            fprintf(stderr, "h3: ulysses nccl: %s\n", error);
+            goto cleanup;
+        }
+        printf("ulysses: N=%d NCCL inited (experimental; default still U=1)\n",
+               ulysses);
+    }
+    h3_vae_encode_f32_bind_cuda(cuda);
+    h3_vision_encode_f32_bind_cuda(cuda);
     printf("nvrtc: %s\n",
            h3_cuda_nvrtc_ok() ? h3_cuda_nvrtc_path() : "MISSING libnvrtc.so.12");
     /* TE NVFP4 linears → cuBLAS (H3_NVFP4_HOST_GEMM=1 to force host). */
@@ -1518,6 +1888,78 @@ int main(int argc, char **argv) {
             h3_dit_w4a8_set_token_reduction(dit, 1);
             printf("token_reduction: on (Metal pair semantics; begin/end via "
                    "env)\n");
+        }
+        if (lora_path && lora_path[0]) {
+            if (!(lora_scale > 0.0f) || !isfinite(lora_scale))
+                lora_scale = 1.0f;
+            if (!h3_lora_load(lora_path, lora_scale, &lora_set, error,
+                              sizeof(error))) {
+                fprintf(stderr, "h3: lora 非金线: %s\n", error);
+                goto cleanup;
+            }
+            lora_loaded = 1;
+            if (!h3_dit_w4a8_set_lora(dit, &lora_set, error, sizeof(error))) {
+                fprintf(stderr, "h3: lora attach: %s\n", error);
+                goto cleanup;
+            }
+            printf("lora: path=%s scale=%.3g pairs=%d ignored_vsa=%d (非金线)\n",
+                   lora_set.path, (double)lora_set.scale, lora_set.n_pairs,
+                   lora_set.ignored_vsa_tensors);
+        }
+        if (ulysses > 1 && dit) {
+            h3_dit_w4a8_sp_comm comm;
+            int ids[8];
+            int ui;
+            /* Device-resident patch↔layers↔final when unset. Set
+             * H3_DIT_W4A8_HOST_FWD=1 to restore host hidden staging. */
+            memset(&comm, 0, sizeof(comm));
+            comm.cfg = &ulysses_cfg;
+            comm.bind = gen_uly_bind;
+            comm.set_compute = gen_uly_set_compute;
+            comm.a2a_qkv = gen_uly_a2a_qkv;
+            comm.a2a_attn_out = gen_uly_a2a_attn;
+            uly_cuda[0] = cuda;
+            uly_dit[0] = dit;
+            for (ui = 0; ui < ulysses && ui < 8; ui++)
+                ids[ui] = ui;
+            for (ui = 1; ui < ulysses && ui < 8; ui++) {
+                uly_cuda[ui] = h3_cuda_create(ui, error, sizeof(error));
+                if (!uly_cuda[ui]) {
+                    fprintf(stderr, "h3: ulysses rank %d cuda: %s\n", ui, error);
+                    goto cleanup;
+                }
+                if (dit_is_int8)
+                    uly_dit[ui] = h3_dit_w4a8_open_int8(uly_cuda[ui], dit_int8,
+                                                        &cfg, error,
+                                                        sizeof(error));
+                else
+                    uly_dit[ui] = h3_dit_w4a8_open(uly_cuda[ui], dit_store, &cfg,
+                                                   error, sizeof(error));
+                if (!uly_dit[ui]) {
+                    fprintf(stderr, "h3: ulysses rank %d dit: %s\n", ui, error);
+                    goto cleanup;
+                }
+                if (lora_loaded &&
+                    !h3_dit_w4a8_set_lora(uly_dit[ui], &lora_set, error,
+                                          sizeof(error))) {
+                    fprintf(stderr, "h3: ulysses rank %d lora: %s\n", ui, error);
+                    goto cleanup;
+                }
+            }
+            if (!h3_dit_w4a8_set_ulysses(dit, uly_dit, ids, ulysses, &comm,
+                                         error, sizeof(error))) {
+                fprintf(stderr, "h3: ulysses attach: %s\n", error);
+                goto cleanup;
+            }
+            printf("ulysses: N=%d DiT SP attached (A2A after QKV+LoRA; "
+                   "SDPA seq=S_real heads=H/U; device-resident unless "
+                   "HOST_FWD=1)\n",
+                   ulysses);
+            /* Rank open leaves current device on U-1; TE/primary DiT are 0. */
+            if (cudaSetDevice(0) != cudaSuccess) {
+                fprintf(stderr, "h3: ulysses restore primary device failed\n");
+                goto cleanup;
+            }
         }
     } else if (first_frame_path && last_frame_path) {
         printf("skip_dit: VAE roundtrip encode→decode from FL2VA "
@@ -1782,8 +2224,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "OOM vision buffers\n");
                 goto cleanup;
             }
-            printf("vision_encode: %s pictures=%zu (host F32; GPU idle is "
-                   "expected here)\n",
+            printf("vision_encode: %s pictures=%zu "
+                   "(cublas+cudnn SDPA if bound; H3_VISION_HOST=1 / "
+                   "H3_VISION_SDPA=host rollback)\n",
                    vis, n_pic);
             fflush(stdout);
             for (p = 0; p < n_pic; p++) {
@@ -1855,10 +2298,13 @@ int main(int argc, char **argv) {
             have_vision_span = 1;
             if (official_kf == 3) {
                 printf("official_condition=1 keyframes=0,last last_keyframe=%d "
-                       "pictures=2 vision.tokens=%zu+%zu span.tokens=%zu+%zu "
-                       "text_seq=%zu vision_inject=1 "
-                       "(multimodal; pack text|cond|cond|audio|video)\n",
-                       last_keyframe, vis_tokens[0], vis_tokens[1],
+                       "aligned_last=%d pictures=2 vision.tokens=%zu+%zu "
+                       "span.tokens=%zu+%zu text_seq=%zu vision_inject=1 "
+                       "(multimodal; pack text|cond|cond|audio|video; "
+                       "last-frame RoPE on mux last not VAE pad)\n",
+                       last_keyframe,
+                       frames_aligned > 0 ? frames_aligned - 1 : 0,
+                       vis_tokens[0], vis_tokens[1],
                        vision_spans[0].tokens, vision_spans[1].tokens, context);
             } else {
                 printf("official_condition=1 keyframes=%d vision.tokens=%zu "
@@ -2343,9 +2789,8 @@ int main(int argc, char **argv) {
             }
             k++;
         }
-        last_condition_time = (float)context +
-                              h3_dit_w4a8_video_span_sum(latent_t) -
-                              (5.0f / 3.0f);
+        last_condition_time =
+            fl2va_last_condition_time(context, last_keyframe);
         if (last_frame_path) {
             if (!h3_dit_w4a8_fill_metal_cond_pos(
                     last_condition_time, latent_h, latent_w,
@@ -2357,18 +2802,22 @@ int main(int argc, char **argv) {
         }
         if (official_kf == 3) {
             printf("cond_seq=%zu keyframes=0,last last_keyframe=%d "
-                   "official_condition=1 "
+                   "aligned_last=%d official_condition=1 "
                    "condition_time0=text_seq=%zu "
-                   "condition_time1=text_seq+span_sum-5/3=%.6g "
-                   "span_sum=%.6g encode_ms=%.1f "
+                   "condition_time1=text_seq+(mux_last)*(5/3)=%.6g "
+                   "span_sum=%.6g metal_aligned_last_t=%.6g encode_ms=%.1f "
                    "pack=text|cond|cond|audio|video\n",
-                   cond_seq, last_keyframe, context,
+                   cond_seq, last_keyframe,
+                   frames_aligned > 0 ? frames_aligned - 1 : 0, context,
                    (double)last_condition_time,
                    (double)h3_dit_w4a8_video_span_sum(latent_t),
+                   (double)((float)context +
+                            h3_dit_w4a8_video_span_sum(latent_t) -
+                            (5.0f / 3.0f)),
                    now_ms() - t_enc);
         } else if (last_frame_path) {
             printf("cond_seq=%zu keyframes=%d official_condition=1 "
-                   "condition_time=text_seq+span_sum-5/3=%.6g "
+                   "condition_time=text_seq+(mux_last)*(5/3)=%.6g "
                    "text_seq=%zu span_sum=%.6g encode_ms=%.1f\n",
                    cond_seq, last_keyframe, (double)last_condition_time,
                    context, (double)h3_dit_w4a8_video_span_sum(latent_t),
@@ -2819,18 +3268,23 @@ int main(int argc, char **argv) {
             fprintf(stderr, "bad reuse schedule\n");
             goto cleanup;
         }
-        if (reuse_explicit || magcache_thresh > 0.0f) {
+        if (reuse_explicit || magcache_thresh > 0.0f ||
+            h3_step_cache_enabled(&step_cache)) {
             const char *mc = getenv("H3_MAGCACHE_MAX_CONSEC");
             if (mc && mc[0]) {
                 long v = strtol(mc, NULL, 10);
                 if (v >= 1 && v <= 8) mag_max_consec = (int)v;
             }
             printf("reuse_schedule: interval=%d selected=%d/%d magcache_thresh=%.3g "
-                   "max_consec=%d av_split=%d (A/B only; default remains off)\n",
+                   "max_consec=%d step_cache=%s thresh=%.3g max_consec=%d "
+                   "av_split=%d (A/B only; default remains off)\n",
                    effective_reuse, nsel, steps, (double)magcache_thresh,
-                   mag_max_consec, pack_audio ? 1 : 0);
+                   mag_max_consec, h3_step_cache_kind_name(step_cache.kind),
+                   (double)step_cache.thresh, step_cache.max_consec,
+                   pack_audio ? 1 : 0);
         } else {
-            printf("reuse_schedule: disabled default_full_eval=1 magcache_thresh=%.3g\n",
+            printf("reuse_schedule: disabled default_full_eval=1 magcache_thresh=%.3g "
+                   "step_cache=off\n",
                    (double)magcache_thresh);
         }
     }
@@ -2867,7 +3321,27 @@ int main(int argc, char **argv) {
             fprintf(stderr, "te open: %s\n", error);
             goto cleanup;
         }
-        if (!skip_dit && overlap && dit && latent_t < 32) {
+        /* After TE packed H2D, disk is free: stage INT8 host while TE
+         * layers run. Starting at te_open contended the 12.8GiB TE upload. */
+        if (dit_is_int8 && dit) {
+            const char *hs = getenv("H3_DIT_HOST_STAGE_TE");
+            int want_hs = !(hs && hs[0] == '0');
+            if (want_hs) {
+                host_stage_job.dit = dit;
+                host_stage_job.first = 0;
+                host_stage_job.n = dit_layers;
+                host_stage_job.ms = 0.0;
+                host_stage_job.ok = 0;
+                host_stage_job.err[0] = '\0';
+                host_stage_kick_job.job = &host_stage_job;
+                host_stage_kick_job.th = &host_stage_th;
+                host_stage_kick_job.ok = &host_stage_th_ok;
+                host_stage_kick_job.t0 = &host_stage_t0;
+                h3_nvfp4_cuda_set_after_packed_hook(kick_dit_host_stage,
+                                                    &host_stage_kick_job);
+            }
+        }
+        if (!skip_dit && overlap && dit && latent_t < 32 && !host_stage_th_ok) {
             double ignore = 0.0;
             unsigned win = h3_w4a8_cache_window_size(h3_dit_w4a8_cache(dit));
             unsigned n_pref = dit_layers;
@@ -2900,19 +3374,58 @@ int main(int argc, char **argv) {
                "(H3_NVFP4_VERBOSE=1 for per-layer)\n",
                context, te_layers);
         fflush(stdout);
-        if (have_vision_span) {
-            const float *ds[3];
-            ds[0] = vision_ds[0];
-            ds[1] = vision_ds[1];
-            ds[2] = vision_ds[2];
-            text_emb = h3_nvfp4_encode_layers_multimodal_f32(
-                &te_store, token_ids, context, vision_spans,
-                (size_t)vision_span_count, vision_merged, ds, te_layers,
-                &te_st, error, sizeof(error));
-        } else {
-            text_emb = h3_nvfp4_encode_layers_f32(&te_store, token_ids, context,
-                                                  te_layers, &te_st, error,
-                                                  sizeof(error));
+        {
+            int te_pc_hit = 0;
+            char te_pc_hex[32];
+            te_pc_hex[0] = '\0';
+            if (te_cache_dir && te_cache_dir[0] && !have_vision_span &&
+                token_ids &&
+                h3_te_cache_key(token_ids, context, te_layers, te_path,
+                                te_pc_hex, sizeof(te_pc_hex), error,
+                                sizeof(error))) {
+                if (h3_te_cache_load(te_cache_dir, te_pc_hex, context, te_layers,
+                                     &text_emb, error, sizeof(error))) {
+                    te_pc_hit = 1;
+                    te_st.embed_cache_hit = 1;
+                    te_st.n_layers = te_layers;
+                    te_st.all_finite = 1;
+                    printf("te_prompt_cache: HIT dir=%s key=%s tokens=%zu\n",
+                           te_cache_dir, te_pc_hex, context);
+                    fflush(stdout);
+                } else if (error[0] && strstr(error, "header mismatch")) {
+                    fprintf(stderr, "te_prompt_cache: %s (recompute)\n", error);
+                    error[0] = '\0';
+                }
+            }
+            if (!te_pc_hit) {
+                if (have_vision_span) {
+                    const float *ds[3];
+                    ds[0] = vision_ds[0];
+                    ds[1] = vision_ds[1];
+                    ds[2] = vision_ds[2];
+                    text_emb = h3_nvfp4_encode_layers_multimodal_f32(
+                        &te_store, token_ids, context, vision_spans,
+                        (size_t)vision_span_count, vision_merged, ds, te_layers,
+                        &te_st, error, sizeof(error));
+                } else {
+                    text_emb = h3_nvfp4_encode_layers_f32(
+                        &te_store, token_ids, context, te_layers, &te_st, error,
+                        sizeof(error));
+                }
+                if (text_emb && te_cache_dir && te_cache_dir[0] &&
+                    !have_vision_span && token_ids && te_pc_hex[0]) {
+                    if (!h3_te_cache_save(te_cache_dir, te_pc_hex, text_emb,
+                                          context, te_layers, error,
+                                          sizeof(error))) {
+                        fprintf(stderr, "te_prompt_cache: save failed: %s\n",
+                                error);
+                        error[0] = '\0';
+                    } else {
+                        printf("te_prompt_cache: MISS wrote dir=%s key=%s\n",
+                               te_cache_dir, te_pc_hex);
+                    }
+                }
+            }
         }
         if (!text_emb) {
             fprintf(stderr, "TE encode: %s\n", error);
@@ -3114,6 +3627,18 @@ int main(int argc, char **argv) {
         printf("released TE after encode (before DiT; context=%zu)\n",
                context);
     }
+    if (host_stage_th_ok) {
+        pthread_join(host_stage_th, NULL);
+        host_stage_th_ok = 0;
+        printf("dit_host_stage: done ok=%d wall_ms=%.1f stage_ms=%.1f "
+               "blocks=%u%s%s\n",
+               host_stage_job.ok, now_ms() - host_stage_t0, host_stage_job.ms,
+               host_stage_job.n, host_stage_job.ok ? "" : " err=",
+               host_stage_job.ok
+                   ? ""
+                   : (host_stage_job.err[0] ? host_stage_job.err : "unknown"));
+        fflush(stdout);
+    }
 
     if (prefetch_done) {
         void *st0 = h3_cuda_stream(cuda, 0);
@@ -3123,6 +3648,55 @@ int main(int argc, char **argv) {
         /* event ownership: destroy via cudaEventDestroy through cast */
         cudaEventDestroy((cudaEvent_t)prefetch_done);
         prefetch_done = NULL;
+    }
+
+    /* After TE: JIT the DiT cuDNN plan on the owner handle so step1's
+     * first SDPA is a hit. Worker-thread JIT (p5) bound the graph to the
+     * wrong handle and slowed step1 — do not bring that back.
+     * Unpack stays inside step1 (full window after TE OOMs the later WS).
+     * H3_DIT_PLAN_REUSE=0 disables. */
+    if (!skip_dit && dit && cuda) {
+        const char *pr = getenv("H3_DIT_PLAN_REUSE");
+        int want_reuse = !(pr && pr[0] == '0');
+        if (want_reuse) {
+            size_t packed_seq = context + cond_seq + audio_cond_seq +
+                                video_seq + (pack_audio ? audio_seq : 0);
+            float attn_scale = 1.0f / sqrtf((float)H3_DIT_W4A8_HEAD_DIM);
+            double t_prep = now_ms();
+            char pb_err[256];
+            int pb_ok;
+            pb_err[0] = '\0';
+            {
+                size_t pb_heads = (size_t)H3_DIT_W4A8_HEADS;
+                int pbi;
+                if (ulysses > 1)
+                    pb_heads /= (size_t)ulysses;
+                pb_ok = h3_cuda_sdpa_prebuild(
+                    cuda, packed_seq, pb_heads,
+                    (size_t)H3_DIT_W4A8_HEAD_DIM, attn_scale, 0, pb_err,
+                    sizeof(pb_err));
+                printf("dit_plan_reuse: after_te same_handle prebuild=%d "
+                       "pb_ms=%.1f seq=%zu heads=%zu d=%d causal=0 ulysses=%d "
+                       "(H3_DIT_PLAN_REUSE=0 disables)\n",
+                       pb_ok, now_ms() - t_prep, packed_seq, pb_heads,
+                       H3_DIT_W4A8_HEAD_DIM, ulysses);
+                if (!pb_ok)
+                    printf("dit_plan_reuse: prebuild_err=%s\n",
+                           pb_err[0] ? pb_err : "unknown");
+                for (pbi = 1; pbi < ulysses && pbi < 8; pbi++) {
+                    if (!uly_cuda[pbi])
+                        continue;
+                    pb_err[0] = '\0';
+                    if (!h3_cuda_sdpa_prebuild(
+                            uly_cuda[pbi], packed_seq, pb_heads,
+                            (size_t)H3_DIT_W4A8_HEAD_DIM, attn_scale, 0,
+                            pb_err, sizeof(pb_err)))
+                        printf("dit_plan_reuse: rank%d prebuild_err=%s\n", pbi,
+                               pb_err[0] ? pb_err : "unknown");
+                }
+            }
+            fflush(stdout);
+        }
     }
 
     t0 = now_ms();
@@ -3137,6 +3711,10 @@ int main(int argc, char **argv) {
         if (effective_reuse == 1 && magcache_thresh > 0.0f && step > 0 &&
             step < steps - 1 &&             mag_have_probe && mag_accum < magcache_thresh &&
             mag_consec < mag_max_consec && mag_fresh)
+            evaluate = 0;
+        /* Independent Tea / FB (h3_step_cache): mutex vs mag already enforced. */
+        if (h3_step_cache_enabled(&step_cache) &&
+            !h3_step_cache_should_eval(&step_cache, step, steps))
             evaluate = 0;
         if (step == 0 || step == steps - 1) evaluate = 1;
 
@@ -3287,6 +3865,29 @@ int main(int argc, char **argv) {
                        mag_fresh ? "allow_skip" : "force_eval_reset");
                 if (!mag_fresh) mag_accum = 0.0f;
             }
+            if (last_eval >= 0 && h3_step_cache_enabled(&step_cache)) {
+                float ma =
+                    h3_dit_w4a8_velocity_mean_abs_f32(velocity, n_lat);
+                float mp =
+                    h3_dit_w4a8_velocity_mean_abs_f32(vel_last, n_lat);
+                float aa = 0.0f, ap = 0.0f;
+                int have_a = 0;
+                float delta;
+                if (pack_audio && audio_vel && avel_last) {
+                    aa = h3_dit_w4a8_velocity_mean_abs_f32(audio_vel, n_audio);
+                    ap = h3_dit_w4a8_velocity_mean_abs_f32(avel_last, n_audio);
+                    have_a = 1;
+                }
+                delta = h3_step_cache_delta_from_velocities(
+                    step_cache.kind, ma, mp, have_a, aa, ap);
+                h3_step_cache_on_eval(&step_cache, delta);
+                printf("  %s: delta=%.4g accum=%.4g last=%.4g thresh=%.4g "
+                       "consec=%d → %s\n",
+                       h3_step_cache_kind_name(step_cache.kind), (double)delta,
+                       (double)step_cache.accum, (double)step_cache.last_delta,
+                       (double)step_cache.thresh, step_cache.consec,
+                       step_cache.fresh ? "allow_skip" : "force_eval");
+            }
             if (last_eval >= 0) {
                 memcpy(vel_prev, vel_last, n_lat * sizeof(float));
                 if (pack_audio && avel_prev && avel_last)
@@ -3303,6 +3904,7 @@ int main(int argc, char **argv) {
                    "total=%.1f\n",
                    step + 1, steps, fst.patch_ms, fst.layers_ms, fst.final_ms,
                    fst.total_ms);
+            h3_cuda_sol_profile_finish_step(step, fst.total_ms);
         } else {
             if (effective_reuse == 1 && magcache_thresh > 0.0f &&
                 mag_have_probe) {
@@ -3311,6 +3913,13 @@ int main(int argc, char **argv) {
                 printf("  magcache: skip grow accum=%.4g (+%.4g) consec=%d/%d\n",
                        (double)mag_accum, (double)mag_last_delta, mag_consec,
                        mag_max_consec);
+            }
+            if (h3_step_cache_enabled(&step_cache)) {
+                h3_step_cache_on_skip(&step_cache);
+                printf("  %s: skip grow accum=%.4g (+%.4g) consec=%d/%d\n",
+                       h3_step_cache_kind_name(step_cache.kind),
+                       (double)step_cache.accum, (double)step_cache.last_delta,
+                       step_cache.consec, step_cache.max_consec);
             }
             if (last_eval < 0) {
                 fprintf(stderr, "reuse skip before first eval\n");
@@ -3371,6 +3980,8 @@ int main(int argc, char **argv) {
     t_dit = now_ms() - t0;
     printf("dit_schedule: evals=%d skips=%d dit_ms=%.1f\n", dit_evals,
            dit_skips, t_dit);
+    h3_cuda_sol_cute_dump_stats();
+    h3_cuda_sage3_dump_stats();
     } else {
         printf("dit_schedule: skipped (decode-only)\n");
     }
@@ -3407,8 +4018,13 @@ int main(int argc, char **argv) {
 
     /* Drop DiT/TE resident weights before VAE so 50L + decode fits in 24GB. */
     h3_dit_w4a8_core_free(&core);
+    gen_uly_free_ranks(dit, uly_dit, uly_cuda);
     h3_dit_w4a8_free(dit);
     dit = NULL;
+    if (lora_loaded) {
+        h3_lora_free(&lora_set);
+        lora_loaded = 0;
+    }
     h3_nvfp4_store_free(&te_store);
     h3_nvfp4_cuda_disable();
     h3_w4a8_store_free(dit_store);
@@ -3706,6 +4322,7 @@ cleanup:
     if (audio_th_ok) pthread_join(audio_th, NULL);
     if (sdpa_th_ok) pthread_join(sdpa_th, NULL);
     if (vae_th_ok) pthread_join(vae_th, NULL);
+    if (host_stage_th_ok) pthread_join(host_stage_th, NULL);
     if (prefetch_done) cudaEventDestroy((cudaEvent_t)prefetch_done);
     free(latent);
     free(velocity);
@@ -3761,8 +4378,24 @@ cleanup:
     h3_vae_int8_store_free(&vae_store);
     h3_nvfp4_store_free(&te_store);
     h3_dit_w4a8_core_free(&core);
+    gen_uly_free_ranks(dit, uly_dit, uly_cuda);
     h3_dit_w4a8_free(dit);
+    dit = NULL;
+    if (lora_loaded) {
+        h3_lora_free(&lora_set);
+        lora_loaded = 0;
+    }
+    h3_ulysses_comm_destroy(&ulysses_cfg);
     h3_nvfp4_cuda_disable();
+    {
+        int ui;
+        for (ui = 1; ui < 8; ui++) {
+            if (uly_cuda[ui]) {
+                h3_cuda_free(uly_cuda[ui]);
+                uly_cuda[ui] = NULL;
+            }
+        }
+    }
     h3_cuda_free(cuda);
     h3_w4a8_store_free(dit_store);
     h3_dit_int8_store_free(dit_int8);

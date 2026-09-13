@@ -24,6 +24,12 @@ int h3_vision_encode_f32(
     int *grid_h, int *grid_w, size_t *tokens,
     char *error, size_t error_size);
 
+/* Bind generate's h3_cuda so vision GEMMs use cuBLAS and SDPA uses Tier-0
+ * cuDNN fused (forced; ignores DiT sage3/sol). NULL drops it.
+ * H3_VISION_HOST=1 forces host OpenMP GEMM + host SDPA.
+ * H3_VISION_SDPA=host keeps cuBLAS GEMM but host SDPA (A/B). */
+void h3_vision_encode_f32_bind_cuda(void *cuda);
+
 #ifdef __cplusplus
 }
 #endif

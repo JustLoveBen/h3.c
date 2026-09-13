@@ -53,18 +53,29 @@ struct h3_cudnn_sdpa_plan {
     int causal = 0;
     int use_mask = 0;
     int use_bias = 0;
+    int device = -1;
     std::shared_ptr<fe::graph::Graph> graph;
     int64_t workspace_size = 0;
     void *d_workspace = nullptr;
     int32_t *d_seq_len = nullptr;
 };
 
-/* Keep TE / DiT / VAE graphs at once. ws is typically 0; dropping the only
- * slot forced a 5s+ DiT rebuild after TE seq=576 causal. */
+/* Per-device slots: graph + workspace + seq_len are allocated on the GPU
+ * that first built the shape. A process-wide cache keyed only by
+ * (seq,H,D) made U>1 rank1 execute rank0's plan → IMA in rope_sdpa.
+ * U=1 still sees 4 slots on device 0 (same eviction as before). */
+enum { H3_CUDNN_PLAN_DEV_MAX = 8 };
 enum { H3_CUDNN_PLAN_SLOTS = 4 };
-static h3_cudnn_sdpa_plan g_plans[H3_CUDNN_PLAN_SLOTS];
-static int g_n_plans = 0;
+static h3_cudnn_sdpa_plan g_plans[H3_CUDNN_PLAN_DEV_MAX][H3_CUDNN_PLAN_SLOTS];
+static int g_n_plans[H3_CUDNN_PLAN_DEV_MAX];
 static h3_cudnn_sdpa_plan *g_plan = nullptr;
+
+static int plan_cur_dev(void) {
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d < 0)
+        return -1;
+    return d;
+}
 
 struct ShapeKey {
     uint64_t seq;
@@ -172,7 +183,12 @@ extern "C" void h3_cuda_sdpa_cudnn_note_variant_fail(size_t seq, size_t heads,
 }
 
 static void plan_reset(h3_cudnn_sdpa_plan *p) {
+    int orig = -1;
     if (!p) return;
+    if (p->device >= 0)
+        cudaGetDevice(&orig);
+    if (p->device >= 0)
+        cudaSetDevice(p->device);
     if (p->d_workspace) {
         cudaFree(p->d_workspace);
         p->d_workspace = nullptr;
@@ -181,6 +197,8 @@ static void plan_reset(h3_cudnn_sdpa_plan *p) {
         cudaFree(p->d_seq_len);
         p->d_seq_len = nullptr;
     }
+    if (orig >= 0)
+        cudaSetDevice(orig);
     p->graph.reset();
     p->workspace_size = 0;
     p->tensor_seq = p->heads = p->head_dim = 0;
@@ -188,13 +206,16 @@ static void plan_reset(h3_cudnn_sdpa_plan *p) {
     p->causal = 0;
     p->use_mask = 0;
     p->use_bias = 0;
+    p->device = -1;
 }
 
 extern "C" void h3_cuda_sdpa_cudnn_reset(void) {
-    int i;
-    for (i = 0; i < g_n_plans; i++)
-        plan_reset(&g_plans[i]);
-    g_n_plans = 0;
+    int d, i;
+    for (d = 0; d < H3_CUDNN_PLAN_DEV_MAX; d++) {
+        for (i = 0; i < g_n_plans[d]; i++)
+            plan_reset(&g_plans[d][i]);
+        g_n_plans[d] = 0;
+    }
     g_plan = nullptr;
     g_logged_ok = 0;
     g_logged_fail = 0;
@@ -208,29 +229,33 @@ static int plan_matches(const h3_cudnn_sdpa_plan *p, int64_t tensor_seq,
            p->use_mask == use_mask && p->use_bias == use_bias;
 }
 
-static h3_cudnn_sdpa_plan *plan_find(int64_t tensor_seq, int64_t heads,
+static h3_cudnn_sdpa_plan *plan_find(int dev, int64_t tensor_seq, int64_t heads,
                                      int64_t head_dim, float scale, int causal,
                                      int use_mask, int use_bias) {
     int i;
-    for (i = 0; i < g_n_plans; i++) {
-        if (plan_matches(&g_plans[i], tensor_seq, heads, head_dim, scale,
+    if (dev < 0 || dev >= H3_CUDNN_PLAN_DEV_MAX)
+        return nullptr;
+    for (i = 0; i < g_n_plans[dev]; i++) {
+        if (plan_matches(&g_plans[dev][i], tensor_seq, heads, head_dim, scale,
                          causal, use_mask, use_bias))
-            return &g_plans[i];
+            return &g_plans[dev][i];
     }
     return nullptr;
 }
 
-static h3_cudnn_sdpa_plan *plan_alloc_slot(void) {
+static h3_cudnn_sdpa_plan *plan_alloc_slot(int dev) {
     int i, evict = 0;
-    if (g_n_plans < H3_CUDNN_PLAN_SLOTS)
-        return &g_plans[g_n_plans++];
-    /* Full: evict the shortest seq (usually TE 576) so DiT/VAE stay. */
-    for (i = 1; i < g_n_plans; i++) {
-        if (g_plans[i].tensor_seq < g_plans[evict].tensor_seq)
+    if (dev < 0 || dev >= H3_CUDNN_PLAN_DEV_MAX)
+        return nullptr;
+    if (g_n_plans[dev] < H3_CUDNN_PLAN_SLOTS)
+        return &g_plans[dev][g_n_plans[dev]++];
+    /* Full on this device: evict the shortest seq (usually TE 576). */
+    for (i = 1; i < g_n_plans[dev]; i++) {
+        if (g_plans[dev][i].tensor_seq < g_plans[dev][evict].tensor_seq)
             evict = i;
     }
-    plan_reset(&g_plans[evict]);
-    return &g_plans[evict];
+    plan_reset(&g_plans[dev][evict]);
+    return &g_plans[dev][evict];
 }
 
 static int build_plan(cudnnHandle_t handle, int64_t tensor_seq, int64_t heads,
@@ -238,13 +263,25 @@ static int build_plan(cudnnHandle_t handle, int64_t tensor_seq, int64_t heads,
                       char *error, size_t error_size) {
     int use_bias =
         (g_bind_bias && g_bind_bias_seq == tensor_seq) ? 1 : 0;
-    h3_cudnn_sdpa_plan *p = plan_find(tensor_seq, heads, head_dim, scale,
-                                      causal, use_mask, use_bias);
+    int dev = plan_cur_dev();
+    h3_cudnn_sdpa_plan *p;
+    if (dev < 0 || dev >= H3_CUDNN_PLAN_DEV_MAX) {
+        if (error && error_size)
+            snprintf(error, error_size, "cudnn sdpa: bad current device");
+        return 0;
+    }
+    p = plan_find(dev, tensor_seq, heads, head_dim, scale, causal, use_mask,
+                  use_bias);
     if (p) {
         g_plan = p;
         return 1;
     }
-    p = plan_alloc_slot();
+    p = plan_alloc_slot(dev);
+    if (!p) {
+        if (error && error_size)
+            snprintf(error, error_size, "cudnn sdpa: no plan slot");
+        return 0;
+    }
     g_plan = p;
 
     auto graph = std::make_shared<fe::graph::Graph>();
@@ -383,13 +420,14 @@ static int build_plan(cudnnHandle_t handle, int64_t tensor_seq, int64_t heads,
     p->causal = causal;
     p->use_mask = use_mask;
     p->use_bias = use_bias;
+    p->device = dev;
 
     fprintf(stderr,
             "[h3] cudnn sdpa plan tensor_seq=%lld heads=%lld d=%lld "
-            "causal=%d mask=%d bias=%d ws_mib=%.1f slots=%d%s\n",
+            "causal=%d mask=%d bias=%d device=%d ws_mib=%.1f slots=%d%s\n",
             (long long)tensor_seq, (long long)heads, (long long)head_dim,
-            causal, use_mask, use_bias, (double)ws / (1024.0 * 1024.0),
-            g_n_plans, want_build_time ? "" : "");
+            causal, use_mask, use_bias, dev, (double)ws / (1024.0 * 1024.0),
+            g_n_plans[dev], want_build_time ? "" : "");
     if (want_build_time)
         fprintf(stderr, "[h3] cudnn_plan_build_ms=%.1f\n", (double)build_ms);
     fflush(stderr);
@@ -459,6 +497,11 @@ extern "C" int h3_cuda_sdpa_cudnn_f16_run_ex(
     if (!p || !p->graph) {
         if (error && error_size)
             snprintf(error, error_size, "cudnn sdpa plan missing");
+        return 0;
+    }
+    if (p->device != plan_cur_dev()) {
+        if (error && error_size)
+            snprintf(error, error_size, "cudnn sdpa plan device mismatch");
         return 0;
     }
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> vp = {

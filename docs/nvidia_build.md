@@ -7,10 +7,31 @@ NVIDIA 侧通过本 CMake 文件构建 **CUDA 旁路 / probe**；不链接、不
 ## 依赖
 
 - CMake ≥ 3.18
-- CUDA Toolkit（建议 12.8+，以便 `sm_120`；更旧工具链会自动省略 120，仅保留 `sm_89`）
+- CUDA Toolkit：**RTX 5090 必须 13+**（`H3_REQUIRE_CUDA13=ON`，产物目录建议 `build-cuda-sm120`）。4090 继续用 conda 12.x + `build-cuda`（sm_89；工具链 ≥12.8 时 fatbin 可另含 120）。
 - 支持的主机编译器（Linux: gcc/clang）
 
 本机若无 `nvcc` / CUDA，配置应失败并提示安装 Toolkit，而不是静默生成空目标。
+
+Ubuntu 软件源常把 CUDA 11.x 的 `nvcc` 放在 PATH 上。CMake 在 PATH nvcc 过旧、且未指定 `CMAKE_CUDA_COMPILER` 时，会优先选 CUDA 13（conda env 或 `/usr/local/cuda-13*`），找不到 13 才回退 12.8。5090 请打开 `H3_REQUIRE_CUDA13`，禁止 12.x 凑合；NVRTC/cuDNN 随 13 链 `libnvrtc.so.13`，不要链到 CUDA 12。
+
+```sh
+# RTX 5090 / CUDA 13+
+export CONDA_PREFIX=$HOME/miniconda3/envs/yongbin   # 若 nvcc 13 在该 env
+export PATH=$CONDA_PREFIX/bin:$PATH
+unset LDFLAGS CFLAGS CXXFLAGS CPPFLAGS
+export LIBRARY_PATH=$CONDA_PREFIX/targets/x86_64-linux/lib:$LIBRARY_PATH
+cmake -S . -B build-cuda-sm120 -DH3_GPU_BACKEND=cuda -DH3_REQUIRE_CUDA13=ON \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++
+which nvcc && nvcc --version   # 必须是 13.x
+
+# RTX 4090 / CUDA 12.x（不要开 H3_REQUIRE_CUDA13）
+cmake -S . -B build-cuda -DH3_GPU_BACKEND=cuda \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++
+```
 
 ## 配置与构建
 
@@ -78,9 +99,38 @@ cmake --build build-cuda -j --target h3_cuda_generate h3_t2av_timing_probe
 
 静态库：`h3_gpu_cuda`（`h3_cuda_*` / resident INT8 GEMM / device unpack）。
 
+## 远程主机（SSH）
+
+| 机 | 环境变量（优先） | 默认 `user@host` | 备注 |
+| --- | --- | --- | --- |
+| RTX 4090 | `H3_SSH_4090` | `haiyang@192.168.31.34` | 局域网；4090 旧址 `192.168.0.38` 已迁移，勿再用 |
+| RTX 5090（单卡） | `H3_SSH_5090` | `yongbin@192.168.31.238` | **保留**。局域网常通 `yongbin@192.168.0.238`（用 env 覆盖即可） |
+| **8× RTX 5090** | `H3_SSH_5090x8` | `user@89.185.31.140` | 端口 22；机架 **2FB-12-14 · U 16–22U**。后续多卡测；本轮未同步源码/权重 |
+
+密码仅会话注入（`H3_SSH_PASS_4090` / `H3_SSH_PASS_5090` / `H3_SSH_PASS_5090x8` 或 `sshpass -e`），**永不写入 repo / docs / scripts / git**。只写变量名，不写值。
+
+编排示例见 `scripts/h3_sdpa_backend_smoke_matrix.sh`（默认值即上表；可用 env 覆盖）。`--host 5090x8` 应对齐 `H3_SSH_5090x8`；脚本默认值不得含密码。
+
+### 8×5090 远程机（探测 2026-09-11）
+
+极速 SKU / Ulysses 实现计划：[2026-09-11-h3c-5090-turbo-implementation.md](superpowers/plans/2026-09-11-h3c-5090-turbo-implementation.md)。
+
+Ubuntu **22.04.5**；主机名 `user`；登录用户 `user`（sudo）。**8× GeForce RTX 5090 属实**（各约 **32607 MiB / 32 GB**，TGP 575 W）。驱动 **595.45.04**（Open Kernel Module）；`nvidia-smi` 报 CUDA **13.2**。Toolkit：`/usr/local/cuda` → `cuda-13.2`，`nvcc` **13.2.51**（默认 PATH **无** nvcc，用 `/usr/local/cuda/bin`）。系统 `python3` 为 3.10.12；**Python 3.12.13** 在 `/usr/bin/python3.12`。CPU：2× Xeon Gold 6530（128 线程）· 主机内存 ~314 GiB。磁盘 `/` ext4 **879 G**（约 26 G 已用）。home：`/home/user`。**尚无 h3_c 工作区**（不要擅自大拷模型）。
+
+**无 NVLink**（`nvidia-smi nvlink -s`：Device does not have or support Nvlink）。拓扑为 PCIe + 双 NUMA：GPU0–3 / NIC `mlx5_*` 在 NUMA 0，GPU4–7 在 NUMA 1；同 NUMA 为 `NODE`，跨 NUMA 为 `SYS`。多卡请按无 NVLink（Ulysses / 跨 NUMA 通信税）设计，勿假设 NV#。
+
+SSH 示例（密码只进当前 shell，勿写入文件）：
+
+```sh
+export H3_SSH_5090x8=user@89.185.31.140
+# export H3_SSH_PASS_5090x8=...   # 仅会话；sshpass -e
+# 若本机 TUN/Clash 出现「TCP 通但无 SSH banner」，对该 IP 走直连，或 ssh -b <物理网卡 IPv4>
+ssh -p 22 "$H3_SSH_5090x8"
+```
+
 ## 远程 4090 验收命令（示例）
 
-主机：`haiyang@192.168.0.38`，环境：`conda activate comfyui`，权重在 `/home/haiyang/h3_c/models/`。源码常在 `src_sync/`。
+主机：`${H3_SSH_4090:-haiyang@192.168.31.34}`，环境：`conda activate comfyui`，权重在 `/home/haiyang/h3_c/models/`。源码常在 `src_sync/`。
 
 ```sh
 cd /home/haiyang/h3_c/src_sync   # 或 /home/haiyang/h3_c
@@ -130,6 +180,121 @@ H3_CUDA_SDPA_BACKEND=cudnn ./build-cuda/h3_t2av_timing_probe --dit DIT --vae VAE
 cuDNN：`-DH3_ENABLE_CUDNN=ON` + vendored `third_party/cudnn_frontend`。
 
 实测数字见 [`nvidia_quant_contract.md`](nvidia_quant_contract.md) §10.15–§10.17。
+
+## SDPA 三后端切换（4090 / 5090）
+
+统一 registry（`h3_sdpa.h`）：**Tier-0** `cudnn`（质量默认，`auto`→cudnn）；**Tier-1** `sage3` / `sol_cute`（一等加速，显式开启）。假 `sol` nested-loop / 假 `sage2` 禁止当产品后端。详见 [2026-08-25-h3c-multi-gpu-arch-speed.md](superpowers/plans/2026-08-25-h3c-multi-gpu-arch-speed.md)。
+
+```sh
+# Tier-0 — 双卡质量默认
+./build-cuda*/h3_cuda_generate ... --sdpa-backend cudnn
+
+# Tier-1 Sage3 — 5090 / build-cuda-sm120（需插件 + ROOT）
+export H3_SAGE3_LIB=$PWD/build-cuda-sm120/libh3_sage3.so
+export H3_SAGE3_ROOT=/path/to/sageattention3_blackwell
+export H3_SAGE3_TOOLS=$PWD/tools
+export PYTHONPATH=$H3_SAGE3_TOOLS:$H3_SAGE3_ROOT/build/lib.linux-x86_64-cpython-310:$H3_SAGE3_ROOT
+./build-cuda-sm120/h3_cuda_generate ... --sdpa-backend sage3
+# 日志应见：layout=F16_BHTD prep=cuda_thd_bhtd；hits 满、fallback=0
+
+# Tier-1 Sol CuTe — 4090 / build-cuda（需插件 + 官方 ATTN ROOT + Triton≥3.3）
+export H3_SOL_CUTE_LIB=$PWD/build-cuda/libh3_sol_cute.so
+export H3_SOL_ATTN_ROOT=/path/to/techniques/sparse_backends   # 官方：无 _prepare_torch
+export H3_TRITON_OVERLAY=/path/to/triton34_overlay            # TensorDescriptor
+export PYTHONPATH=$H3_TRITON_OVERLAY:$H3_SOL_ATTN_ROOT:$PWD/tools
+# 测满核命中时可：
+export H3_SOL_FIRST_DENSE_STEPS=0 H3_SOL_FIRST_DENSE_LAYERS=0
+./build-cuda/h3_cuda_generate ... --sdpa-backend sol_cute
+# 日志应见：backend=cute_sm89 preprocess=triton_prepare；hits>0 fallback=0
+
+# 能力探测
+./build-cuda*/h3_cuda_info
+# 打印 caps: sm / fp4 / sage3_lib / sol_cute_lib 与 sdpa_select reason
+```
+
+### 缺什么会硬错
+
+| 后端 | 缺项 | 行为 |
+| --- | --- | --- |
+| `sage3` | `H3_SAGE3_LIB` / 插件 | generate resolve / dlopen **硬错** |
+| `sage3` | `H3_SAGE3_ROOT` | init **硬错** |
+| `sol_cute` | `H3_SOL_CUTE_LIB` | **硬错** |
+| `sol_cute` | `H3_SOL_ATTN_ROOT` | **硬错**（无机器默认；warmup 亦不回退 sparse） |
+| `sol_cute` | ROOT 含 `_prepare_torch` / Triton&lt;3.3 | embed **硬错**（拒绝假 preprocess） |
+| `sol_cute` | backend≠`cute_sm89` | embed **硬错** |
+
+不会静默落到 nested-loop / sage2。
+
+### 已测数字（诚实，2026-08-25）
+
+| 卡 | 后端 | 配方摘录 | 结果 |
+| --- | --- | --- | --- |
+| 5090 | cudnn | cafe 8-step warm | DiT **~31.3s**；TE 上传稳档后 e2e warm mean **~66s** |
+| 5090 | sage3 | 同配方；CUDA prep | DiT **~26.4–27.4s**；hits=400 fallback=0；MAE~27 |
+| 4090 | sol_cute | cafe 5s×8-step 有声，dense=0，官方 ROOT | **hits=400**；DiT **40.9 vs cudnn 48.3（−15%）**；e2e≈79s≈cudnn；**MAE~35 视觉不过** |
+
+报告路径：
+
+- Sol 视觉门：[`out/verify_sol_vis_gate/REPORT.md`](../out/verify_sol_vis_gate/REPORT.md)（远程 `/tmp/h3_sol_vis_gate/`）
+- 5090 TE 稳档：[`out/verify_5090_te_stable/REPORT.md`](../out/verify_5090_te_stable/REPORT.md)（远程 `…/out_5090_te_stable/`）
+- 5090 后端 bench：[`out/verify_5090_bench/REPORT.md`](../out/verify_5090_bench/REPORT.md)
+
+**Sol ROOT：** 用官方 NVlabs `sol-engine` 的 `techniques/sparse_backends`（preprocess 无条件 `TensorDescriptor`）。带 `try/except` + `_prepare_torch` 的 sparse 拷贝**不能**当 `H3_SOL_ATTN_ROOT`。
+
+**Sage3 prep：** 插件暴露 BHTD；C 做 `THD→BHTD` / `BHTD→THD F32` CUDA kernel，不再走 Python permute。质量门不因加速改默认。
+
+**TE 稳档（5090）：** 偶发 `upload_ms~50s` 来自 12.8GiB `mmap_direct` 页错误。默认 `MAP_POPULATE` + sync prefault（`H3_TE_MMAP_POPULATE` / `H3_TE_PREFAULT`，`=0` 关）。稳档后 `upload_ms≈6.2s`（4 连续跑无尖峰）；warm e2e mean **~66s**。
+
+## 双卡 SDPA 后端冒烟矩阵
+
+可重复轻量检查（真 backend；默认 `--seconds 1 --steps 2`；**不开 MagCache**）。脚本在 GPU 机上跑；编排器可选从笔记本 SSH（密码只走环境变量，勿入库）。
+
+```sh
+# 在 5090 / 4090 仓库根：
+bash scripts/h3_sdpa_backend_smoke.sh --host 5090 --backend cudnn
+bash scripts/h3_sdpa_backend_smoke.sh --host 5090 --backend sage3   # 需 H3_SAGE3_LIB+ROOT
+bash scripts/h3_sdpa_backend_smoke.sh --host 5090x8 --backend cudnn  # 8×5090；H3_SSH_5090x8；后续测，本轮未同步仓库
+bash scripts/h3_sdpa_backend_smoke.sh --host 4090 --backend cudnn
+bash scripts/h3_sdpa_backend_smoke.sh --host 4090 --backend sol_cute # 官方 SOL ATTN ROOT
+
+# 可选编排（主机：H3_SSH_5090 / H3_SSH_4090 / H3_SSH_5090x8；
+# 密码：H3_SSH_PASS_5090 / H3_SSH_PASS_4090 / H3_SSH_PASS_5090x8，由操作者注入，勿入库）
+# 8×5090 默认不 rsync；需 H3_SMOKE_ENABLE_5090x8=1。TUN 拦 SSH 时可设 H3_SSH_BIND。
+bash scripts/h3_sdpa_backend_smoke_matrix.sh
+```
+
+
+| 卡 | 后端 | 门禁 |
+| --- | --- | --- |
+| 5090 | cudnn | `sdpa_select=cudnn` + 出片 |
+| 5090 | sage3 | hits>0、fallback=0 |
+| 4090 | cudnn | 同上 + 出片 |
+| 4090 | sol_cute | cute_sm89 + hits>0、fallback=0 |
+
+失败非零退出。本地汇总可放 `out/verify_sdpa_smoke/`。
+
+### 加速矩阵（cafe 金线臂）
+
+统一入口（真 `--seconds`；reuse/mag/tea/fb/sage/sol **不**改默认）：
+
+```sh
+bash scripts/h3_accel_matrix_smoke.sh --gpu 4090 --arm cudnn
+bash scripts/h3_accel_matrix_smoke.sh --gpu 4090 --arm sol_cute
+bash scripts/h3_accel_matrix_smoke.sh --gpu 4090 --arm magcache --thresh 0.08
+bash scripts/h3_accel_matrix_smoke.sh --gpu 4090 --arm teacache --thresh 0.04
+bash scripts/h3_accel_matrix_smoke.sh --gpu 4090 --arm fbcache --thresh 0.04
+bash scripts/h3_accel_matrix_smoke.sh --gpu 5090 --arm cudnn
+bash scripts/h3_accel_matrix_smoke.sh --gpu 5090 --arm sage3
+```
+
+总表：[`out/verify_accel_matrix/REPORT.md`](../out/verify_accel_matrix/REPORT.md)。  
+步/块 cache 独立模块：`h3_step_cache.h` / `.c`（`--teacache-*` / `--fbcache-*`；`--easycache-thresh` → **NOT IMPLEMENTED** 硬错误）。与 Mag/reuse 互斥。
+
+### Vision 条件图 SDPA（F2VA/L2VA）
+
+默认：绑 `h3_cuda` 后 vision **cuBLAS GEMM + Tier-0 cuDNN SDPA**（强制 cudnn，不受 DiT sage3/sol 影响）。  
+`H3_VISION_HOST=1` → 全 host；`H3_VISION_SDPA=host` → 仅 SDPA 回退 host（便于 A/B）。  
+实测见 [`out/verify_vision_cudnn_sdpa/REPORT.md`](../out/verify_vision_cudnn_sdpa/REPORT.md)。
 
 ## 已知限制
 

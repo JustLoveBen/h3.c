@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
 
 static int g_fail;
 
@@ -518,17 +522,129 @@ done:
     return ok;
 }
 
+static int test_vision_host_vs_cuda(const char *te_path, int height, int width) {
+    const int frames = 1;
+    const size_t tokens_want = (size_t)(height / 32) * (size_t)(width / 32);
+    const size_t row = (size_t)H3_CUDA_VISION_WIDTH;
+    const size_t n = tokens_want * row;
+    float *pixels = NULL, *host_m = NULL, *cuda_m = NULL;
+    float *ds_h[3] = {NULL, NULL, NULL}, *ds_c[3] = {NULL, NULL, NULL};
+    h3_cuda *cuda = NULL;
+    char err[512];
+    int grid_h = 0, grid_w = 0;
+    size_t tokens = 0, i;
+    int ok = 0;
+    struct timespec t0, t1;
+    double host_ms = 0.0, cuda_ms = 0.0, max_abs = 0.0, mae = 0.0, num = 0.0,
+           den = 0.0;
+
+    pixels = (float *)malloc((size_t)frames * 3u * height * width *
+                             sizeof(float));
+    host_m = (float *)malloc(n * sizeof(float));
+    cuda_m = (float *)malloc(n * sizeof(float));
+    ds_h[0] = (float *)malloc(n * sizeof(float));
+    ds_h[1] = (float *)malloc(n * sizeof(float));
+    ds_h[2] = (float *)malloc(n * sizeof(float));
+    ds_c[0] = (float *)malloc(n * sizeof(float));
+    ds_c[1] = (float *)malloc(n * sizeof(float));
+    ds_c[2] = (float *)malloc(n * sizeof(float));
+    if (!pixels || !host_m || !cuda_m || !ds_h[0] || !ds_h[1] || !ds_h[2] ||
+        !ds_c[0] || !ds_c[1] || !ds_c[2]) {
+        fail_msg("OOM vision A/B buffers");
+        goto done;
+    }
+    fill_pixels(pixels, frames, height, width);
+
+    h3_vision_encode_f32_bind_cuda(NULL);
+    setenv("H3_VISION_HOST", "1", 1);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (!h3_vision_encode_f32(te_path, pixels, frames, height, width, host_m,
+                              ds_h, &grid_h, &grid_w, &tokens, err,
+                              sizeof(err))) {
+        fail_msg(err[0] ? err : "host vision_encode failed");
+        goto done;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    host_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+              (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    unsetenv("H3_VISION_HOST");
+    cuda = h3_cuda_create(0, err, sizeof(err));
+    if (!cuda) {
+        fail_msg(err[0] ? err : "h3_cuda_create failed");
+        goto done;
+    }
+    h3_vision_encode_f32_bind_cuda(cuda);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (!h3_vision_encode_f32(te_path, pixels, frames, height, width, cuda_m,
+                              ds_c, &grid_h, &grid_w, &tokens, err,
+                              sizeof(err))) {
+        fail_msg(err[0] ? err : "cuda vision_encode failed");
+        goto done;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    cuda_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+              (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    if (tokens != tokens_want) {
+        fail_msg("vision A/B token count mismatch");
+        goto done;
+    }
+    for (i = 0; i < n; i++) {
+        double d = (double)cuda_m[i] - (double)host_m[i];
+        double a = fabs(d);
+        mae += a;
+        num += d * d;
+        den += (double)host_m[i] * (double)host_m[i];
+        if (a > max_abs) max_abs = a;
+    }
+    mae /= (double)n;
+    {
+        double rel_l2 = sqrt(num / (den > 1e-24 ? den : 1e-24));
+        printf("vision host vs cuda %dx%d: host_ms=%.1f cuda_ms=%.1f "
+               "max_abs=%.6g mae=%.6g rel-L2=%.6g "
+               "(gate max_abs<1.5e-1 mae<5e-3 rel-L2<1e-2; FP16 cuDNN SDPA)\n",
+               width, height, host_ms, cuda_ms, max_abs, mae, rel_l2);
+        if (max_abs >= 1.5e-1 || mae >= 5e-3 || rel_l2 >= 1e-2) {
+            fail_msg("vision cuda vs host exceeds gate");
+            goto done;
+        }
+    }
+    ok = 1;
+    puts("ok: vision cublas+cudnn matches host within gate");
+done:
+    unsetenv("H3_VISION_HOST");
+    h3_vision_encode_f32_bind_cuda(NULL);
+    h3_cuda_free(cuda);
+    free(pixels);
+    free(host_m);
+    free(cuda_m);
+    free(ds_h[0]);
+    free(ds_h[1]);
+    free(ds_h[2]);
+    free(ds_c[0]);
+    free(ds_c[1]);
+    free(ds_c[2]);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     const char *te_path = NULL;
     const char *ref_merged = NULL;
-    int i;
+    int i, vision_ab = 0, ab_h = 256, ab_w = 256;
     g_fail = 0;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--te") && i + 1 < argc)
             te_path = argv[++i];
         else if (!strcmp(argv[i], "--ref-merged") && i + 1 < argc)
             ref_merged = argv[++i];
-        else if (argv[i][0] != '-')
+        else if (!strcmp(argv[i], "--vision-ab")) {
+            vision_ab = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                int side = atoi(argv[++i]);
+                if (side >= 32 && (side % 32) == 0) ab_h = ab_w = side;
+            }
+        } else if (argv[i][0] != '-')
             te_path = argv[i];
     }
     test_picture_ids();
@@ -536,12 +652,15 @@ int main(int argc, char **argv) {
     test_span_pads_follow_vision_tokens();
     if (!te_path) {
         if (g_fail) return 1;
-        fprintf(stderr, "usage: %s --te TE.safetensors [--ref-merged F32]\n",
+        fprintf(stderr, "usage: %s --te TE.safetensors [--ref-merged F32] "
+                        "[--vision-ab [HW]]\n",
                 argv[0]);
         return 2;
     }
     test_no_image_te(te_path);
     test_vision_encode(te_path, ref_merged);
+    if (vision_ab)
+        test_vision_host_vs_cuda(te_path, ab_h, ab_w);
     test_with_image_te(te_path);
     return g_fail ? 1 : 0;
 }

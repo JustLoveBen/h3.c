@@ -1,6 +1,25 @@
 #include "h3_gpu_cuda.h"
+#include "h3_cuda_device_caps.h"
+#include "h3_sdpa.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+
+/* h3_gpu_cuda.cu.o pulls ConvRot Hadamard helpers; this probe never uses them. */
+float *h3_w4a8_hadamard_normalized(int size, char *error, size_t error_size) {
+    (void)size;
+    if (error && error_size)
+        snprintf(error, error_size, "h3_cuda_info: hadamard unused");
+    return NULL;
+}
+
+float *h3_w4a8_hadamard_sylvester_normalized(int size, char *error,
+                                             size_t error_size) {
+    (void)size;
+    if (error && error_size)
+        snprintf(error, error_size, "h3_cuda_info: hadamard unused");
+    return NULL;
+}
 
 static const char *h3_cuda_arch_note(int major, int minor) {
     if (major == 8 && minor == 9) return "Ada (sm_89), e.g. RTX 4090";
@@ -38,8 +57,26 @@ int main(void) {
     }
 
     printf("CUDA devices: %d\n", count);
+    {
+        const char *req = getenv("H3_CUDA_SDPA_BACKEND");
+        h3_sdpa_backend_id id;
+        int avail = 0;
+        char reason[320];
+        h3_sdpa_resolve(req && req[0] ? req : "auto", NULL, &id, &avail, reason,
+                        sizeof(reason));
+        printf("SDPA registry: request=%s → %s (auto always Tier-0 cudnn; "
+               "Tier-1 = sage3|sol_cute)\n",
+               (req && req[0]) ? req : "auto", h3_sdpa_backend_id_name(id));
+        printf("  resolve: %s\n", reason);
+    }
     for (index = 0; index < count; index++) {
         h3_cuda_device_info info;
+        h3_cuda_device_caps caps;
+        char caps_line[384];
+        h3_sdpa_backend_id id;
+        int avail = 0;
+        char reason[320];
+        const char *req = getenv("H3_CUDA_SDPA_BACKEND");
         if (!h3_cuda_probe(index, &info, error, sizeof(error))) {
             fprintf(stderr, "h3_cuda_info: device %d: %s\n", index, error);
             return 1;
@@ -55,6 +92,20 @@ int main(void) {
         printf("  SMs: %d\n", info.multiprocessor_count);
         h3_cuda_print_version("  driver", info.driver_version);
         h3_cuda_print_version("  runtime", info.runtime_version);
+        if (h3_cuda_query_caps(index, &caps, error, sizeof(error))) {
+            h3_cuda_caps_format(&caps, caps_line, sizeof(caps_line));
+            printf("  caps: %s\n", caps_line);
+            h3_sdpa_resolve(req && req[0] ? req : "auto", &caps, &id, &avail,
+                            reason, sizeof(reason));
+            printf("  sdpa_select: %s available=%d (%s)\n",
+                   h3_sdpa_backend_id_name(id), avail, reason);
+            if (caps.has_fp4_tc && !req)
+                printf("  note: FP4 capable — sage3 is Tier-1 opt-in, not auto\n");
+            if (info.compute_major == 8 && info.compute_minor == 9)
+                printf("  note: Ada sm_89 — prefer sol_cute for Tier-1 accel\n");
+        } else {
+            printf("  caps: probe failed: %s\n", error);
+        }
     }
     return 0;
 }

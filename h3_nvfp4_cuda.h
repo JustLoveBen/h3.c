@@ -18,11 +18,16 @@ extern "C" {
  * Env H3_NVFP4_DISABLE_DEV_CACHE=1 skips the host scale/packed cache.
  * Env H3_NVFP4_HOST_ACT=1 forces host activation path (no device TE layers).
  * Env H3_NVFP4_DEV_ACT=0 disables device-resident text TE (default is on).
- * Env H3_TE_PACKED_RESIDENT=0 disables packed GPU arena (default on). */
+ * Env H3_TE_PACKED_RESIDENT=0 disables packed GPU arena (default on).
+ * Env H3_TE_MMAP_POPULATE=0 skips MAP_POPULATE at TE open (default on).
+ * Env H3_TE_PREFAULT=0 skips sync page-touch before packed H2D (default on). */
 int h3_nvfp4_cuda_enable(h3_cuda *cuda, char *error, size_t error_size);
 void h3_nvfp4_cuda_disable(void);
 int h3_nvfp4_cuda_enabled(void);
 void h3_nvfp4_cuda_cache_clear(void);
+
+/* One-shot: run after TE packed GPU upload, before TE layers (disk free). */
+void h3_nvfp4_cuda_set_after_packed_hook(void (*fn)(void *), void *user);
 
 /* Device-resident text TE layers (no vision / mRoPE). Default on;
  * H3_NVFP4_HOST_ACT=1 reverts. hidden is host [tokens, TEXT_DIM] in/out.

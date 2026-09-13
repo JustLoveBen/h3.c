@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
@@ -228,6 +229,29 @@ cuda_graph_child_graph_node_get_graph(cudaGraphNode_t hNode, cudaGraph_t *phGrap
     NV_FE_CALL_TO_CUDA(cuda_graph_child_graph_node_get_graph, cudaGraphChildGraphNodeGetGraph, hNode, phGraph);
 }
 
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 13000)
+// CUDA 13 removed the 3-parameter cudaGraphNodeGetDependentNodes.
+inline cudaError_t
+cuda_graph_node_get_dependent_nodes_v2(cudaGraphNode_t node,
+                                       cudaGraphNode_t *pDependentNodes,
+                                       cudaGraphEdgeData *edgeData,
+                                       size_t *pNumDependentNodes) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
+                       cudaGraphNodeGetDependentNodes,
+                       node,
+                       pDependentNodes,
+                       edgeData,
+                       pNumDependentNodes);
+}
+
+inline cudaError_t
+cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
+                                    cudaGraphNode_t *pDependentNodes,
+                                    size_t *pNumDependentNodes) {
+    return cuda_graph_node_get_dependent_nodes_v2(
+        node, pDependentNodes, /*edgeData=*/nullptr, pNumDependentNodes);
+}
+#else
 inline cudaError_t
 cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
                                     cudaGraphNode_t *pDependentNodes,
@@ -235,6 +259,7 @@ cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
     NV_FE_CALL_TO_CUDA(
         cuda_graph_node_get_dependent_nodes, cudaGraphNodeGetDependentNodes, node, pDependentNodes, pNumDependentNodes);
 }
+#endif
 
 inline cudaError_t
 cuda_graph_add_memcpy_node_set_params_1D(cudaGraphNode_t node,
