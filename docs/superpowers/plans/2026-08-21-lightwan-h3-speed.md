@@ -109,6 +109,7 @@ LightX2V 工程菜单（文档 / examples / issues）：
 | L1 | 4-step 蒸馏（high/low noise expert） | 把 40 NFE 蒸馏成 4；CFG 也蒸馏掉 | **不适用**。H3 权重已是 8-step CFG-distilled，没有 Wan2.2 MoE 的 high/low ckpt，不能把 `--steps 8` 改成 4 冒充 | 未蒸馏强行 4 步会崩主题/运动 | **禁用** |
 | L2 | NVFP4 QAT | Blackwell FP4 Tensor Core + 量化感知蒸馏 | **不适用**。4090=Ada；红线锁 INT8 ConvRot；NVFP4 是 TE 路径已有，不能换 DiT | 换量化格式 = 主题回归 | **禁用** |
 | L3 | 动态稀疏 attn 90% + Sage2 | 跳过 O(N²) 中「不重要」块 | **不可默认**。本仓 packed 是 text+audio+video 统一自注意力；Canvas 已禁 Sol-Attn/稀疏当终稿；本仓 sage2 满 seq 比 cuDNN 慢 ~60× | 人脸/对白细部丢失；SLA 论文也要微调 | **P2 研究，默认关** |
+| L3b | **H3 Turbo-SLA**（HF 4-step FL2V LoRA） | 蒸馏 4 步 + 85% `dynamic_sparse_attn` + sage2 + `training_euler` | **不是**给现有 8-step INT8 插核。无 LoRA 加载器；BF16 LoRA vs INT8 ConvRot；FL2V≠T2VA 金线；2.5× 是 5090 LightX2V vs 30-step | 不训的稀疏会崩；末帧/小脸 | **C 现阶段不要做**。专章：[2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md) |
 | L4 | SageAttention 替换 FA2 | QK INT8 / PV FP8 MMA | **不可默认**。Ada 上社区相对 FA2 可 ~2×，但本仓上限是 cuDNN fused，sage2 核 9s/层 ≫ cuDNN 150ms | INT8/FP8 attn 微损 | **保持 opt-in，禁止改默认** |
 | L5 | `enable_cfg=false` | 蒸馏模型单路 | **已做**。质量档 cfg=1 | cfg=5 + 短 ids 过曝 | **保持** |
 | L6 | TeaCache / MagCache / FBCache | 步间 residual 相似则 skip DiT | **可接线，不可当质量默认**。H3 已 8-step 蒸馏，#579 说蒸馏后再 cache 几乎不跳；本仓 `--magcache-thresh` 已存在但主题默认关；EasyCache 伤 H3 音频（Comfy #15326） | 轨迹漂移、对白节拍乱 | **P1 A/B，默认关** |
@@ -161,7 +162,7 @@ LightX2V 工程菜单（文档 / examples / issues）：
 
 - 真 MMA Sage2++ 且 **核速度 ≤ cuDNN** 才允许 opt-in。
 - Ada 上的稀疏 attn 研究档（非成片）。
-- 若未来有 H3 官方 4-step 蒸馏权重，再单独立档（不是把现在 8 步砍成 4）。
+- H3 **社区** 4-step 已出现：LightX2V [Minimax-h3-Turbo-SLA](https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA) 是 **FL2V LoRA + SLA/Sage2**，不是给本仓 8-step INT8 插核。判定 **C**，见 [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)。不要把 `--steps 8` 改成 4 冒充。
 
 ---
 
@@ -215,7 +216,7 @@ LightX2V 工程菜单（文档 / examples / issues）：
 
 ### 步 2 — 编译到 4090 `src_sync` — **已做**
 
-`haiyang@192.168.0.38:/home/haiyang/h3_c/src_sync`，binary `2026-08-21 06:06:57 +0800`。
+`${H3_SSH_4090:-haiyang@192.168.31.34}:/home/haiyang/h3_c/src_sync`（旧 `192.168.0.38` 已迁移），binary `2026-08-21 06:06:57 +0800`。
 
 禁止：`--frames 17`、`--magcache-thresh`、`--reuse`、sage2、`H3_VAE_NO_SPATIAL_TILE`、设 `H3_W4A8_CACHE_REFIT_RESERVE_MIB=8192`（会退回 p2 窗）。
 
@@ -282,6 +283,8 @@ LightX2V 工程菜单（文档 / examples / issues）：
 - https://arxiv.org/html/2506.09045v1 （MagCache）
 - https://github.com/thu-ml/SageAttention
 - https://arxiv.org/html/2509.24006v1 （SLA）
+- https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA
+- [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)
 - https://github.com/mit-han-lab/radial-attention
 - https://huggingface.co/lightx2v/Wan2.2-Lightning
 - 本仓 Canvas：`h3c-480p-quality-speed-plan.canvas.tsx`（A1–A5 已在 p0 落地，本文件不重复做 pad/nvrtc）

@@ -1,5 +1,7 @@
 # MiniMax H3 加速方案普查 + Sol-Attn 专章
 
+> **2026-08-25 已 superseded。** 可执行加速方案、4090 实测地板、官方 4.44× 怎么读、真 Sol 视觉门：见 [2026-08-25-h3c-4090-accel-plan.md](./2026-08-25-h3c-4090-accel-plan.md)。本文保留作 8-21 普查底稿；**不要**再把 Spark 融合后再加 Sol 的 −12% 焊成「官方只承诺 12%」。
+
 日期：2026-08-21  
 仓库：`h3.c`（纯 C/CUDA MiniMax-H3 T2VA，RTX 4090 24GB）  
 本文不改推理代码、不跑 generate。数字来自联网源码/论文/本仓已存计划。
@@ -17,6 +19,7 @@
 3. **不要指望把 cafe DiT 50.5s 砍掉一半。** 合理预期是稳态注意力段再压 **数秒到约 8s**；step1 的 11s unpack/建图 Sol 帮不上。叠 MagCache/EasyCache 才是 Sol-Engine 宣传的 4–5×，本仓 8-step 上 MagCache 0.08 已质量 FAIL。
 4. **现在不要接到 h3.c 质量默认。** 2026-08-21 孤立 CUDA Sol（tau=1.3 / sink=988 / block=64）在 cafe packed `T=15973,H=56,D=128` 上 **输给本仓 cuDNN：351ms vs 47ms（约 7.5× 慢）**。未跑 q2 generate。禁止 Triton 侧车。详见 §1.10。
 5. A1 TE packed 常驻 + 有声 overlap 已合入：有声 q1 **75.4s**（te 11.6 / dit 47.5 / vae 9.3），checksum 与 p3 相同。到 40–50s 仍被 DiT 47.5s 挡住，必须跨红线。
+6. **SLA / MiniMax-H3 Turbo-SLA = C，不要做。** 论文要微调；HF 是 4-step FL2V LoRA+Sage2，不是 8-step INT8 插核。专章：[2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)。
 
 禁止当质量：W4A8、关 deblock、`--frames 17` 冒充 5s、默认 magcache、TinyVAE 成片、未蒸馏 4 步。
 
@@ -330,12 +333,13 @@ Saganaki22 自己的整模数字更诚实：H3 15s 480×864 20 步，hook 版 So
 - TRT：与自有 INT8 契约+纯 C 旁路冲突（`docs/nvidia_optimization_plan.md`）。
 - CUDA Graph：`H3_DIT_W4A8_CUDA_GRAPH` 已接线；**cuDNN SDPA 不可捕获**。p5 pthread prebuild 90.5→98.8s，已回退。
 
-#### Window attention / 稀疏 90% / Radial / SLA — **C 默认**
+#### Window attention / 稀疏 90% / Radial / SLA — **C 默认**（SLA 2026-08-25 专章）
 
 - LightWan extreme：`sparsity_ratio=0.9` + sage2。要微调，伤细部。
 - RadialAttention：https://github.com/mit-han-lab/radial-attention ；Comfy：https://github.com/woct0rdho/ComfyUI-RadialAttn
 - 本仓 `--attn-window` 是产品档，不进质量默认。
 - Canvas/LightWan 文档已禁「稀疏 90% 当终稿」。
+- **SLA（论文 arXiv:2509.24006 + HF `Minimax-h3-Turbo-SLA`）= C，不要做。** 可训练稀疏+线性，不是 Sol 那种 plug-and-play。HF 是 **4-step distilled FL2V LoRA** + `attn_type=dynamic_sparse_attn` + `operator=sage2` + `training_euler`，5090 LightX2V 自称 ~2.5×（对 30-step base，不是本仓 8-step INT8+cuDNN）。本仓无 LoRA 加载器、无 native SLA 核、sage2 远慢于 cuDNN。专章：[2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)。
 
 #### Token reduction — **C 质量默认**
 
@@ -507,6 +511,7 @@ Saganaki22 自己的整模数字更诚实：H3 15s 480×864 20 步，hook 版 So
 | --- | --- |
 | MagCache 0.08 当质量 | 79s，MAE 52–68 |
 | 未蒸馏 4 步 / LightWan 80× 直接搬 | 没有 H3 4-step 权；80× 主力在蒸馏 |
+| **SLA / MiniMax-H3 Turbo-SLA 进质量默认或当 8-step kernel** | 论文要微调；plug-and-play 85% 稀疏会崩（Sparge-F）。HF 是另一套 4-step FL2V BF16 LoRA+Sage2，不是 INT8+cuDNN 插核。无 native SLA 核可对 cafe `T=15973` bench。详见 [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md) |
 | 20 步当更清 | av20 140s |
 | W4A8 DiT 当主题 | 主题崩 |
 | NVFP4 DiT / Sage3 / FA3 | 4090=Ada |
@@ -579,6 +584,10 @@ Saganaki22 自己的整模数字更诚实：H3 15s 480×864 20 步，hook 版 So
 - https://arxiv.org/abs/2605.16736 （CAB）
 - 本仓金线：`out/verify_480p_quality_full/t2va_complex_5s_cafe_p3/`
 - 用户已存 Sol README：`/Users/digenman/.cursor/projects/Volumes-Ben-Digen-code-h3-c/uploads/ComfyUI-sol-attn-2.md`
+- https://arxiv.org/abs/2509.24006 （SLA）
+- https://github.com/thu-ml/SLA
+- https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA
+- [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)
 
 ---
 
@@ -588,4 +597,5 @@ Saganaki22 自己的整模数字更诚实：H3 15s 480×864 20 步，hook 版 So
 | --- | --- |
 | [2026-08-21-remaining-quality-speed.md](./2026-08-21-remaining-quality-speed.md) | 质量菜单；本文把 Sol-Attn 从笼统「稀疏 attn」里拆出来，并交叉链接 |
 | [2026-08-21-lightwan-h3-speed.md](./2026-08-21-lightwan-h3-speed.md) | LightWan 80× 为何搬不来；p0–p5 墙钟 |
+| [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md) | SLA / H3 Turbo-SLA：**C 不要做**；不是 Sol 续集 |
 | `docs/nvidia_optimization_plan.md` §9 | 2026-08 的 Sage/MagCache/TRT 菜单；本文用 cafe_p3 数字刷新 |

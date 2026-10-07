@@ -93,6 +93,7 @@
 | B5 | YCNodes Distance Attention | 时空高斯感受野，挡背景吞五官 | 不加速，略增 mask 开销；可能改善 cafe 小脸 | **质量刀，不是速度刀** |
 | B6 | YCNodes Sigma Refiner | 低 sigma 尾部**加步** | 更慢。整段 8→20 已证伪（av20 140s 且不更清）；Refiner 只加密尾巴，对「中前期身份融化」无效 | **质量刀，默认会变慢** |
 | B7 | 稀疏 attn / Sage2（泛称） | 跳 token 或量化 attn | 本仓 sage2 满 seq 比 cuDNN 慢数量级；稀疏伤细部 | 仅研究档 |
+| B9 | **SLA / H3 Turbo-SLA**（论文 + HF 4-step FL2V LoRA） | 可训练稀疏+线性；HF 是另一套 4-step 配方 + sage2 | 不训会崩；85% 伤 480p 脸/末帧；LoRA≠INT8 | **C 现阶段不要做**。专章：[2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md) |
 | B8 | **Sol-Attn**（kijai Triton / 论文） | training-free 阈值路由 + pooled-KV 近似校正；H3 需 sink 保 text/audio | 小脸/细部。**2026-08-21 孤立 CUDA Sol 输给 cuDNN 7.5×**，未跑 q2 | **已停**。不进质量默认。专章：[加速普查 §1.10](./2026-08-21-h3-accel-survey.md) |
 
 ### C. 已证伪 / 不适用于本仓
@@ -101,6 +102,7 @@
 | --- | --- |
 | MagCache 0.08 当质量 | 79s，RGB MAE 52–68，已回退 |
 | 把 `--steps` 改成 4（无 H3 4-step 蒸馏权重） | LightWan 80× 的主力在蒸馏；H3 已是 8-step CFG-distilled |
+| SLA / Turbo-SLA 当 8-step INT8 加速 | HF 是 4-step FL2V LoRA+Sage2，对 30-step base；本仓无 LoRA、无 SLA 核、cuDNN 已赢 Sage。C，见 [2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md) |
 | 20 步当「更清」 | av20 140s，同片不更清；整段加步拉歪蒸馏轨迹 |
 | W4A8 DiT 当主题 | 主题崩 |
 | NVFP4 DiT / 5090 故事 | 4090=Ada |
@@ -274,6 +276,7 @@ Issue [#18](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/iss
 - 本仓金线：`out/verify_480p_quality_full/t2va_complex_5s_cafe_p3/`
 - LightWan 已落地项：[2026-08-21-lightwan-h3-speed.md](./2026-08-21-lightwan-h3-speed.md)
 - Sol-Attn + 市面加速普查：[2026-08-21-h3-accel-survey.md](./2026-08-21-h3-accel-survey.md)
+- SLA / H3 Turbo-SLA（**C 不要做**）：[2026-08-25-sla-vs-h3c.md](./2026-08-25-sla-vs-h3c.md)
 - https://github.com/kijai/ComfyUI-SolAttn_triton
 - https://arxiv.org/abs/2607.24027
 - https://github.com/Saganaki22/ComfyUI-sol-attn

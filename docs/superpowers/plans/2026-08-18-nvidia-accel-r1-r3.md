@@ -23,7 +23,7 @@
 
 ### 远程 4090 验证路径提示（勿写密码）
 
-- Host：`haiyang@192.168.0.38`（见 `docs/nvidia_build.md`）。
+- Host：`${H3_SSH_4090:-haiyang@192.168.31.34}`（见 `docs/nvidia_build.md`；旧 `192.168.0.38` 已迁移）。
 - Env：`conda activate comfyui`；`unset LDFLAGS CFLAGS CXXFLAGS CPPFLAGS`；补 `LIBRARY_PATH` / cuDNN `LD_LIBRARY_PATH`。
 - Tree：源码常在 `/home/haiyang/h3_c/src_sync` 或 `/home/haiyang/h3_c`；权重 `/home/haiyang/h3_c/models/comfy-org/`。
 - Build：
