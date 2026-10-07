@@ -197,19 +197,20 @@ export PYTHONPATH=$H3_SAGE3_TOOLS:$H3_SAGE3_ROOT/build/lib.linux-x86_64-cpython-
 ./build-cuda-sm120/h3_cuda_generate ... --sdpa-backend sage3
 # 日志应见：layout=F16_BHTD prep=cuda_thd_bhtd；hits 满、fallback=0
 
-# Tier-1 Sol CuTe — 4090 / build-cuda（需插件 + 官方 ATTN ROOT + Triton≥3.3）
-export H3_SOL_CUTE_LIB=$PWD/build-cuda/libh3_sol_cute.so
-export H3_SOL_ATTN_ROOT=/path/to/techniques/sparse_backends   # 官方：无 _prepare_torch
-export H3_TRITON_OVERLAY=/path/to/triton34_overlay            # TensorDescriptor
-export PYTHONPATH=$H3_TRITON_OVERLAY:$H3_SOL_ATTN_ROOT:$PWD/tools
+# Tier-1 Sol CuTe — 官方 NVlabs sol-engine（4090=`cute_sm89`；5090=`cute_sm120`）
+export H3_SOL_CUTE_LIB=$PWD/build-cuda-sm120/libh3_sol_cute.so   # 4090 用 build-cuda/
+export H3_SOL_ATTN_ROOT=/path/to/Sana/techniques/sparse_backends   # 官方：无 _prepare_torch
+export H3_SOL_CUTE_TOOLS=$PWD/tools
+export H3_TRITON_OVERLAY=/path/to/triton34_overlay            # TensorDescriptor；无机器默认
+export PYTHONPATH=$H3_TRITON_OVERLAY:$H3_SOL_ATTN_ROOT:$H3_SOL_CUTE_TOOLS
 # 测满核命中时可：
 export H3_SOL_FIRST_DENSE_STEPS=0 H3_SOL_FIRST_DENSE_LAYERS=0
-./build-cuda/h3_cuda_generate ... --sdpa-backend sol_cute
-# 日志应见：backend=cute_sm89 preprocess=triton_prepare；hits>0 fallback=0
-
-# 能力探测
+./build-cuda-sm120/h3_cuda_generate ... --sdpa-backend sol_cute
+# 5090 日志应见：backend=cute_sm120；hits>0 fallback=0。backend=triton 是缺 CuTe，禁止报 hit。
+# 探测核是否真在：
+python3 tools/h3_sol_sage3_inventory.py
+# 打印 caps: sm / fp4 / sage3_lib / sol_cute_lib / ROOT env 与 sdpa_select reason
 ./build-cuda*/h3_cuda_info
-# 打印 caps: sm / fp4 / sage3_lib / sol_cute_lib 与 sdpa_select reason
 ```
 
 ### 缺什么会硬错
@@ -221,7 +222,7 @@ export H3_SOL_FIRST_DENSE_STEPS=0 H3_SOL_FIRST_DENSE_LAYERS=0
 | `sol_cute` | `H3_SOL_CUTE_LIB` | **硬错** |
 | `sol_cute` | `H3_SOL_ATTN_ROOT` | **硬错**（无机器默认；warmup 亦不回退 sparse） |
 | `sol_cute` | ROOT 含 `_prepare_torch` / Triton&lt;3.3 | embed **硬错**（拒绝假 preprocess） |
-| `sol_cute` | backend≠`cute_sm89` | embed **硬错** |
+| `sol_cute` | backend 不是 `cute_sm89|cute_sm90|cute_sm100|cute_sm120`（含 `triton`） | embed **硬错** |
 
 不会静默落到 nested-loop / sage2。
 

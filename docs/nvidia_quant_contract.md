@@ -241,6 +241,8 @@ make h3_w4a8_matmul_probe
 # 或: cmake --build build-cuda --target h3_w4a8_matmul_probe
 ```
 
+**当前连接（地址已迁移）：** 4090 现用 `${H3_SSH_4090:-haiyang@192.168.31.34}`，5090 现用 `${H3_SSH_5090:-yongbin@192.168.31.238}`（见 `docs/nvidia_build.md`）。下文各「远程验收」标题中的 `haiyang@192.168.0.38` 为 2026-08-13 历史机址，勿再当当前入口。
+
 **远程验收（第一步，`haiyang@192.168.0.38`，FL2VA W4A8，2026-08-13）：**
 
 ```text

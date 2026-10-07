@@ -2,7 +2,7 @@
 
 > 状态跟踪文档。实现与实测后更新「状态 / 实测」列。  
 > 硬约束：纯 C/CUDA C；不破坏 Metal；不 git commit；密码不上库。  
-> 基线机：`haiyang@192.168.0.38` RTX 4090 24GB，`conda activate comfyui`。
+> 基线机：`${H3_SSH_4090:-haiyang@192.168.31.34}` RTX 4090 24GB，`conda activate comfyui`。（旧 `192.168.0.38` 已迁移）
 
 ## 1. 背景与基线
 
@@ -675,7 +675,7 @@ H3_CUDA_SDPA_BACKEND=cudnn ./build-cuda/h3_cuda_generate \
 
 ### 17.2 实测耗时表（配置注明）
 
-> 机：`haiyang@192.168.0.38` RTX 4090 24GB；`conda activate comfyui`；`H3_CUDA_SDPA_BACKEND=cudnn`（除非另注）；口径见 §6 / §10.3（多层 `blocks_ms` 自 warm prefetch **后**起算）。
+> 机：`${H3_SSH_4090:-haiyang@192.168.31.34}` RTX 4090 24GB；`conda activate comfyui`；`H3_CUDA_SDPA_BACKEND=cudnn`（除非另注）；口径见 §6 / §10.3（多层 `blocks_ms` 自 warm prefetch **后**起算）。
 
 #### 17.2.1 算力探针（opt3 · 2026-08-15）
 
