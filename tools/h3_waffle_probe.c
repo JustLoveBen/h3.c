@@ -50,8 +50,8 @@ int main(int argc, char **argv) {
         b16 = h3_waffle_b16_gated_rgb24(rgb, w, h, &ratio, &low);
         if (low)
             printf("waffle: frame=%s b16=%.3f %dx%d INVALID_LOWENERGY "
-                   "block_ratio=%.1f gate=%.1f\n",
-                   argv[i], b16, w, h, ratio, H3_WAFFLE_B16_MIN_BLOCK_RATIO);
+                   "block_ratio=%.1f gate=%.2f\n",
+                   argv[i], b16, w, h, ratio, h3_waffle_b16_gate(w, h));
         else
             printf("waffle: frame=%s b16=%.3f %dx%d\n", argv[i], b16, w, h);
         free(rgb);

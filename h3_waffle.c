@@ -75,7 +75,7 @@ double h3_waffle_b16_gated_rgb24(const uint8_t *rgb, int width, int height,
             }
         }
         if (block_ratio) *block_ratio = ratio;
-        if (low_energy && ratio < H3_WAFFLE_B16_MIN_BLOCK_RATIO)
+        if (low_energy && ratio < h3_waffle_b16_gate(width, height))
             *low_energy = 1;
     }
     return ((double)edge / (double)n_edge) / ((double)inner / (double)n_inner);
@@ -96,8 +96,8 @@ void h3_waffle_log_rgb24(const uint8_t *rgb, int nframes, int width, int height)
                                         &ratio, &low);
         if (low)
             printf("waffle: frame=%d b16=%.3f INVALID_LOWENERGY "
-                   "block_ratio=%.1f gate=%.1f\n",
-                   f, b16, ratio, H3_WAFFLE_B16_MIN_BLOCK_RATIO);
+                   "block_ratio=%.1f gate=%.2f\n",
+                   f, b16, ratio, h3_waffle_b16_gate(width, height));
         else
             printf("waffle: frame=%d b16=%.3f\n", f, b16);
     }
