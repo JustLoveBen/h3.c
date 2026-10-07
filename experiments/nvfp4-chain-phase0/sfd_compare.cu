@@ -53,6 +53,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/host_tensor.h"
 
 #include "quant_act_extracted.cuh"
 
@@ -126,6 +127,9 @@ using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideC = typename Gemm::GemmKernel::StrideC;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
+using FusionOp = typename Gemm::EpilogueOutputOp;
+constexpr bool IsBlockScaleSupported = FusionOp::IsBlockScaleSupported;
+static_assert(IsBlockScaleSupported, "79b epilogue must support SFD gen");
 
 struct DeviceBuf {
   void *p = nullptr;
@@ -135,6 +139,11 @@ struct DeviceBuf {
   ~DeviceBuf() { if (p) cudaFree(p); }
   DeviceBuf(const DeviceBuf &) = delete;
   DeviceBuf &operator=(const DeviceBuf &) = delete;
+  DeviceBuf(DeviceBuf &&o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; o.bytes = 0; }
+  DeviceBuf &operator=(DeviceBuf &&o) noexcept {
+    if (this != &o) { if (p) cudaFree(p); p = o.p; bytes = o.bytes; o.p = nullptr; o.bytes = 0; }
+    return *this;
+  }
 };
 
 static void fill_uniform(float *h, size_t n, uint32_t *state, float lo,
@@ -163,12 +172,12 @@ static void quantize_to_device(const std::vector<float> &h, size_t rows,
   CK(cudaDeviceSynchronize());
 }
 
-struct Shape {
+struct ShapeCfg {
   const char *name;
   size_t m, n, k;
 };
 
-static bool run_shape(const Shape &s) {
+static bool run_shape(const ShapeCfg &s) {
   size_t m = s.m, n = s.n, k = s.k;
   fprintf(stderr, "== %s M=%zu N=%zu K=%zu ==\n", s.name, m, n, k);
 
@@ -215,26 +224,48 @@ static bool run_shape(const Shape &s) {
   fprintf(stderr, "  SFD extent: cutlass cosize=%zu h3 sf_bytes=%zu %s\n",
           sfd_bytes, ref_bytes, sfd_bytes == ref_bytes ? "(match)" : "(MISMATCH!)");
 
-  DeviceBuf d_d_fp4(m * (n / 2)), d_sfd(sfd_bytes);
-  CK(cudaMemset(d_d_fp4.p, 0xEE, m * (n / 2))); // poison: detect unwritten bytes
-  CK(cudaMemset(d_sfd.p, 0xEE, sfd_bytes));
-  DeviceBuf d_norm(4);
-  float h_norm = 1.0f;
-  CK(cudaMemcpy(d_norm.p, &h_norm, 4, cudaMemcpyHostToDevice));
+  // HostTensor device_data() yields exactly the pointer types the Arguments
+  // fields expect (mirror 79b). Stage the h3p0-quantized bytes into them.
+  cutlass::HostTensor<typename ElementA::DataType, cutlass::layout::PackedVectorLayout> block_A;
+  cutlass::HostTensor<typename ElementA::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFA;
+  cutlass::HostTensor<typename ElementB::DataType, cutlass::layout::PackedVectorLayout> block_B;
+  cutlass::HostTensor<typename ElementB::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFB;
+  cutlass::HostTensor<ElementD, cutlass::layout::PackedVectorLayout> block_D;
+  cutlass::HostTensor<ElementSFD, cutlass::layout::PackedVectorLayout> block_SFD;
+  cutlass::HostTensor<ElementCompute, cutlass::layout::PackedVectorLayout> block_Normconst;
+
+  size_t m_pad = (m + 127u) & ~(size_t)127u;
+  block_A.reset(cutlass::make_Coord(h3p0::fp4_bytes(m_pad, k)));
+  block_B.reset(cutlass::make_Coord(h3p0::fp4_bytes(n, k)));
+  block_SFA.reset(cutlass::make_Coord(h3p0::sf_bytes(m, k)));
+  block_SFB.reset(cutlass::make_Coord(h3p0::sf_bytes(n, k)));
+  block_D.reset(cutlass::make_Coord(m * (n / 2)));
+  block_SFD.reset(cutlass::make_Coord(sfd_bytes));
+  block_Normconst.reset(cutlass::make_Coord(1));
+
+  CK(cudaMemcpy(block_A.device_data(), d_x_fp4.p, h3p0::fp4_bytes(m_pad, k), cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpy(block_B.device_data(), d_w_fp4.p, h3p0::fp4_bytes(n, k), cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpy(block_SFA.device_data(), d_sf_x.p, h3p0::sf_bytes(m, k), cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpy(block_SFB.device_data(), d_sf_w.p, h3p0::sf_bytes(n, k), cudaMemcpyDeviceToDevice));
+  CK(cudaMemset(block_D.device_data(), 0xEE, m * (n / 2))); // poison: detect unwritten bytes
+  CK(cudaMemset(block_SFD.device_data(), 0xEE, sfd_bytes));
+  block_Normconst.at(cutlass::make_Coord(0)) = 1.0f;
+  block_Normconst.sync_device();
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       {(int)m, (int)n, (int)k, 1},
-      {cute::recast_ptr<typename ElementA::DataType>(d_x_fp4.p), stride_A,
-       cute::recast_ptr<typename ElementB::DataType>(d_w_fp4.p), stride_B,
-       cute::recast_ptr<typename ElementA::ScaleFactorType>(d_sf_x.p), layout_SFA,
-       cute::recast_ptr<typename ElementB::ScaleFactorType>(d_sf_w.p), layout_SFB},
+      {block_A.device_data(), stride_A,
+       block_B.device_data(), stride_B,
+       block_SFA.device_data(), layout_SFA,
+       block_SFB.device_data(), layout_SFB},
       {{1.0f, 0.0f},
        nullptr, stride_C,
-       cute::recast_ptr<ElementD>(d_d_fp4.p), stride_D}};
-  arguments.epilogue.thread.block_scale_factor_ptr =
-      cute::recast_ptr<ElementSFD>(d_sfd.p);
-  arguments.epilogue.thread.norm_constant_ptr = (const float *)d_norm.p;
+       block_D.device_data(), stride_D}};
+  if constexpr (IsBlockScaleSupported) {
+    arguments.epilogue.thread.block_scale_factor_ptr = block_SFD.device_data();
+    arguments.epilogue.thread.norm_constant_ptr = block_Normconst.device_data();
+  }
 
   Gemm gemm;
   size_t ws_size = Gemm::get_workspace_size(arguments);
@@ -247,7 +278,7 @@ static bool run_shape(const Shape &s) {
   // Byte-compare SFD over the common extent (should be identical sizes).
   size_t cmp = sfd_bytes < ref_bytes ? sfd_bytes : ref_bytes;
   std::vector<uint8_t> h_sfd(cmp), h_ref(cmp);
-  CK(cudaMemcpy(h_sfd.data(), d_sfd.p, cmp, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(h_sfd.data(), block_SFD.device_data(), cmp, cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(h_ref.data(), d_ref_sf.p, cmp, cudaMemcpyDeviceToHost));
 
   size_t ncb = (n / 16) / 4;

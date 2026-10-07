@@ -51,6 +51,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/host_tensor.h"
 
 #include "quant_act_extracted.cuh"
 
@@ -185,6 +186,11 @@ struct DeviceBuf {
   ~DeviceBuf() { if (p) cudaFree(p); }
   DeviceBuf(const DeviceBuf &) = delete;
   DeviceBuf &operator=(const DeviceBuf &) = delete;
+  DeviceBuf(DeviceBuf &&o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; o.bytes = 0; }
+  DeviceBuf &operator=(DeviceBuf &&o) noexcept {
+    if (this != &o) { if (p) cudaFree(p); p = o.p; bytes = o.bytes; o.p = nullptr; o.bytes = 0; }
+    return *this;
+  }
 };
 
 static float bench_ms(std::function<void()> fn, int warmup, int iters) {
@@ -438,27 +444,48 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[cutlass] layout_SFD cosize=%zu h3 sf_bytes(m,n)=%zu\n",
             sfd_bytes, h3p0::sf_bytes(m, n));
 
-    DeviceBuf d_d_fp4(m * (n / 2)), d_sfd(sfd_bytes);
-    DeviceBuf d_norm(4);
+    // HostTensor gives device_data() of exactly the type the Arguments fields
+    // expect (mirror 79b). We stage the h3p0-quantized bytes into them.
+    cutlass::HostTensor<typename ElementA::DataType, cutlass::layout::PackedVectorLayout> block_A;
+    cutlass::HostTensor<typename ElementA::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFA;
+    cutlass::HostTensor<typename ElementB::DataType, cutlass::layout::PackedVectorLayout> block_B;
+    cutlass::HostTensor<typename ElementB::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFB;
+    cutlass::HostTensor<ElementD, cutlass::layout::PackedVectorLayout> block_D;
+    cutlass::HostTensor<ElementSFD, cutlass::layout::PackedVectorLayout> block_SFD;
+    cutlass::HostTensor<ElementCompute, cutlass::layout::PackedVectorLayout> block_Normconst;
+
+    block_A.reset(cutlass::make_Coord(h3p0::fp4_bytes(m_pad, k)));       // e2m1 packed bytes
+    block_B.reset(cutlass::make_Coord(h3p0::fp4_bytes(n, k)));
+    block_SFA.reset(cutlass::make_Coord(h3p0::sf_bytes(m, k)));
+    block_SFB.reset(cutlass::make_Coord(h3p0::sf_bytes(n, k)));
+    block_D.reset(cutlass::make_Coord(m * (n / 2)));
+    block_SFD.reset(cutlass::make_Coord(sfd_bytes));
+    block_Normconst.reset(cutlass::make_Coord(1));
+
+    CK(cudaMemcpy(block_A.device_data(), d_x_fp4.p, h3p0::fp4_bytes(m_pad, k), cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(block_B.device_data(), d_w_fp4.p, h3p0::fp4_bytes(n, k), cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(block_SFA.device_data(), d_sf_x.p, h3p0::sf_bytes(m, k), cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(block_SFB.device_data(), d_sf_w.p, h3p0::sf_bytes(n, k), cudaMemcpyDeviceToDevice));
     // norm_constant=1: output must be exactly alpha*acc+beta*C in value so the
     // spot-check against cublasLt compares the same math (79b uses 2 as a demo;
     // that version dequantizes to 2x, which would pollute rel_l2).
-    float h_norm = 1.0f;
-    CK(cudaMemcpy(d_norm.p, &h_norm, 4, cudaMemcpyHostToDevice));
+    block_Normconst.at(cutlass::make_Coord(0)) = 1.0f;
+    block_Normconst.sync_device();
 
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {(int)m, (int)n, (int)k, 1},
-        {cute::recast_ptr<typename ElementA::DataType>(d_x_fp4.p), stride_A,
-         cute::recast_ptr<typename ElementB::DataType>(d_w_fp4.p), stride_B,
-         cute::recast_ptr<typename ElementA::ScaleFactorType>(d_sf_x.p), layout_SFA,
-         cute::recast_ptr<typename ElementB::ScaleFactorType>(d_sf_w.p), layout_SFB},
+        {block_A.device_data(), stride_A,
+         block_B.device_data(), stride_B,
+         block_SFA.device_data(), layout_SFA,
+         block_SFB.device_data(), layout_SFB},
         {{1.0f, 0.0f},
          nullptr, stride_C,
-         cute::recast_ptr<ElementD>(d_d_fp4.p), stride_D}};
-    arguments.epilogue.thread.block_scale_factor_ptr =
-        cute::recast_ptr<ElementSFD>(d_sfd.p);
-    arguments.epilogue.thread.norm_constant_ptr = (const float *)d_norm.p;
+         block_D.device_data(), stride_D}};
+    if constexpr (IsBlockScaleSupported) {
+      arguments.epilogue.thread.block_scale_factor_ptr = block_SFD.device_data();
+      arguments.epilogue.thread.norm_constant_ptr = block_Normconst.device_data();
+    }
 
     Gemm gemm;
     size_t ws_size = Gemm::get_workspace_size(arguments);
@@ -488,7 +515,7 @@ int main(int argc, char **argv) {
     {
       size_t tot = m * n;
       dequant_h3<<<(unsigned)((tot + 255) / 256), 256>>>(
-          (const uint8_t *)d_d_fp4.p, (const uint8_t *)d_sfd.p,
+          (const uint8_t *)block_D.device_data(), (const uint8_t *)block_SFD.device_data(),
           (float *)d_out_cut.p, m, n);
       bf16_to_f32<<<(unsigned)((tot + 255) / 256), 256>>>(
           (const __nv_bfloat16 *)d_y_bf16.p, (float *)d_out_lt.p, tot);
