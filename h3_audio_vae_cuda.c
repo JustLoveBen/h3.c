@@ -1198,10 +1198,13 @@ int h3_audio_vae_cuda_decode(h3_cuda *cuda, const char *weights_path,
              ctx.length);
     if (ok) ok = decode_output(&ctx, output, error, error_size);
     if (ok) {
-        cudaError_t st = cudaDeviceSynchronize();
-        if (st != cudaSuccess) {
-            fail(error, error_size, "cudaDeviceSynchronize: %s",
-                 cudaGetErrorString(st));
+        /* Stream sync only: DeviceSync would wait for video VAE on overlap. */
+        cudaStream_t st = (cudaStream_t)h3_cuda_op_stream(cuda);
+        cudaError_t rst =
+            st ? cudaStreamSynchronize(st) : cudaDeviceSynchronize();
+        if (rst != cudaSuccess) {
+            fail(error, error_size, "cudaStreamSynchronize: %s",
+                 cudaGetErrorString(rst));
             ok = 0;
         }
     }

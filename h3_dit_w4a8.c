@@ -1,11 +1,15 @@
 #include "h3_dit_w4a8.h"
 
+#include "h3_dit_fused_epi.h"
 #include "h3_dit_int8.h"
+#include "h3_dit_int8_opt.h"
+#include "h3_dit_nvfp4.h"
 #include "h3_lora.h"
 
 #include <cuda_runtime_api.h>
 
 #include <limits.h>
+#include <stdint.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -15,6 +19,12 @@
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
 #endif
+
+/* 16-byte pad so AdaLN `d_a` stays float4-safe. Odd seq used to leave
+ * map+8 and break NVFP4 gs==0 quantize (misaligned). Gold layout +8 max. */
+#define H3_WS_MAP_BYTES(seq) \
+    (((size_t)(seq) * sizeof(uint32_t) + 15u) & ~(size_t)15u)
+#define H3_LORA_EV_MAX 256
 
 static int env_flag_is_one(const char *name) {
     const char *e = getenv(name);
@@ -27,6 +37,7 @@ static int g_uly_log_rank = -1;
 static int g_uly_log_phase = 0;
 static unsigned g_uly_log_block = 0;
 static int g_uly_phase_sync = 0;
+static int g_dit_gemm_epi;
 
 static void uly_klog(const char *kernel, const char *state) {
     if (g_uly_log_rank < 0 || !kernel)
@@ -146,6 +157,7 @@ struct h3_dit_w4a8 {
     h3_cuda *cuda;
     h3_w4a8_store *store;
     h3_dit_int8_store *int8_store; /* mutually exclusive with store */
+    h3_nvfp4_store *nvfp4_store;   /* NVFP4 DiT; mutually exclusive */
     h3_w4a8_cache *cache;
     int convrot_gs;
     int group_size;
@@ -170,6 +182,18 @@ struct h3_dit_w4a8 {
     unsigned graph_block;
     int graph_ok;
     int graph_warmed;
+    /* Whole-step CUDA Graph: one capture for all n_blocks of the all-aux
+     * device chain (only when the weight window covers the full range).
+     * Keyed by (first_block, n_blocks, seq); the captured device pointers
+     * must stay stable across steps, so any realloc/reload invalidates.
+     * Env: H3_DIT_W4A8_CUDA_GRAPH=1 (shared with the block graph). */
+    cudaGraph_t step_graph;
+    cudaGraphExec_t step_graph_exec;
+    size_t step_graph_seq;
+    unsigned step_graph_first;
+    unsigned step_graph_n;
+    float *d_graph_aux_base; /* d_block_ws offset snapshot at capture */
+    int step_graph_ok;
     /* Metal-compatible token-reduction (opt-in; default off). */
     int token_reduction;
     unsigned tr_begin;
@@ -244,12 +268,42 @@ struct h3_dit_w4a8 {
     float *d_lora_t;
     size_t d_lora_t_cap;
     int lora_max_r;
+    unsigned char lora_f16; /* A/B stored as __half; mixed GEMM. */
+    cudaEvent_t *lora_ev0;
+    cudaEvent_t *lora_ev1;
+    int lora_ev_n;
+    int lora_ev_cap;
+    cudaEvent_t lora_x_ev;
+    cudaEvent_t lora_done_ev;
     /* Ulysses SP group (only on rank 0 ctx; uly_ctx[0] == this). Rank ctxs
      * are owned by the caller (generate). uly_u<=1 → today's path. */
     struct h3_dit_w4a8 *uly_ctx[8];
     int uly_dev[8];
     int uly_u;
     h3_dit_w4a8_sp_comm uly_comm;
+    /* Layer-wise clean AV KV (TaoMate). NULL when disabled. */
+    int ckv_on;
+    int ckv_mode; /* 0 off, 1 noisy, 2 commit */
+    unsigned ckv_layer;
+    size_t ckv_max;
+    size_t ckv_n;
+    size_t ckv_save_n;
+    size_t ckv_save_dst;
+    void *d_ckv_k;
+    void *d_ckv_v;
+    uint32_t *d_ckv_idx;
+    size_t ckv_idx_cap;
+    /* NVFP4 P1.4/P1.5 (H3_DIT_NVFP4=1): FP4 cuBLASLt GEMM track. FP4
+     * weights come from a sidecar safetensors ({base}.weight_fp4 /
+     * .weight_sf / .weight_scale2, swizzled-SF layout identical to the
+     * runtime act quantizer). INT8 track stays the fallback per-block. */
+    int nvfp4_on;
+    int nvfp4_ready;
+    h3_st_header nvfp4_hdr;
+    h3_cuda_nvfp4_weight *nvfp4_w[H3_DIT_W4A8_N_BLOCKS][4];
+    uint8_t *d_nvfp4_scratch;
+    size_t d_nvfp4_scratch_bytes;
+    size_t nvfp4_scratch_cap_seq;
 };
 
 static uint32_t dit_text_row_mod(const h3_dit_w4a8 *ctx, size_t i,
@@ -278,6 +332,7 @@ static size_t dit_adaln_mod_elems(const h3_dit_w4a8 *ctx) {
 }
 
 static void destroy_block_graph(h3_dit_w4a8 *ctx);
+static void destroy_step_graph(h3_dit_w4a8 *ctx);
 
 static void fail(char *error, size_t error_size, const char *msg) {
     if (!error || !error_size) return;
@@ -394,8 +449,73 @@ h3_dit_w4a8 *h3_dit_w4a8_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
     ctx->tr_early_steps = 10;
     ctx->tr_early_end = 40;
     ctx->tr_scale = 1.0f;
+    ctx->nvfp4_on = env_flag_is_one("H3_DIT_NVFP4");
+    if (ctx->nvfp4_on) {
+        h3_w4a8_cache_set_nvfp4_int8_skip(ctx->cache, 1);
+        fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
+                        "(INT8 weights load lazily only on FP4 dispatch "
+                        "miss)\n");
+        fflush(stderr);
+    }
     return ctx;
 }
+
+h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
+                                    const h3_w4a8_cache_config *cfg,
+                                    char *error, size_t error_size) {
+    h3_w4a8_cache_config local;
+    h3_dit_w4a8 *ctx;
+    char detail[384];
+
+    if (!cuda || !store) {
+        fail(error, error_size, "cuda and NVFP4 DiT store are required");
+        return NULL;
+    }
+    if (!h3_dit_nvfp4_probe(store, error, error_size)) return NULL;
+
+    ctx = (h3_dit_w4a8 *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        fail(error, error_size, "out of memory opening dit nvfp4");
+        return NULL;
+    }
+    ctx->cuda = cuda;
+    ctx->store = NULL;
+    ctx->int8_store = NULL;
+    ctx->nvfp4_store = store;
+    ctx->act_quant = H3_W4A8_ACT_QUANT_PER_ROW;
+    ctx->group_size = 0;
+    ctx->convrot_gs = 0; /* NVFP4 is not ConvRot-preprocessed */
+
+    if (cfg)
+        local = *cfg;
+    else
+        h3_w4a8_cache_config_init(&local);
+
+    ctx->cache =
+        h3_w4a8_cache_open_nvfp4(cuda, store, &local, detail, sizeof(detail));
+    if (!ctx->cache) {
+        snprintf(error, error_size, "NVFP4 cache open: %s", detail);
+        free(ctx);
+        return NULL;
+    }
+    ctx->token_reduction = 0;
+    ctx->tr_begin = 4;
+    ctx->tr_end = 30;
+    ctx->tr_early_steps = 10;
+    ctx->tr_early_end = 40;
+    ctx->tr_scale = 1.0f;
+    ctx->nvfp4_on = env_flag_is_one("H3_DIT_NVFP4");
+    if (ctx->nvfp4_on) {
+        h3_w4a8_cache_set_nvfp4_int8_skip(ctx->cache, 1);
+        fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
+                        "(INT8 weights load lazily only on FP4 dispatch "
+                        "miss)\n");
+        fflush(stderr);
+    }
+    return ctx;
+}
+
+static void dit_rope_memo_free_all(void);
 
 void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
     unsigned i;
@@ -405,6 +525,7 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
     free(ctx->x_i8);
     free(ctx->act_scales);
     destroy_block_graph(ctx);
+    destroy_step_graph(ctx);
     if (ctx->d_block_ws) cudaFree(ctx->d_block_ws);
     if (ctx->d_video_patch_w) cudaFree(ctx->d_video_patch_w);
     if (ctx->d_video_patch_b) cudaFree(ctx->d_video_patch_b);
@@ -434,13 +555,24 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
         }
     }
     if (ctx->d_lora_t) cudaFree(ctx->d_lora_t);
+    h3_dit_w4a8_clean_kv_free(ctx);
     free(ctx->adaln_audio_scratch);
     free(ctx->adaln_visual_cond_scratch);
     free(ctx->adaln_audio_cond_scratch);
     for (i = 0; i < H3_DIT_W4A8_N_BLOCKS; i++) {
         if (ctx->aux_valid[i]) h3_dit_w4a8_block_aux_free(&ctx->aux_cache[i]);
     }
+    {
+        unsigned b, p;
+        for (b = 0; b < H3_DIT_W4A8_N_BLOCKS; b++)
+            for (p = 0; p < 4; p++)
+                if (ctx->nvfp4_w[b][p])
+                    h3_cuda_nvfp4_weight_free(ctx->cuda, ctx->nvfp4_w[b][p]);
+    }
+    if (ctx->d_nvfp4_scratch) cudaFree(ctx->d_nvfp4_scratch);
+    if (ctx->nvfp4_ready) h3_st_free_header(&ctx->nvfp4_hdr);
     free(ctx);
+    dit_rope_memo_free_all();
 }
 
 static const h3_lora_pair *dit_lora_pair(const h3_lora_block *b, int which) {
@@ -474,6 +606,23 @@ static void dit_lora_gpu_clear(h3_dit_w4a8 *ctx) {
     }
     ctx->d_lora_t_cap = 0;
     ctx->lora_max_r = 0;
+    ctx->lora_f16 = 0;
+    if (ctx->lora_ev0 && ctx->lora_ev1) {
+        int i;
+        for (i = 0; i < ctx->lora_ev_cap; i++) {
+            if (ctx->lora_ev0[i]) cudaEventDestroy(ctx->lora_ev0[i]);
+            if (ctx->lora_ev1[i]) cudaEventDestroy(ctx->lora_ev1[i]);
+        }
+    }
+    free(ctx->lora_ev0);
+    free(ctx->lora_ev1);
+    ctx->lora_ev0 = ctx->lora_ev1 = NULL;
+    ctx->lora_ev_n = ctx->lora_ev_cap = 0;
+    if (ctx->lora_x_ev)
+        cudaEventDestroy(ctx->lora_x_ev);
+    if (ctx->lora_done_ev)
+        cudaEventDestroy(ctx->lora_done_ev);
+    ctx->lora_x_ev = ctx->lora_done_ev = NULL;
     ctx->lora = NULL;
 }
 
@@ -527,6 +676,42 @@ int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
         }
     }
     ctx->lora_max_r = max_r;
+    if (h3_dit_w4a8_lora_f16()) {
+        for (b = 0; b < H3_LORA_N_BLOCKS; b++) {
+            for (p = 0; p < 4; p++) {
+                size_t a_n = (size_t)ctx->lora_r[b][p] * (size_t)ctx->lora_k[b][p];
+                size_t b_n = (size_t)ctx->lora_n[b][p] * (size_t)ctx->lora_r[b][p];
+                void *d_h = NULL;
+                char detail[256];
+                if (cudaMalloc(&d_h, a_n * 2u) != cudaSuccess ||
+                    !h3_cuda_f32_to_f16_dev(ctx->cuda, ctx->d_lora_A[b][p], d_h,
+                                            a_n, detail, sizeof(detail)) ||
+                    cudaDeviceSynchronize() != cudaSuccess) {
+                    if (d_h) cudaFree(d_h);
+                    dit_lora_gpu_clear(ctx);
+                    fail(error, error_size, "dit set_lora: A f16");
+                    return 0;
+                }
+                cudaFree(ctx->d_lora_A[b][p]);
+                ctx->d_lora_A[b][p] = (float *)d_h;
+                d_h = NULL;
+                if (cudaMalloc(&d_h, b_n * 2u) != cudaSuccess ||
+                    !h3_cuda_f32_to_f16_dev(ctx->cuda, ctx->d_lora_B[b][p], d_h,
+                                            b_n, detail, sizeof(detail)) ||
+                    cudaDeviceSynchronize() != cudaSuccess) {
+                    if (d_h) cudaFree(d_h);
+                    dit_lora_gpu_clear(ctx);
+                    fail(error, error_size, "dit set_lora: B f16");
+                    return 0;
+                }
+                cudaFree(ctx->d_lora_B[b][p]);
+                ctx->d_lora_B[b][p] = (float *)d_h;
+            }
+        }
+        ctx->lora_f16 = 1;
+        fprintf(stderr, "dit_lora_gemm: f16w max_r=%d\n", max_r);
+        fflush(stderr);
+    }
     pre = 16384u * (size_t)max_r;
     if (cudaMalloc((void **)&ctx->d_lora_t, pre * sizeof(float)) != cudaSuccess) {
         dit_lora_gpu_clear(ctx);
@@ -534,6 +719,27 @@ int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
         return 0;
     }
     ctx->d_lora_t_cap = pre;
+    ctx->lora_ev0 = (cudaEvent_t *)calloc((size_t)H3_LORA_EV_MAX, sizeof(cudaEvent_t));
+    ctx->lora_ev1 = (cudaEvent_t *)calloc((size_t)H3_LORA_EV_MAX, sizeof(cudaEvent_t));
+    ctx->lora_ev_n = 0;
+    ctx->lora_ev_cap = 0;
+    if (ctx->lora_ev0 && ctx->lora_ev1) {
+        int i;
+        for (i = 0; i < H3_LORA_EV_MAX; i++) {
+            if (cudaEventCreate(&ctx->lora_ev0[i]) != cudaSuccess ||
+                cudaEventCreate(&ctx->lora_ev1[i]) != cudaSuccess)
+                break;
+            ctx->lora_ev_cap = i + 1;
+        }
+    }
+    if (cudaEventCreateWithFlags(&ctx->lora_x_ev, cudaEventDisableTiming) !=
+            cudaSuccess ||
+        cudaEventCreateWithFlags(&ctx->lora_done_ev, cudaEventDisableTiming) !=
+            cudaSuccess) {
+        dit_lora_gpu_clear(ctx);
+        fail(error, error_size, "dit set_lora: overlap events");
+        return 0;
+    }
     return 1;
 }
 
@@ -580,11 +786,12 @@ int h3_dit_w4a8_set_ulysses(h3_dit_w4a8 *ctx, h3_dit_w4a8 *const *rank_ctx,
 
 static int dit_lora_residual_dev(h3_dit_w4a8 *ctx, unsigned block, int which,
                                  const float *d_x, float *d_y, size_t seq,
-                                 char *error, size_t error_size) {
+                                 float beta, char *error, size_t error_size) {
     int r, n, k;
     size_t need;
     char detail[256];
     float scale;
+    int slot = -1;
     if (!ctx || !ctx->lora)
         return 1;
     if (block >= H3_DIT_W4A8_N_BLOCKS || which < 0 || which > 3) {
@@ -619,20 +826,174 @@ static int dit_lora_residual_dev(h3_dit_w4a8 *ctx, unsigned block, int which,
         ctx->d_lora_t_cap = need;
     }
     scale = ctx->lora->scale;
-    if (!h3_cuda_gemm_f32_dd(ctx->cuda, d_x, ctx->d_lora_A[block][which], seq,
-                             (size_t)r, (size_t)k, ctx->d_lora_t, NULL, detail,
-                             sizeof(detail))) {
-        snprintf(error, error_size, "lora XA^T: %s", detail);
-        return 0;
+    if (ctx->lora_ev0 && ctx->lora_ev1 && ctx->lora_ev_n < ctx->lora_ev_cap) {
+        cudaStream_t st = ctx->cuda
+                               ? (cudaStream_t)h3_cuda_cublas_stream(ctx->cuda)
+                               : (cudaStream_t)0;
+        slot = ctx->lora_ev_n++;
+        cudaEventRecord(ctx->lora_ev0[slot], st);
     }
-    if (!h3_cuda_gemm_f32_dd_ex(ctx->cuda, ctx->d_lora_t,
-                                ctx->d_lora_B[block][which], seq, (size_t)n,
-                                (size_t)r, d_y, scale, 1.0f, NULL, detail,
-                                sizeof(detail))) {
-        snprintf(error, error_size, "lora TB^T: %s", detail);
-        return 0;
+    if (ctx->lora_f16) {
+        if (!h3_cuda_gemm_f32in_f16w_f32out_dd_ex(
+                ctx->cuda, d_x, ctx->d_lora_A[block][which], seq, (size_t)r,
+                (size_t)k, ctx->d_lora_t, 1.0f, 0.0f, detail, sizeof(detail))) {
+            snprintf(error, error_size, "lora XA^T f16: %s", detail);
+            return 0;
+        }
+        if (!h3_cuda_gemm_f32in_f16w_f32out_dd_ex(
+                ctx->cuda, ctx->d_lora_t, ctx->d_lora_B[block][which], seq,
+                (size_t)n, (size_t)r, d_y, scale, beta, detail,
+                sizeof(detail))) {
+            snprintf(error, error_size, "lora TB^T f16: %s", detail);
+            return 0;
+        }
+    } else if (h3_dit_w4a8_lora_tf32()) {
+        static int tf32_logged;
+        if (!tf32_logged) {
+            tf32_logged = 1;
+            fprintf(stderr, "dit_lora_gemm: tf32 r=%d\n", r);
+            fflush(stderr);
+        }
+        if (!h3_cuda_gemm_f32_dd_tf32_ex(ctx->cuda, d_x,
+                                         ctx->d_lora_A[block][which], seq,
+                                         (size_t)r, (size_t)k, ctx->d_lora_t,
+                                         1.0f, 0.0f, detail, sizeof(detail))) {
+            snprintf(error, error_size, "lora XA^T tf32: %s", detail);
+            return 0;
+        }
+        if (!h3_cuda_gemm_f32_dd_tf32_ex(
+                ctx->cuda, ctx->d_lora_t, ctx->d_lora_B[block][which], seq,
+                (size_t)n, (size_t)r, d_y, scale, beta, detail,
+                sizeof(detail))) {
+            snprintf(error, error_size, "lora TB^T tf32: %s", detail);
+            return 0;
+        }
+    } else {
+        if (!h3_cuda_gemm_f32_dd(ctx->cuda, d_x, ctx->d_lora_A[block][which],
+                                 seq, (size_t)r, (size_t)k, ctx->d_lora_t, NULL,
+                                 detail, sizeof(detail))) {
+            snprintf(error, error_size, "lora XA^T: %s", detail);
+            return 0;
+        }
+        if (!h3_cuda_gemm_f32_dd_ex(ctx->cuda, ctx->d_lora_t,
+                                    ctx->d_lora_B[block][which], seq,
+                                    (size_t)n, (size_t)r, d_y, scale, beta, NULL,
+                                    detail, sizeof(detail))) {
+            snprintf(error, error_size, "lora TB^T: %s", detail);
+            return 0;
+        }
+    }
+    if (slot >= 0) {
+        cudaStream_t st = ctx->cuda
+                               ? (cudaStream_t)h3_cuda_cublas_stream(ctx->cuda)
+                               : (cudaStream_t)0;
+        cudaEventRecord(ctx->lora_ev1[slot], st);
     }
     return 1;
+}
+
+/* 1 = LoRA running on side stream; 0 = serial; -1 = error. */
+static int dit_lora_overlap_begin(h3_dit_w4a8 *ctx, char *error,
+                                  size_t error_size) {
+    void *side;
+    static int logged;
+    if (!ctx || !ctx->cuda || !h3_dit_lora_overlap_wanted())
+        return 0;
+    if (!ctx->lora_x_ev || !ctx->lora_done_ev)
+        return 0;
+    if (h3_cuda_graph_capture(ctx->cuda) || ctx->uly_u > 1)
+        return 0;
+    side = h3_cuda_stream(ctx->cuda, 1);
+    if (!side) {
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "dit_lora_overlap: off reason=no_stream\n");
+            fflush(stderr);
+        }
+        return 0;
+    }
+    if (!h3_cuda_event_record(h3_cuda_op_stream(ctx->cuda), ctx->lora_x_ev,
+                              error, error_size))
+        return -1;
+    if (!h3_cuda_stream_wait_event(side, ctx->lora_x_ev, error, error_size))
+        return -1;
+    if (!h3_cuda_cublas_use_side(ctx->cuda, 1, error, error_size))
+        return 0;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "dit_lora_overlap: on side=1 cublas_side=1\n");
+        fflush(stderr);
+    }
+    return 1;
+}
+
+static int dit_lora_overlap_finish(h3_dit_w4a8 *ctx, int ov, char *error,
+                                   size_t error_size) {
+    void *side;
+    if (ov <= 0)
+        return ov < 0 ? 0 : 1;
+    side = h3_cuda_stream(ctx->cuda, 1);
+    if (!h3_cuda_event_record(side, ctx->lora_done_ev, error, error_size)) {
+        h3_cuda_cublas_use_side(ctx->cuda, 0, NULL, 0);
+        return 0;
+    }
+    if (!h3_cuda_cublas_use_side(ctx->cuda, 0, error, error_size))
+        return 0;
+    return 1;
+}
+
+static int dit_lora_kick(h3_dit_w4a8 *ctx, unsigned block, int which,
+                         const float *d_x, float *d_y, size_t seq, float beta,
+                         int overlap, void **lora_ready, char *error,
+                         size_t error_size) {
+    int ov = 0;
+    if (lora_ready)
+        *lora_ready = NULL;
+    if (overlap)
+        ov = dit_lora_overlap_begin(ctx, error, error_size);
+    if (ov < 0)
+        return 0;
+    if (!dit_lora_residual_dev(ctx, block, which, d_x, d_y, seq, beta, error,
+                               error_size)) {
+        dit_lora_overlap_finish(ctx, ov, error, error_size);
+        return 0;
+    }
+    if (!dit_lora_overlap_finish(ctx, ov, error, error_size))
+        return 0;
+    if (ov == 1 && lora_ready)
+        *lora_ready = (void *)ctx->lora_done_ev;
+    return 1;
+}
+
+static double dit_lora_harvest_ms(h3_dit_w4a8 *ctx) {
+    int i;
+    double sum = 0.0;
+    if (!ctx || ctx->lora_ev_n <= 0 || !ctx->lora_ev0 || !ctx->lora_ev1)
+        return 0.0;
+    if (cudaEventSynchronize(ctx->lora_ev1[ctx->lora_ev_n - 1]) != cudaSuccess) {
+        ctx->lora_ev_n = 0;
+        return 0.0;
+    }
+    for (i = 0; i < ctx->lora_ev_n; i++) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, ctx->lora_ev0[i], ctx->lora_ev1[i]) ==
+            cudaSuccess)
+            sum += (double)ms;
+    }
+    ctx->lora_ev_n = 0;
+    return sum;
+}
+
+static void dit_lora_log_ms(h3_dit_w4a8 *ctx, h3_dit_w4a8_layers_stats *stats) {
+    double ms;
+    if (!ctx || !ctx->lora)
+        return;
+    ms = dit_lora_harvest_ms(ctx);
+    if (stats)
+        stats->lora_ms = ms;
+    fprintf(stderr, "dit_lora: scale=%.4g gemm_epi=%d ms=%.1f\n",
+            ctx->lora->scale, g_dit_gemm_epi, ms);
+    fflush(stderr);
 }
 
 void h3_dit_w4a8_set_token_reduction(h3_dit_w4a8 *ctx, int enabled) {
@@ -698,6 +1059,134 @@ void h3_dit_w4a8_set_denoise_step(h3_dit_w4a8 *ctx, int step) {
     h3_cuda_sol_cute_set_step(step);
 }
 
+void h3_dit_w4a8_clean_kv_free(h3_dit_w4a8 *ctx) {
+    if (!ctx) return;
+    h3_cuda_sdpa_clear_kvext();
+    if (ctx->d_ckv_k) cudaFree(ctx->d_ckv_k);
+    if (ctx->d_ckv_v) cudaFree(ctx->d_ckv_v);
+    if (ctx->d_ckv_idx) cudaFree(ctx->d_ckv_idx);
+    ctx->d_ckv_k = NULL;
+    ctx->d_ckv_v = NULL;
+    ctx->d_ckv_idx = NULL;
+    ctx->ckv_on = 0;
+    ctx->ckv_mode = 0;
+    ctx->ckv_max = 0;
+    ctx->ckv_n = 0;
+    ctx->ckv_save_n = 0;
+    ctx->ckv_idx_cap = 0;
+}
+
+int h3_dit_w4a8_clean_kv_enable(h3_dit_w4a8 *ctx, size_t max_tokens,
+                                char *error, size_t error_size) {
+    size_t layer_bytes, idx_bytes;
+    cudaError_t st;
+    if (!ctx || max_tokens == 0) {
+        snprintf(error, error_size, "clean-kv enable: bad args");
+        return 0;
+    }
+    h3_dit_w4a8_clean_kv_free(ctx);
+    destroy_block_graph(ctx);
+    layer_bytes = max_tokens * (size_t)H3_DIT_W4A8_HEADS *
+                  (size_t)H3_DIT_W4A8_HEAD_DIM * sizeof(uint16_t);
+    layer_bytes *= (size_t)H3_DIT_W4A8_N_BLOCKS;
+    idx_bytes = max_tokens * sizeof(uint32_t);
+    st = cudaMalloc(&ctx->d_ckv_k, layer_bytes);
+    if (st != cudaSuccess) {
+        snprintf(error, error_size, "clean-kv K cudaMalloc %zu: %s",
+                 layer_bytes, cudaGetErrorString(st));
+        h3_dit_w4a8_clean_kv_free(ctx);
+        return 0;
+    }
+    st = cudaMalloc(&ctx->d_ckv_v, layer_bytes);
+    if (st != cudaSuccess) {
+        snprintf(error, error_size, "clean-kv V cudaMalloc %zu: %s",
+                 layer_bytes, cudaGetErrorString(st));
+        h3_dit_w4a8_clean_kv_free(ctx);
+        return 0;
+    }
+    st = cudaMalloc((void **)&ctx->d_ckv_idx, idx_bytes);
+    if (st != cudaSuccess) {
+        snprintf(error, error_size, "clean-kv idx cudaMalloc: %s",
+                 cudaGetErrorString(st));
+        h3_dit_w4a8_clean_kv_free(ctx);
+        return 0;
+    }
+    cudaMemset(ctx->d_ckv_k, 0, layer_bytes);
+    cudaMemset(ctx->d_ckv_v, 0, layer_bytes);
+    ctx->ckv_idx_cap = max_tokens;
+    ctx->ckv_max = max_tokens;
+    ctx->ckv_n = 0;
+    ctx->ckv_on = 1;
+    ctx->ckv_mode = 0;
+    fprintf(stderr,
+            "[h3] layer_kv enable max_tokens=%zu bytes_kv=%zu (Q unchanged; "
+            "K/V hist only)\n",
+            max_tokens, layer_bytes * 2u);
+    return 1;
+}
+
+int h3_dit_w4a8_clean_kv_enabled(const h3_dit_w4a8 *ctx) {
+    return ctx && ctx->ckv_on && ctx->d_ckv_k && ctx->d_ckv_v;
+}
+
+size_t h3_dit_w4a8_clean_kv_max_tokens(const h3_dit_w4a8 *ctx) {
+    return ctx ? ctx->ckv_max : 0;
+}
+
+size_t h3_dit_w4a8_clean_kv_hist_tokens(const h3_dit_w4a8 *ctx) {
+    return ctx ? ctx->ckv_n : 0;
+}
+
+int h3_dit_w4a8_clean_kv_begin(h3_dit_w4a8 *ctx, int mode,
+                               const uint32_t *save_idx, size_t save_n,
+                               size_t save_dst, char *error, size_t error_size) {
+    if (!h3_dit_w4a8_clean_kv_enabled(ctx)) {
+        snprintf(error, error_size, "clean-kv begin: not enabled");
+        return 0;
+    }
+    if (mode != 1 && mode != 2) {
+        snprintf(error, error_size, "clean-kv begin: mode %d", mode);
+        return 0;
+    }
+    ctx->ckv_mode = mode;
+    ctx->ckv_save_n = 0;
+    ctx->ckv_save_dst = 0;
+    if (mode == 2) {
+        if (!save_idx || save_n == 0) {
+            snprintf(error, error_size, "clean-kv commit needs save idx");
+            return 0;
+        }
+        if (save_n + save_dst > ctx->ckv_max) {
+            snprintf(error, error_size,
+                     "clean-kv save %zu+%zu exceeds max %zu", save_dst, save_n,
+                     ctx->ckv_max);
+            return 0;
+        }
+        if (save_n > ctx->ckv_idx_cap) {
+            snprintf(error, error_size, "clean-kv idx cap %zu < %zu",
+                     ctx->ckv_idx_cap, save_n);
+            return 0;
+        }
+        if (cudaMemcpy(ctx->d_ckv_idx, save_idx, save_n * sizeof(uint32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            snprintf(error, error_size, "clean-kv idx H2D failed");
+            return 0;
+        }
+        ctx->ckv_save_n = save_n;
+        ctx->ckv_save_dst = save_dst;
+    }
+    return 1;
+}
+
+void h3_dit_w4a8_clean_kv_finish(h3_dit_w4a8 *ctx, size_t hist_n) {
+    if (!ctx) return;
+    h3_cuda_sdpa_clear_kvext();
+    if (ctx->ckv_mode == 2 && hist_n <= ctx->ckv_max)
+        ctx->ckv_n = hist_n;
+    ctx->ckv_mode = 0;
+    ctx->ckv_save_n = 0;
+}
+
 void h3_dit_w4a8_set_text_mod_tags(h3_dit_w4a8 *ctx, const uint8_t *tags,
                                    size_t n) {
     if (!ctx) return;
@@ -717,7 +1206,8 @@ static void dit_aux_log_disk_loads(h3_dit_w4a8 *ctx) {
             "(expect ≈unique blocks once, not blocks×steps)\n",
             ctx->aux_disk_loads, mode);
     fflush(stderr);
-    if (ctx->int8_store) h3_w4a8_cache_log_int8_host(ctx->cache);
+    if (ctx->int8_store || ctx->nvfp4_store)
+        h3_w4a8_cache_log_int8_host(ctx->cache);
 }
 
 /* Lazily load + cache block aux (avoids per-layer safetensors+BF16 convert). */
@@ -733,6 +1223,8 @@ static const h3_dit_w4a8_block_aux *dit_aux_cached(h3_dit_w4a8 *ctx,
         const h3_st_header *hdr = NULL;
         if (ctx->int8_store)
             hdr = h3_dit_int8_store_header(ctx->int8_store);
+        else if (ctx->nvfp4_store)
+            hdr = &ctx->nvfp4_store->header;
         else if (ctx->store)
             hdr = h3_w4a8_store_header(ctx->store);
         if (!hdr) {
@@ -764,6 +1256,8 @@ static int ensure_block_ws(h3_dit_w4a8 *ctx, size_t bytes, char *error,
     }
     if (bytes == 0) return 1;
     if (ctx->d_block_ws && ctx->d_block_ws_bytes >= bytes) return 1;
+    /* The step graph hard-codes d_block_ws-carved pointers. */
+    destroy_step_graph(ctx);
     if (ctx->cuda && !h3_cuda_bind_device(ctx->cuda, error, error_size))
         return 0;
     /* Allocate first, free old only on success. Free-then-malloc after
@@ -772,6 +1266,19 @@ static int ensure_block_ws(h3_dit_w4a8 *ctx, size_t bytes, char *error,
     alloc = bytes;
     if (bytes <= (size_t)-1 - slack) alloc = bytes + slack;
     if (cudaMalloc(&fresh, alloc) != cudaSuccess) {
+        /* Grow-in-place: alloc-first can fail while an older smaller WS still
+         * occupies the only large contiguous hole (taomate overlap 12304→14346).
+         * Free old then retry once. Do not make_room here (frozen INT8 window). */
+        if (ctx->d_block_ws) {
+            cudaFree(ctx->d_block_ws);
+            ctx->d_block_ws = NULL;
+            ctx->d_block_ws_bytes = 0;
+            if (cudaMalloc(&fresh, alloc) == cudaSuccess) {
+                ctx->d_block_ws = fresh;
+                ctx->d_block_ws_bytes = alloc;
+                return 1;
+            }
+        }
         fail(error, error_size, "cudaMalloc block workspace failed");
         return 0;
     }
@@ -791,6 +1298,7 @@ static int ensure_fwd_act(h3_dit_w4a8 *ctx, size_t seq, char *error,
     need = seq * (size_t)H3_DIT_W4A8_HIDDEN;
     if (ctx->d_fwd_act_a && ctx->d_fwd_act_b && ctx->d_fwd_act_cap >= need)
         return 1;
+    destroy_step_graph(ctx);
     if (ctx->d_fwd_act_a) {
         cudaFree(ctx->d_fwd_act_a);
         ctx->d_fwd_act_a = NULL;
@@ -870,6 +1378,70 @@ h3_w4a8_cache *h3_dit_w4a8_cache(h3_dit_w4a8 *ctx) {
     return ctx ? ctx->cache : NULL;
 }
 
+void h3_dit_w4a8_release_block_workspace(h3_dit_w4a8 *ctx) {
+    if (!ctx || !ctx->d_block_ws)
+        return;
+    destroy_step_graph(ctx);
+    cudaFree(ctx->d_block_ws);
+    ctx->d_block_ws = NULL;
+    ctx->d_block_ws_bytes = 0;
+}
+
+/* Keep in sync with h3_dit_w4a8_layers_forward_f32 all-aux `need`. */
+static size_t layers_dev_chain_ws_bytes(const h3_dit_w4a8 *ctx, size_t seq,
+                                        unsigned n_blocks, int use_ext_act) {
+    const size_t hidden = H3_DIT_W4A8_HIDDEN;
+    const size_t inner = H3_DIT_W4A8_INNER;
+    const size_t ffn = H3_DIT_W4A8_FFN;
+    const size_t slots = H3_DIT_W4A8_SLOTS;
+    const size_t mod_rows = dit_adaln_mod_rows(ctx);
+    const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
+    const size_t mod_elems = mod_rows * slots * hidden;
+    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
+    const size_t wide = ffn * 2;
+    const size_t aux_stride = mod_elems + hidden * 2 + head_dim * 2;
+    const size_t act_bytes =
+        use_ext_act ? 0 : (seq * hidden * sizeof(float) * 2);
+    size_t need = 0;
+    if (n_blocks < 1)
+        n_blocks = 1;
+    if (n_blocks > (unsigned)H3_DIT_W4A8_N_BLOCKS)
+        n_blocks = (unsigned)H3_DIT_W4A8_N_BLOCKS;
+    need += act_bytes;
+    need += H3_WS_MAP_BYTES(seq);
+    need += seq * rope_half * sizeof(float) * 2;
+    need += (size_t)n_blocks * aux_stride * sizeof(float);
+    need += seq * hidden * sizeof(float) * 2;
+    need += seq * inner * 3 * sizeof(float);
+    need += seq * wide * sizeof(float);
+    return need;
+}
+
+int h3_dit_w4a8_pregrow_layers_ws(h3_dit_w4a8 *ctx, size_t seq,
+                                  unsigned n_blocks, char *error,
+                                  size_t error_size) {
+    size_t need;
+    if (!ctx || seq == 0) {
+        fail(error, error_size, "pregrow_layers_ws bad args");
+        return 0;
+    }
+    if (!ensure_fwd_act(ctx, seq, error, error_size))
+        return 0;
+    need = layers_dev_chain_ws_bytes(ctx, seq, n_blocks, 1);
+    if (!ensure_block_ws(ctx, need, error, error_size))
+        return 0;
+    printf("dit_pregrow_layers_ws: seq=%zu n_blocks=%u ws_giB=%.2f "
+           "fwd_act_giB=%.2f\n",
+           seq, n_blocks < 1 ? 1u : (n_blocks > (unsigned)H3_DIT_W4A8_N_BLOCKS
+                                         ? (unsigned)H3_DIT_W4A8_N_BLOCKS
+                                         : n_blocks),
+           (double)ctx->d_block_ws_bytes / (1024.0 * 1024.0 * 1024.0),
+           (double)(seq * (size_t)H3_DIT_W4A8_HIDDEN * sizeof(float) * 2) /
+               (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+    return 1;
+}
+
 h3_cuda *h3_dit_w4a8_cuda(h3_dit_w4a8 *ctx) {
     return ctx ? ctx->cuda : NULL;
 }
@@ -882,8 +1454,53 @@ int h3_dit_w4a8_convrot_groupsize(const h3_dit_w4a8 *ctx) {
     return ctx ? ctx->convrot_gs : 0;
 }
 
+int h3_dit_w4a8_act_f16(void) {
+    const char *e = getenv("H3_DIT_ACT_F16");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
+}
+
+int h3_dit_w4a8_fused_epilogue(void) {
+    return h3_dit_fused_epilogue_wanted();
+}
+
+int h3_dit_w4a8_lora_f16(void) {
+    const char *e = getenv("H3_DIT_LORA_F16");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+int h3_dit_w4a8_lora_tf32(void) {
+    const char *e = getenv("H3_DIT_LORA_TF32");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+int h3_dit_w4a8_lora_overlap(void) {
+    return h3_dit_lora_overlap_wanted();
+}
+
 int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx) {
     return ctx ? ctx->group_size : 0;
+}
+
+static void copy_layer_stats(h3_dit_w4a8_forward_stats *st,
+                             const h3_dit_w4a8_layers_stats *lst) {
+    if (!st || !lst) return;
+    st->layers_ms = lst->total_ms;
+    st->layers_prefetch_ms = lst->prefetch_ms;
+    st->layers_h2d_ms = lst->h2d_ms;
+    st->layers_compute_ms = lst->compute_ms;
+    st->layers_d2h_ms = lst->d2h_ms;
+    st->layers_prefetch_wait_ms = lst->prefetch_wait_ms;
+}
+
+/* U=1: next-block only. Full-window prefetch drains H2D before compute. */
+static int prefetch_next_u1(h3_dit_w4a8 *ctx, unsigned next_block,
+                            unsigned last_block, char *error,
+                            size_t error_size) {
+    double ignore = 0.0;
+    if (!ctx || next_block >= last_block) return 1;
+    return h3_dit_w4a8_prefetch(ctx, next_block, 1, &ignore, error,
+                                error_size);
 }
 
 int h3_dit_w4a8_prefetch(h3_dit_w4a8 *ctx, unsigned first_block,
@@ -1358,12 +1975,135 @@ int h3_dit_w4a8_time_feat_from_table(const h3_dit_w4a8_block_aux *aux,
     return 1;
 }
 
+/* Phase-A profile counters (RoPE table build). Zero-cost unless env var set. */
+static double g_dit_rope_profile_ms = 0.0;
+static unsigned long g_dit_rope_profile_calls = 0;
+
+void h3_dit_w4a8_rope_profile_get(double *ms, unsigned long *calls) {
+    if (ms) *ms = g_dit_rope_profile_ms;
+    if (calls) *calls = g_dit_rope_profile_calls;
+}
+
+void h3_dit_w4a8_rope_profile_reset(void) {
+    g_dit_rope_profile_ms = 0.0;
+    g_dit_rope_profile_calls = 0;
+}
+
+/* Per-shape memo cache for DiT RoPE tables.
+ * Key = (seq, spatial_scale, content-hash of pos_t/pos_h/pos_w).
+ * Value = precomputed cos/sin table [seq, ROPE_HALF].
+ * Grow-only, process-lifetime. Thread-safe under GIL-style single-threaded
+ * generation (h3_cuda_generate is single-threaded for DiT forward). */
+typedef struct {
+    size_t seq;
+    float spatial_scale;
+    uint64_t pos_hash;
+    float *cos_table;
+    float *sin_table;
+} dit_rope_memo_entry;
+
+static dit_rope_memo_entry *g_dit_rope_memo = NULL;
+static size_t g_dit_rope_memo_n = 0;
+static size_t g_dit_rope_memo_cap = 0;
+
+static uint64_t dit_rope_hash_pos(const float *pos, size_t n) {
+    /* FNV-1a over raw bytes; position arrays are deterministic floats. */
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *p = (const unsigned char *)pos;
+    size_t bytes = n * sizeof(float);
+    size_t i;
+    for (i = 0; i < bytes; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t dit_rope_hash_all(const float *pos_t, const float *pos_h,
+                                  const float *pos_w, size_t seq,
+                                  float spatial_scale) {
+    uint64_t h = dit_rope_hash_pos(pos_t, seq);
+    h = dit_rope_hash_pos(pos_h, seq) ^ (h << 1);
+    h = dit_rope_hash_pos(pos_w, seq) ^ (h << 2);
+    h ^= (uint64_t)(spatial_scale * 1000.0f);
+    return h;
+}
+
+static int dit_rope_memo_grow(size_t need, char *error, size_t error_size) {
+    if (need <= g_dit_rope_memo_cap) return 1;
+    size_t new_cap = g_dit_rope_memo_cap ? g_dit_rope_memo_cap * 2 : 8;
+    if (new_cap < need) new_cap = need;
+    dit_rope_memo_entry *n = (dit_rope_memo_entry *)realloc(
+        g_dit_rope_memo, new_cap * sizeof(dit_rope_memo_entry));
+    if (!n) {
+        fail(error, error_size, "OOM rope memo grow");
+        return 0;
+    }
+    g_dit_rope_memo = n;
+    g_dit_rope_memo_cap = new_cap;
+    return 1;
+}
+
+static dit_rope_memo_entry *dit_rope_memo_find(size_t seq, float spatial_scale,
+                                                uint64_t pos_hash) {
+    size_t i;
+    for (i = 0; i < g_dit_rope_memo_n; i++) {
+        dit_rope_memo_entry *e = &g_dit_rope_memo[i];
+        if (e->seq == seq && e->spatial_scale == spatial_scale &&
+            e->pos_hash == pos_hash)
+            return e;
+    }
+    return NULL;
+}
+
+static dit_rope_memo_entry *dit_rope_memo_alloc(size_t seq,
+                                                 float spatial_scale,
+                                                 uint64_t pos_hash,
+                                                 char *error,
+                                                 size_t error_size) {
+    if (!dit_rope_memo_grow(g_dit_rope_memo_n + 1, error, error_size))
+        return NULL;
+    dit_rope_memo_entry *e = &g_dit_rope_memo[g_dit_rope_memo_n];
+    e->seq = seq;
+    e->spatial_scale = spatial_scale;
+    e->pos_hash = pos_hash;
+    e->cos_table = (float *)malloc(seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+    e->sin_table = (float *)malloc(seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+    if (!e->cos_table || !e->sin_table) {
+        free(e->cos_table);
+        free(e->sin_table);
+        fail(error, error_size, "OOM rope memo table");
+        return NULL;
+    }
+    g_dit_rope_memo_n++;
+    return e;
+}
+
+static void dit_rope_memo_free_all(void) {
+    size_t i;
+    for (i = 0; i < g_dit_rope_memo_n; i++) {
+        free(g_dit_rope_memo[i].cos_table);
+        free(g_dit_rope_memo[i].sin_table);
+    }
+    free(g_dit_rope_memo);
+    g_dit_rope_memo = NULL;
+    g_dit_rope_memo_n = 0;
+    g_dit_rope_memo_cap = 0;
+}
+
+/* Cleanup hook: dit_rope_memo_free_all() is called from h3_dit_w4a8_free. */
+
 int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
                                 const float *pos_t, const float *pos_h,
                                 const float *pos_w, float spatial_scale,
                                 float *cos_out, float *sin_out, char *error,
                                 size_t error_size) {
     size_t row, axis, f;
+    clock_t t0 = 0, t1 = 0;
+    const int profile = env_flag_is_one("H3_ROPE_PROFILE");
+    uint64_t pos_hash = 0;
+    dit_rope_memo_entry *memo = NULL;
+    if (profile) t0 = clock();
     if (!inv_freq || !pos_t || !pos_h || !pos_w || !cos_out || !sin_out ||
         seq == 0) {
         fail(error, error_size, "invalid rope_tables args");
@@ -1373,19 +2113,35 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
         fail(error, error_size, "invalid spatial_scale");
         return 0;
     }
-    for (row = 0; row < seq; row++) {
-        float axes[3] = {pos_t[row], pos_h[row] * spatial_scale,
-                         pos_w[row] * spatial_scale};
-        for (axis = 0; axis < 3; axis++) {
-            for (f = 0; f < H3_DIT_W4A8_ROPE_FREQS; f++) {
-                size_t index =
-                    row * H3_DIT_W4A8_ROPE_HALF + axis * H3_DIT_W4A8_ROPE_FREQS +
-                    f;
-                float angle = axes[axis] * inv_freq[f];
-                cos_out[index] = cosf(angle);
-                sin_out[index] = sinf(angle);
+    pos_hash = dit_rope_hash_all(pos_t, pos_h, pos_w, seq, spatial_scale);
+    memo = dit_rope_memo_find(seq, spatial_scale, pos_hash);
+    if (!memo) {
+        memo = dit_rope_memo_alloc(seq, spatial_scale, pos_hash, error,
+                                   error_size);
+        if (!memo) return 0;
+        for (row = 0; row < seq; row++) {
+            float axes[3] = {pos_t[row], pos_h[row] * spatial_scale,
+                             pos_w[row] * spatial_scale};
+            for (axis = 0; axis < 3; axis++) {
+                for (f = 0; f < H3_DIT_W4A8_ROPE_FREQS; f++) {
+                    size_t index =
+                        row * H3_DIT_W4A8_ROPE_HALF +
+                        axis * H3_DIT_W4A8_ROPE_FREQS + f;
+                    float angle = axes[axis] * inv_freq[f];
+                    memo->cos_table[index] = cosf(angle);
+                    memo->sin_table[index] = sinf(angle);
+                }
             }
         }
+    }
+    memcpy(cos_out, memo->cos_table,
+           seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+    memcpy(sin_out, memo->sin_table,
+           seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+    if (profile) {
+        t1 = clock();
+        g_dit_rope_profile_ms += elapsed_ms(t0, t1);
+        g_dit_rope_profile_calls++;
     }
     return 1;
 }
@@ -1824,6 +2580,166 @@ int h3_dit_w4a8_qkv_rope_f32(const float *qkv, const float *q_norm,
     return 1;
 }
 
+/* P1 FP verification: split merged [3n,k] weight into three narrow [n,k]
+ * GEMMs. Output-split means each output column of the wide GEMM is an
+ * independent dot product, so merged vs split3 is bit-identical in exact
+ * arithmetic; in FP32 the dot-product summation order is the same too
+ * (same K order), so MAE should be exactly 0. */
+int h3_dit_w4a8_fp_qkv_split3_f32(const float *x, const float *wqkv,
+                                  size_t m, size_t n, size_t k, float *y,
+                                  char *error, size_t error_size) {
+    size_t r, part, o, c;
+    if (!x || !wqkv || !y || m == 0 || n == 0 || k == 0) {
+        fail(error, error_size, "invalid fp_qkv_split3 args");
+        return 0;
+    }
+    for (r = 0; r < m; r++) {
+        const float *xr = x + r * k;
+        float *yr = y + r * n * 3;
+        for (part = 0; part < 3; part++) {
+            const float *wp = wqkv + part * n * k;
+            float *yp = yr + part * n;
+            for (o = 0; o < n; o++) {
+                const float *wrow = wp + o * k;
+                float acc = 0.0f;
+                for (c = 0; c < k; c++) acc += xr[c] * wrow[c];
+                yp[o] = acc;
+            }
+        }
+    }
+    return 1;
+}
+
+/* P1 FP verification: unfused QK-RMSNorm (materialized intermediate) then
+ * RoPE. Same layout/grouped/split-half conventions as the fused kernel. */
+int h3_dit_w4a8_fp_qknorm_rope_unfused_f32(
+    const float *qkv, const float *q_norm, const float *k_norm,
+    const float *rope_cos, const float *rope_sin, size_t seq, size_t heads,
+    size_t head_dim, size_t rope_half, float epsilon, float *query, float *key,
+    float *value, char *error, size_t error_size) {
+    size_t row, head, d;
+    size_t inner;
+    float *q_tmp = NULL, *k_tmp = NULL;
+    int ok = 0;
+    if (!qkv || !q_norm || !k_norm || !query || !key || !value || seq == 0 ||
+        heads == 0 || head_dim == 0 ||
+        (rope_half > 0 && (!rope_cos || !rope_sin))) {
+        fail(error, error_size, "invalid fp_qknorm_rope_unfused args");
+        return 0;
+    }
+    if (rope_half * 2 > head_dim) {
+        fail(error, error_size, "rope_half too large for head_dim");
+        return 0;
+    }
+    inner = heads * head_dim;
+    q_tmp = (float *)malloc(inner * sizeof(float));
+    k_tmp = (float *)malloc(inner * sizeof(float));
+    if (!q_tmp || !k_tmp) {
+        fail(error, error_size, "out of memory (fp_qknorm_rope_unfused)");
+        goto done;
+    }
+    for (row = 0; row < seq; row++) {
+        const float *qkv_row = qkv + row * inner * 3;
+        const float *c_row =
+            (rope_half > 0) ? (rope_cos + row * rope_half) : NULL;
+        const float *s_row =
+            (rope_half > 0) ? (rope_sin + row * rope_half) : NULL;
+        for (head = 0; head < heads; head++) {
+            const float *q_base;
+            const float *k_base;
+            const float *v_base;
+            if (dit_qkv_grouped_layout()) {
+                q_base = qkv_row + head * head_dim * 3;
+                k_base = q_base + head_dim;
+                v_base = k_base + head_dim;
+            } else {
+                q_base = qkv_row + head * head_dim;
+                k_base = q_base + inner;
+                v_base = q_base + inner * 2;
+            }
+            float *q_out = query + (row * heads + head) * head_dim;
+            float *k_out = key + (row * heads + head) * head_dim;
+            float *v_out = value + (row * heads + head) * head_dim;
+            float q_sum = 0.0f, k_sum = 0.0f;
+            float q_inv, k_inv;
+            /* Pass 1: RMS normalize into materialized q_tmp/k_tmp (the
+             * intermediate the fused kernel keeps in registers). */
+            for (d = 0; d < head_dim; d++) {
+                q_sum += q_base[d] * q_base[d];
+                k_sum += k_base[d] * k_base[d];
+                v_out[d] = v_base[d];
+            }
+            q_inv = 1.0f / sqrtf(q_sum / (float)head_dim + epsilon);
+            k_inv = 1.0f / sqrtf(k_sum / (float)head_dim + epsilon);
+            for (d = 0; d < head_dim; d++) {
+                q_tmp[d] = q_base[d] * q_inv * q_norm[d];
+                k_tmp[d] = k_base[d] * k_inv * k_norm[d];
+            }
+            /* Pass 2: RoPE from the materialized buffer. */
+            if (dit_rope_split_half() && rope_half > 0) {
+                for (d = 0; d < head_dim; d++) {
+                    float q0 = q_tmp[d];
+                    float k0 = k_tmp[d];
+                    if (d < rope_half) {
+                        size_t pair = d + rope_half;
+                        float q1 = q_tmp[pair];
+                        float k1 = k_tmp[pair];
+                        float c = c_row[d];
+                        float s = s_row[d];
+                        q0 = q0 * c - q1 * s;
+                        k0 = k0 * c - k1 * s;
+                    } else if (d < rope_half * 2) {
+                        size_t pair = d - rope_half;
+                        float q1 = q_tmp[pair];
+                        float k1 = k_tmp[pair];
+                        float c = c_row[pair];
+                        float s = s_row[pair];
+                        q0 = q0 * c + q1 * s;
+                        k0 = k0 * c + k1 * s;
+                    }
+                    q_out[d] = q0;
+                    k_out[d] = k0;
+                }
+            } else if (rope_half > 0) {
+                for (d = 0; d < head_dim; d++) {
+                    q_out[d] = q_tmp[d];
+                    k_out[d] = k_tmp[d];
+                }
+                for (d = 0; d < rope_half; d++) {
+                    size_t i0 = d * 2u;
+                    size_t i1 = i0 + 1u;
+                    float c = c_row[d];
+                    float s = s_row[d];
+                    float q0 = q_out[i0], q1 = q_out[i1];
+                    float k0 = k_out[i0], k1 = k_out[i1];
+                    q_out[i0] = q0 * c - q1 * s;
+                    q_out[i1] = q0 * s + q1 * c;
+                    k_out[i0] = k0 * c - k1 * s;
+                    k_out[i1] = k0 * s + k1 * c;
+                }
+            } else {
+                for (d = 0; d < head_dim; d++) {
+                    q_out[d] = q_tmp[d];
+                    k_out[d] = k_tmp[d];
+                }
+            }
+        }
+    }
+    ok = 1;
+done:
+    free(q_tmp);
+    free(k_tmp);
+    return ok;
+}
+
+int h3_dit_w4a8_fp_qkv_merge_enabled(void) {
+    return env_flag_is_one("H3_DIT_QKV_MERGE");
+}
+
+int h3_dit_w4a8_fp_qknorm_rope_fuse_enabled(void) {
+    return env_flag_is_one("H3_DIT_QKNORM_ROPE_FUSE");
+}
+
 int h3_dit_w4a8_sdpa_f32(const float *query, const float *key,
                          const float *value, size_t seq, size_t heads,
                          size_t head_dim, float scale, float *out, char *error,
@@ -1869,8 +2785,265 @@ int h3_dit_w4a8_sdpa_f32(const float *query, const float *key,
     return 1;
 }
 
+/* ---- NVFP4 P1.4/P1.5 dispatch (H3_DIT_NVFP4=1) ----
+ * Weight sidecar: one safetensors holding per-linear
+ *   {base}.weight_fp4    U8 [N, K/2]  (packed E2M1, ConvRot basis)
+ *   {base}.weight_sf     U8 [rb*ncb*512]  (swizzled UE4M3 SF, same layout
+ *                        as h3_cuda_quantize_act_nvfp4_kernel)
+ *   {base}.weight_scale2 F32 [1] (per-tensor second-level scale)
+ * Lookup mirrors the INT8 loader's base-name derivation (blocks.{i}.<suffix>
+ * from ctx->int8_store / nvfp4_store); the file is env-selected:
+ *   H3_DIT_NVFP4_FILE=<path>   (explicit)
+ *   unset → int8 store path with ".safetensors" → ".nvfp4.safetensors"
+ * FP4 GEMM produces BF16 [M,N]; epilogues apply w_scale2 * act_global
+ * (act_global=1.0 today: act quantization is dynamic per-16 SF only), then
+ * run the same SwiGLU / AdaLN-gate fusion structure as the INT8 R31
+ * epilogues. epi_fuse INT8 requant chaining is bypassed on this track. */
+
+static const char *nvfp4_linear_suffix(unsigned kind) {
+    switch (kind) {
+    case 0: return "attn.qkv_proj";
+    case 1: return "attn.out_proj";
+    case 2: return "mlp.fc1";
+    case 3: return "mlp.fc2";
+    default: return NULL;
+    }
+}
+
+static int nvfp4_read_tensor(const h3_st_header *hdr, const char *name,
+                             void *dst, size_t bytes, char *error,
+                             size_t error_size) {
+    const h3_st_tensor *t = h3_st_find(hdr, name);
+    if (!t) {
+        snprintf(error, error_size, "nvfp4 sidecar missing %s", name);
+        return 0;
+    }
+    if ((size_t)(t->data_end - t->data_begin) != bytes) {
+        snprintf(error, error_size, "nvfp4 sidecar %s size mismatch", name);
+        return 0;
+    }
+    return h3_st_read_data(hdr, t, dst, bytes, error, error_size);
+}
+
+static int nvfp4_load_block_weights(h3_dit_w4a8 *ctx, unsigned block,
+                                    char *error, size_t error_size) {
+    unsigned p;
+    size_t n_expect[4], k_expect[4];
+    const char *base_path = NULL;
+    char sidecar[768];
+    char detail[384];
+    static const size_t n_fix[4] = {21504u, 5376u, 28672u, 5376u};
+    static const size_t k_fix[4] = {5376u, 7168u, 5376u, 14336u};
+
+    for (p = 0; p < 4; p++) {
+        n_expect[p] = n_fix[p];
+        k_expect[p] = k_fix[p];
+    }
+    if (ctx->int8_store) {
+        h3_dit_int8_linear lin;
+        base_path = h3_dit_int8_store_header(ctx->int8_store)->path;
+        for (p = 0; p < 4; p++) {
+            if (h3_dit_int8_find_block_linear(ctx->int8_store, block,
+                                              nvfp4_linear_suffix(p), &lin,
+                                              detail, sizeof(detail))) {
+                n_expect[p] = lin.n;
+                k_expect[p] = lin.k;
+            }
+        }
+    } else if (ctx->nvfp4_store) {
+        h3_nvfp4_linear lin;
+        base_path = ctx->nvfp4_store->path;
+        for (p = 0; p < 4; p++) {
+            if (h3_dit_nvfp4_find_block_linear(ctx->nvfp4_store, block,
+                                               nvfp4_linear_suffix(p), &lin,
+                                               detail, sizeof(detail))) {
+                n_expect[p] = lin.n;
+                k_expect[p] = lin.k;
+            }
+        }
+    }
+    if (!ctx->nvfp4_ready) {
+        const char *env_file = getenv("H3_DIT_NVFP4_FILE");
+        const char *dot;
+        if (env_file && env_file[0]) {
+            snprintf(sidecar, sizeof(sidecar), "%s", env_file);
+        } else if (base_path && (dot = strrchr(base_path, '.')) &&
+                   !strcmp(dot, ".safetensors")) {
+            snprintf(sidecar, sizeof(sidecar), "%.*s.nvfp4.safetensors",
+                     (int)(dot - base_path), base_path);
+        } else {
+            fail(error, error_size,
+                 "H3_DIT_NVFP4=1 needs H3_DIT_NVFP4_FILE (no derivable path)");
+            return 0;
+        }
+        if (!h3_st_read_header(sidecar, &ctx->nvfp4_hdr, detail,
+                               sizeof(detail))) {
+            snprintf(error, error_size, "nvfp4 sidecar open %s: %s", sidecar,
+                     detail);
+            return 0;
+        }
+        fprintf(stderr, "dit_nvfp4: sidecar=%s tensors=%zu\n", sidecar,
+                ctx->nvfp4_hdr.tensor_count);
+        fflush(stderr);
+        ctx->nvfp4_ready = 1;
+    }
+    for (p = 0; p < 4; p++) {
+        char wname[320], sname[320], s2name[320];
+        uint8_t *h_w = NULL, *h_sf = NULL;
+        float scale2 = 1.0f;
+        size_t n = n_expect[p], k = k_expect[p];
+        size_t w_bytes = n * (k / 2u);
+        /* SF uses cuBLASLt's padded K-extent (ceil(ncb/32)*32 tile-cols). */
+        size_t sf_bytes = ((n + 127u) / 128u) *
+                          ((((k / 16u) + 3u) / 4u + 31u) & ~(size_t)31u) *
+                          512u;
+        const h3_st_tensor *s2t;
+        if (ctx->nvfp4_w[block][p]) continue;
+        snprintf(wname, sizeof(wname), "blocks.%u.%s.weight_fp4", block,
+                 nvfp4_linear_suffix(p));
+        snprintf(sname, sizeof(sname), "blocks.%u.%s.weight_sf", block,
+                 nvfp4_linear_suffix(p));
+        snprintf(s2name, sizeof(s2name), "blocks.%u.%s.weight_scale2", block,
+                 nvfp4_linear_suffix(p));
+        s2t = h3_st_find(&ctx->nvfp4_hdr, s2name);
+        if (s2t &&
+            !h3_st_read_data(&ctx->nvfp4_hdr, s2t, &scale2, sizeof(float),
+                             detail, sizeof(detail))) {
+            snprintf(error, error_size, "nvfp4 %s: %s", s2name, detail);
+            return 0;
+        }
+        h_w = (uint8_t *)malloc(w_bytes);
+        h_sf = (uint8_t *)malloc(sf_bytes);
+        if (!h_w || !h_sf) {
+            free(h_w);
+            free(h_sf);
+            fail(error, error_size, "OOM nvfp4 host staging");
+            return 0;
+        }
+        if (!nvfp4_read_tensor(&ctx->nvfp4_hdr, wname, h_w, w_bytes, detail,
+                               sizeof(detail)) ||
+            !nvfp4_read_tensor(&ctx->nvfp4_hdr, sname, h_sf, sf_bytes, detail,
+                               sizeof(detail))) {
+            free(h_w);
+            free(h_sf);
+            snprintf(error, error_size, "%s", detail);
+            return 0;
+        }
+        /* Loader takes ownership of h_w / h_sf on success. */
+        if (!h3_cuda_nvfp4_weight_create(ctx->cuda, h_w, h_sf, scale2, n, k,
+                                         &ctx->nvfp4_w[block][p], NULL,
+                                         detail, sizeof(detail))) {
+            free(h_w);
+            free(h_sf);
+            snprintf(error, error_size, "nvfp4 weight create b%u.%s: %s",
+                     block, nvfp4_linear_suffix(p), detail);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int nvfp4_ensure_scratch(h3_dit_w4a8 *ctx, size_t seq, char *error,
+                                size_t error_size) {
+    size_t need, widest_n;
+    if (ctx->d_nvfp4_scratch && seq <= ctx->nvfp4_scratch_cap_seq)
+        return 1;
+    widest_n = 28672u; /* max(21504 qkv, 28672 fc1, 5376 out/fc2) */
+    need = 0;
+    need += h3_cuda_nvfp4_gemm_scratch_bytes(seq, 21504u, 5376u);
+    {
+        size_t b = h3_cuda_nvfp4_gemm_scratch_bytes(seq, widest_n, 14336u);
+        if (b > need) need = b;
+    }
+    if (need > ctx->d_nvfp4_scratch_bytes) {
+        if (ctx->d_nvfp4_scratch) {
+            cudaFree(ctx->d_nvfp4_scratch);
+            ctx->d_nvfp4_scratch = NULL;
+        }
+        if (cudaMalloc((void **)&ctx->d_nvfp4_scratch, need) != cudaSuccess) {
+            ctx->d_nvfp4_scratch_bytes = 0;
+            ctx->nvfp4_scratch_cap_seq = 0;
+            fail(error, error_size, "nvfp4 scratch OOM");
+            return 0;
+        }
+        ctx->d_nvfp4_scratch_bytes = need;
+    }
+    ctx->nvfp4_scratch_cap_seq = seq;
+    return 1;
+}
+
+/* Per-linear FP4 dispatch. kind: 0=QKV 1=OUT 2=FC1 3=FC2. Handles the act
+ * quant + FP4 GEMM + BF16 epilogue (swiglu for FC1, AdaLN gate for
+ * OUT/FC2). Returns 0 only on hard error; caller keeps stats. */
+static int nvfp4_gemm_dispatch(h3_dit_w4a8 *ctx, unsigned block, unsigned kind,
+                               const float *d_x, float *d_y, size_t seq,
+                               const float *d_residual, const float *d_mod,
+                               const uint32_t *d_map, size_t gate_slot,
+                               const float *d_lora, double *prep_ms,
+                               double *gemm_ms, char *error,
+                               size_t error_size) {
+    const h3_cuda_nvfp4_weight *w;
+    char detail[384];
+    char tag[32];
+    if (!nvfp4_load_block_weights(ctx, block, error, error_size))
+        return 0;
+    if (!nvfp4_ensure_scratch(ctx, seq, error, error_size))
+        return 0;
+    w = ctx->nvfp4_w[block][kind];
+    if (!w) {
+        fail(error, error_size, "nvfp4 weight missing");
+        return 0;
+    }
+    snprintf(tag, sizeof(tag), "b%u.%s", block, nvfp4_linear_suffix(kind));
+    if (h3_nvfp4_debug_nan_dev()) {
+        h3_nvfp4_debug_scan_dev(ctx->cuda, d_x, seq * h3_cuda_nvfp4_weight_k(w),
+                                "f32", tag, "dispatch_in");
+    }
+    if (kind == 2u) {
+        if (!h3_cuda_gemm_fp4_w_act_dev_swiglu(
+                ctx->cuda, w, d_x, 1.0f, seq, d_lora, d_y,
+                ctx->d_nvfp4_scratch, prep_ms, gemm_ms, detail,
+                sizeof(detail), tag)) {
+            snprintf(error, error_size, "nvfp4 fc1: %s", detail);
+            return 0;
+        }
+        return 1;
+    }
+    if (kind == 1u || kind == 3u) {
+        if (!h3_cuda_gemm_fp4_w_act_dev_gate(
+                ctx->cuda, w, d_x, 1.0f, seq, d_residual, d_mod, d_map,
+                (size_t)H3_DIT_W4A8_SLOTS, gate_slot, d_lora, d_y,
+                ctx->d_nvfp4_scratch, prep_ms, gemm_ms, detail,
+                sizeof(detail), tag)) {
+            snprintf(error, error_size, "nvfp4 %s: %s",
+                     kind == 1u ? "out" : "fc2", detail);
+            return 0;
+        }
+        return 1;
+    }
+    if (!h3_cuda_gemm_fp4_w_act_dev(ctx->cuda, w, d_x, 1.0f, seq, d_y,
+                                    ctx->d_nvfp4_scratch, prep_ms, gemm_ms,
+                                    detail, sizeof(detail), tag)) {
+        snprintf(error, error_size, "nvfp4 qkv: %s", detail);
+        return 0;
+    }
+    return 1;
+}
+
 /* Phase 1: AdaLN(attn) + QKV GEMM (+LoRA residual) on local rows.
  * Ulysses insertion point is directly after this (A2A on d_qkv). */
+/* nvfp4 track: the 4 FP4-ized linears are not pre-resident; resolve each
+ * INT8 fallback lazily right before its (skipped-by-FP4) GEMM phase. A
+ * successful FP4 dispatch jumps past the resolve, so nothing loads. */
+static const h3_cuda_w4a8_weight *dit_lazy_int8(h3_dit_w4a8 *ctx,
+                                                unsigned block,
+                                                h3_w4a8_linear_kind kind,
+                                                char *error,
+                                                size_t error_size) {
+    if (!ctx->nvfp4_on) return NULL;
+    return get_weight(ctx, block, kind, error, error_size);
+}
+
 static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
                            const h3_cuda_w4a8_weight *w_qkv, float *d_x,
                            float *d_mod, uint32_t *d_map, float *d_n1,
@@ -1897,17 +3070,35 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
 
     prep = gemm = 0.0;
     uly_klog("qkv_gemm", "enter");
+    if (ctx->nvfp4_on) {
+        /* FP4 track: act quant + FP4 cuBLASLt GEMM + BF16→F32 dequant. */
+        snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
+        if (nvfp4_gemm_dispatch(ctx, block, 0u, d_a, d_qkv, seq, NULL, NULL,
+                                NULL, 0u, NULL, &prep, &gemm, detail,
+                                sizeof(detail))) {
+            goto qkv_done;
+        }
+        fprintf(stderr, "dit_nvfp4: qkv b%u FP4 dispatch failed (%s); INT8\n",
+                block, detail);
+        fflush(stderr);
+        w_qkv = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_QKV, error,
+                              error_size);
+        if (!w_qkv) return 0;
+        backend[0] = '\0';
+        prep = gemm = 0.0;
+    }
     if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
             ctx->cuda, w_qkv, d_a, ctx->convrot_gs, seq, d_qkv, &prep, &gemm,
             backend, sizeof(backend), detail, sizeof(detail))) {
         snprintf(error, error_size, "qkv: %s", detail);
         return 0;
     }
+qkv_done:
     if (!uly_ksync("qkv_gemm", error, error_size))
         return 0;
     if (ctx->lora) {
         uly_klog("qkv_lora", "enter");
-        if (!dit_lora_residual_dev(ctx, block, 0, d_a, d_qkv, seq, error,
+        if (!dit_lora_residual_dev(ctx, block, 0, d_a, d_qkv, seq, 1.0f, error,
                                    error_size))
             return 0;
         if (!uly_ksync("qkv_lora", error, error_size))
@@ -1924,7 +3115,7 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
 /* Phase 2: RoPE + SDPA. seq_attn/heads_attn are the attention geometry
  * (U=1: local seq × full heads; Ulysses: S_real gathered rows × H/U heads —
  * pad rows are excluded here so zero-K rows never pollute softmax). */
-static int block_phase_attn(h3_dit_w4a8 *ctx, const float *d_qkv,
+static int block_phase_attn(h3_dit_w4a8 *ctx, unsigned block, const float *d_qkv,
                             const float *d_qn, const float *d_kn,
                             const float *d_cos, const float *d_sin,
                             size_t seq_attn, size_t heads_attn, float *d_attn,
@@ -1939,15 +3130,33 @@ static int block_phase_attn(h3_dit_w4a8 *ctx, const float *d_qkv,
     char detail[384];
     double rope_ms = 0.0, op = 0.0;
     be[0] = '\0';
+    if (ctx && ctx->ckv_on && ctx->ckv_mode && ctx->d_ckv_k &&
+        block < (unsigned)H3_DIT_W4A8_N_BLOCKS) {
+        size_t row = (size_t)H3_DIT_W4A8_HEADS * (size_t)H3_DIT_W4A8_HEAD_DIM;
+        size_t layer_bytes = ctx->ckv_max * row * sizeof(uint16_t);
+        char *k_base = (char *)ctx->d_ckv_k + (size_t)block * layer_bytes;
+        char *v_base = (char *)ctx->d_ckv_v + (size_t)block * layer_bytes;
+        if (ctx->ckv_n > 0)
+            h3_cuda_sdpa_bind_kvcat(k_base, v_base, ctx->ckv_n);
+        else
+            h3_cuda_sdpa_bind_kvcat(NULL, NULL, 0);
+        if (ctx->ckv_mode == 2 && ctx->ckv_save_n > 0) {
+            size_t off = ctx->ckv_save_dst * row * sizeof(uint16_t);
+            h3_cuda_sdpa_bind_kvsave(k_base + off, v_base + off, ctx->d_ckv_idx,
+                                     ctx->ckv_save_n);
+        }
+    }
     /* RoPE → FP16 scratch + SDPA (skip f32 Q/K/V materialize + cast). */
     uly_klog("rope_sdpa", "enter");
     if (!h3_cuda_qkv_rope_sdpa_f16_dev(
             ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq_attn, heads_attn,
             head_dim, rope_half, eps, attn_scale, attn_window, d_attn, &rope_ms,
             &op, be, sizeof(be), detail, sizeof(detail))) {
+        h3_cuda_sdpa_clear_kvext();
         snprintf(error, error_size, "rope_sdpa: %s", detail);
         return 0;
     }
+    h3_cuda_sdpa_clear_kvext();
     if (!uly_ksync("rope_sdpa", error, error_size))
         return 0;
     if (stats) {
@@ -1975,20 +3184,111 @@ static int block_phase_out_mlp(
     double prep = 0.0, gemm = 0.0, op = 0.0;
     char backend[32];
     char detail[384];
+    int fused = h3_dit_w4a8_fused_epilogue();
+    /* FP4 track fuses out-gate / swiglu / fc2-gate in its own BF16
+     * epilogues, which take over the INT8 R31 epilogue's role; keep the
+     * INT8 GEMM epilogue off so the non-FP4 fallback paths stay separate. */
+    int gemm_epi = fused && !ctx->nvfp4_on;
+    /* E2 opt-in (H3_DIT_EPI_FUSE=1): collapse dequant→FP32 round-trip→requant
+     * pairs. Requires the R31 epilogue path AND the act_f16 act path. */
+    int epi_fuse = gemm_epi && h3_dit_epi_fuse_wanted() &&
+                   h3_dit_w4a8_act_f16() && ctx->convrot_gs > 0;
+    int8_t *fc1_pre_x = NULL;
+    float *fc1_pre_act = NULL;
+    int8_t *fc2_pre_x = NULL;
+    float *fc2_pre_act = NULL;
+    h3_cuda_dit_gemm_epi epi;
+    static int fused_logged;
+
+    g_dit_gemm_epi = gemm_epi;
+    if (!fused_logged) {
+        fused_logged = 1;
+        fprintf(stderr,
+                "dit_fused_epi: %s gate_adaln=%d gemm_epi=%d lora=%d scale=%.4g "
+                "overlap=%d epi_fuse=%d nvfp4=%d\n",
+                fused ? "on" : "off", fused ? 1 : 0, gemm_epi ? 1 : 0,
+                ctx->lora ? 1 : 0, ctx->lora ? ctx->lora->scale : 0.0,
+                ctx->lora ? h3_dit_w4a8_lora_overlap() : 0, epi_fuse ? 1 : 0,
+                ctx->nvfp4_on ? 1 : 0);
+        fflush(stderr);
+    }
+    memset(&epi, 0, sizeof(epi));
 
     prep = gemm = 0.0;
     uly_klog("out_gemm", "enter");
-    if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
-            ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_a, &prep,
-            &gemm, backend, sizeof(backend), detail, sizeof(detail))) {
+    if (ctx->nvfp4_on) {
+        /* FP4 track: GEMM + AdaLN gate (slot 2) fused on the BF16 acc;
+         * LoRA delta is added inside the BF16 gate epilogue (no pre-kick). */
+        double fp4_prep = 0.0, fp4_gemm = 0.0;
+        snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
+        if (nvfp4_gemm_dispatch(ctx, block, 1u, d_attn, d_b, seq, d_x, d_mod,
+                                d_map, 2u, ctx->lora ? d_a : NULL, &fp4_prep,
+                                &fp4_gemm, detail, sizeof(detail))) {
+            prep = fp4_prep;
+            gemm = fp4_gemm;
+            goto out_done;
+        }
+        fprintf(stderr, "dit_nvfp4: out b%u FP4 dispatch failed (%s); INT8\n",
+                block, detail);
+        fflush(stderr);
+        w_out = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_OUT, error,
+                              error_size);
+        if (!w_out) return 0;
+        backend[0] = '\0';
+        prep = gemm = 0.0;
+    }
+    if (gemm_epi && ctx->lora) {
+        void *ready = NULL;
+        uly_klog("out_lora", "enter");
+        if (!dit_lora_kick(ctx, block, 1, d_attn, d_a, seq, 0.0f, 1, &ready,
+                           error, error_size))
+            return 0;
+        if (!ready && !uly_ksync("out_lora", error, error_size))
+            return 0;
+        epi.d_lora = d_a;
+        epi.lora_ready = ready;
+    }
+    if (gemm_epi) {
+        epi.gate = 1;
+        epi.swiglu = 0;
+        epi.d_residual = d_x;
+        epi.d_modulation = d_mod;
+        epi.d_row_map = d_map;
+        epi.slots = slots;
+        epi.gate_slot = 2;
+        if (epi_fuse) {
+            /* FC1's act source is d_x (the gate residual). Quantize it in
+             * this launch; FC1 then runs pre_q (no ConvRot/act-prep). */
+            epi.requant_mode = 2;
+            epi.requant_gs = (int)hidden;
+            if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                    ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_b, &prep,
+                    &gemm, backend, sizeof(backend), &epi, detail,
+                    sizeof(detail))) {
+                snprintf(error, error_size, "out: %s", detail);
+                return 0;
+            }
+            fc1_pre_x = epi.d_rq_x;
+            fc1_pre_act = epi.d_rq_act;
+        } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                       ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_b,
+                       &prep, &gemm, backend, sizeof(backend), &epi, detail,
+                       sizeof(detail))) {
+            snprintf(error, error_size, "out: %s", detail);
+            return 0;
+        }
+    } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+                   ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_a, &prep,
+                   &gemm, backend, sizeof(backend), detail, sizeof(detail))) {
         snprintf(error, error_size, "out: %s", detail);
         return 0;
     }
+out_done:
     if (!uly_ksync("out_gemm", error, error_size))
         return 0;
-    if (ctx->lora) {
+    if (!gemm_epi && ctx->lora) {
         uly_klog("out_lora", "enter");
-        if (!dit_lora_residual_dev(ctx, block, 1, d_attn, d_a, seq, error,
+        if (!dit_lora_residual_dev(ctx, block, 1, d_attn, d_a, seq, 1.0f, error,
                                    error_size))
             return 0;
         if (!uly_ksync("out_lora", error, error_size))
@@ -2001,26 +3301,56 @@ static int block_phase_out_mlp(
                  backend);
     }
 
-    uly_klog("gate_attn", "enter");
-    if (!h3_cuda_gate_f32_dev(ctx->cuda, d_x, d_a, d_mod, d_map, seq, hidden,
-                              slots, 2, d_b, &op, detail, sizeof(detail))) {
-        snprintf(error, error_size, "gate_attn: %s", detail);
-        return 0;
-    }
-    if (!uly_ksync("gate_attn", error, error_size))
-        return 0;
-    if (stats) stats->gate_attn_ms = op;
+    if (gemm_epi) {
+        uly_klog("adaln_mlp", "enter");
+        if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_b, d_n2, d_mod, d_map, seq,
+                                   hidden, slots, 3, 4, eps, d_a, &op, detail,
+                                   sizeof(detail))) {
+            snprintf(error, error_size, "adaln_mlp: %s", detail);
+            return 0;
+        }
+        if (!uly_ksync("adaln_mlp", error, error_size))
+            return 0;
+        if (stats) {
+            stats->gate_attn_ms = 0.0;
+            stats->adaln_mlp_ms = op;
+        }
+    } else if (fused) {
+        uly_klog("gate_adaln", "enter");
+        if (!h3_cuda_gate_adaln_f32_dev(
+                ctx->cuda, d_x, d_a, d_n2, d_mod, d_map, seq, hidden, slots, 2,
+                3, 4, eps, d_b, d_a, &op, detail, sizeof(detail))) {
+            snprintf(error, error_size, "gate_adaln: %s", detail);
+            return 0;
+        }
+        if (!uly_ksync("gate_adaln", error, error_size))
+            return 0;
+        if (stats) {
+            stats->gate_attn_ms = 0.0;
+            stats->adaln_mlp_ms = op;
+        }
+    } else {
+        uly_klog("gate_attn", "enter");
+        if (!h3_cuda_gate_f32_dev(ctx->cuda, d_x, d_a, d_mod, d_map, seq, hidden,
+                                  slots, 2, d_b, &op, detail, sizeof(detail))) {
+            snprintf(error, error_size, "gate_attn: %s", detail);
+            return 0;
+        }
+        if (!uly_ksync("gate_attn", error, error_size))
+            return 0;
+        if (stats) stats->gate_attn_ms = op;
 
-    uly_klog("adaln_mlp", "enter");
-    if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_b, d_n2, d_mod, d_map, seq, hidden,
-                               slots, 3, 4, eps, d_a, &op, detail,
-                               sizeof(detail))) {
-        snprintf(error, error_size, "adaln_mlp: %s", detail);
-        return 0;
+        uly_klog("adaln_mlp", "enter");
+        if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_b, d_n2, d_mod, d_map, seq,
+                                   hidden, slots, 3, 4, eps, d_a, &op, detail,
+                                   sizeof(detail))) {
+            snprintf(error, error_size, "adaln_mlp: %s", detail);
+            return 0;
+        }
+        if (!uly_ksync("adaln_mlp", error, error_size))
+            return 0;
+        if (stats) stats->adaln_mlp_ms = op;
     }
-    if (!uly_ksync("adaln_mlp", error, error_size))
-        return 0;
-    if (stats) stats->adaln_mlp_ms = op;
 
     {
         float *d_fc1 = d_wide;
@@ -2028,18 +3358,97 @@ static int block_phase_out_mlp(
 
         prep = gemm = 0.0;
         uly_klog("fc1_gemm", "enter");
-        if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
-                ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_fc1, &prep, &gemm,
-                backend, sizeof(backend), detail, sizeof(detail))) {
+        if (ctx->nvfp4_on) {
+            /* FP4 FC1: GEMM [seq,2*ffn] + fused SwiGLU (+lora) on BF16 acc;
+             * d_act holds the gated half [seq,ffn]. */
+            snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
+            if (nvfp4_gemm_dispatch(ctx, block, 2u, d_a, d_act, seq, NULL,
+                                    NULL, NULL, 0u,
+                                    ctx->lora ? d_fc1 : NULL, &prep, &gemm,
+                                    detail, sizeof(detail))) {
+                goto fc1_done;
+            }
+            fprintf(stderr,
+                    "dit_nvfp4: fc1 b%u FP4 dispatch failed (%s); INT8\n",
+                    block, detail);
+            fflush(stderr);
+            w_fc1 = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_FC1, error,
+                                  error_size);
+            if (!w_fc1) return 0;
+            backend[0] = '\0';
+            prep = gemm = 0.0;
+        }
+        if (gemm_epi && ctx->lora) {
+            void *ready = NULL;
+            uly_klog("fc1_lora", "enter");
+            if (!dit_lora_kick(ctx, block, 2, d_a, d_fc1, seq, 0.0f, 1, &ready,
+                               error, error_size))
+                return 0;
+            if (!ready && !uly_ksync("fc1_lora", error, error_size))
+                return 0;
+            memset(&epi, 0, sizeof(epi));
+            epi.swiglu = 1;
+            epi.d_lora = d_fc1;
+            epi.lora_ready = ready;
+            if (epi_fuse) epi.requant_mode = 1;
+            if (epi_fuse && fc1_pre_x && fc1_pre_act) {
+                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
+                        ctx->cuda, w_fc1, fc1_pre_x, fc1_pre_act, seq, d_act,
+                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
+                        sizeof(detail))) {
+                    snprintf(error, error_size, "fc1: %s", detail);
+                    return 0;
+                }
+                fc2_pre_x = epi.d_rq_x;
+                fc2_pre_act = epi.d_rq_act;
+            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                           ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act,
+                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           detail, sizeof(detail))) {
+                snprintf(error, error_size, "fc1: %s", detail);
+                return 0;
+            } else if (epi_fuse) {
+                fc2_pre_x = epi.d_rq_x;
+                fc2_pre_act = epi.d_rq_act;
+            }
+        } else if (gemm_epi) {
+            memset(&epi, 0, sizeof(epi));
+            epi.swiglu = 1;
+            if (epi_fuse) epi.requant_mode = 1;
+            if (epi_fuse && fc1_pre_x && fc1_pre_act) {
+                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
+                        ctx->cuda, w_fc1, fc1_pre_x, fc1_pre_act, seq, d_act,
+                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
+                        sizeof(detail))) {
+                    snprintf(error, error_size, "fc1: %s", detail);
+                    return 0;
+                }
+                fc2_pre_x = epi.d_rq_x;
+                fc2_pre_act = epi.d_rq_act;
+            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                           ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act,
+                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           detail, sizeof(detail))) {
+                snprintf(error, error_size, "fc1: %s", detail);
+                return 0;
+            } else if (epi_fuse) {
+                fc2_pre_x = epi.d_rq_x;
+                fc2_pre_act = epi.d_rq_act;
+            }
+        } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+                       ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_fc1,
+                       &prep, &gemm, backend, sizeof(backend), detail,
+                       sizeof(detail))) {
             snprintf(error, error_size, "fc1: %s", detail);
             return 0;
         }
+fc1_done:
         if (!uly_ksync("fc1_gemm", error, error_size))
             return 0;
-        if (ctx->lora) {
+        if (!gemm_epi && ctx->lora) {
             uly_klog("fc1_lora", "enter");
-            if (!dit_lora_residual_dev(ctx, block, 2, d_a, d_fc1, seq, error,
-                                       error_size))
+            if (!dit_lora_residual_dev(ctx, block, 2, d_a, d_fc1, seq, 1.0f,
+                                       error, error_size))
                 return 0;
             if (!uly_ksync("fc1_lora", error, error_size))
                 return 0;
@@ -2051,31 +3460,111 @@ static int block_phase_out_mlp(
                      backend);
         }
 
-        prep = gemm = 0.0;
-        uly_klog("swiglu", "enter");
-        if (!h3_cuda_swiglu_f32_dev(ctx->cuda, d_fc1, seq, ffn, d_act, &op,
-                                    detail, sizeof(detail))) {
-            snprintf(error, error_size, "swiglu: %s", detail);
-            return 0;
+        if (!gemm_epi) {
+            prep = gemm = 0.0;
+            uly_klog("swiglu", "enter");
+            if (!h3_cuda_swiglu_f32_dev(ctx->cuda, d_fc1, seq, ffn, d_act, &op,
+                                        detail, sizeof(detail))) {
+                snprintf(error, error_size, "swiglu: %s", detail);
+                return 0;
+            }
+            if (!uly_ksync("swiglu", error, error_size))
+                return 0;
+            if (stats) stats->swiglu_ms = op;
+        } else if (stats) {
+            stats->swiglu_ms = 0.0;
         }
-        if (!uly_ksync("swiglu", error, error_size))
-            return 0;
-        if (stats) stats->swiglu_ms = op;
 
         prep = gemm = 0.0;
         uly_klog("fc2_gemm", "enter");
-        if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
-                ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_a, &prep, &gemm,
-                backend, sizeof(backend), detail, sizeof(detail))) {
+        if (ctx->nvfp4_on) {
+            /* FP4 FC2: GEMM + AdaLN gate (slot 5, residual d_b) fused on
+             * the BF16 acc; writes d_y directly. */
+            snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
+            if (nvfp4_gemm_dispatch(ctx, block, 3u, d_act, d_y, seq, d_b,
+                                    d_mod, d_map, 5u, ctx->lora ? d_a : NULL,
+                                    &prep, &gemm, detail, sizeof(detail))) {
+                goto fc2_done;
+            }
+            fprintf(stderr,
+                    "dit_nvfp4: fc2 b%u FP4 dispatch failed (%s); INT8\n",
+                    block, detail);
+            fflush(stderr);
+            w_fc2 = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_FC2, error,
+                                  error_size);
+            if (!w_fc2) return 0;
+            backend[0] = '\0';
+            prep = gemm = 0.0;
+        }
+        if (gemm_epi && ctx->lora) {
+            void *ready = NULL;
+            uly_klog("fc2_lora", "enter");
+            if (!dit_lora_kick(ctx, block, 3, d_act, d_a, seq, 0.0f, 1, &ready,
+                               error, error_size))
+                return 0;
+            if (!ready && !uly_ksync("fc2_lora", error, error_size))
+                return 0;
+            memset(&epi, 0, sizeof(epi));
+            epi.gate = 1;
+            epi.d_residual = d_b;
+            epi.d_modulation = d_mod;
+            epi.d_row_map = d_map;
+            epi.slots = slots;
+            epi.gate_slot = 5;
+            epi.d_lora = d_a;
+            epi.lora_ready = ready;
+            if (epi_fuse && fc2_pre_x && fc2_pre_act) {
+                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
+                        ctx->cuda, w_fc2, fc2_pre_x, fc2_pre_act, seq, d_y,
+                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
+                        sizeof(detail))) {
+                    snprintf(error, error_size, "fc2: %s", detail);
+                    return 0;
+                }
+            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                           ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_y,
+                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           detail, sizeof(detail))) {
+                snprintf(error, error_size, "fc2: %s", detail);
+                return 0;
+            }
+        } else if (gemm_epi) {
+            memset(&epi, 0, sizeof(epi));
+            epi.gate = 1;
+            epi.d_residual = d_b;
+            epi.d_modulation = d_mod;
+            epi.d_row_map = d_map;
+            epi.slots = slots;
+            epi.gate_slot = 5;
+            if (epi_fuse && fc2_pre_x && fc2_pre_act) {
+                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
+                        ctx->cuda, w_fc2, fc2_pre_x, fc2_pre_act, seq, d_y,
+                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
+                        sizeof(detail))) {
+                    snprintf(error, error_size, "fc2: %s", detail);
+                    return 0;
+                }
+            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                           ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_y,
+                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           detail, sizeof(detail))) {
+                snprintf(error, error_size, "fc2: %s", detail);
+                return 0;
+            }
+        } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+                       ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_a,
+                       &prep, &gemm, backend, sizeof(backend), detail,
+                       sizeof(detail))) {
             snprintf(error, error_size, "fc2: %s", detail);
             return 0;
         }
+fc2_done:
         if (!uly_ksync("fc2_gemm", error, error_size))
             return 0;
-        if (ctx->lora) {
+        if (!gemm_epi && ctx->lora) {
             uly_klog("fc2_lora", "enter");
-            if (!dit_lora_residual_dev(ctx, block, 3, d_act, d_a, seq, error,
-                                       error_size))
+            if (!dit_lora_residual_dev(ctx, block, 3, d_act, d_a, seq, 1.0f,
+                                       error, error_size))
                 return 0;
             if (!uly_ksync("fc2_lora", error, error_size))
                 return 0;
@@ -2088,6 +3577,12 @@ static int block_phase_out_mlp(
         }
     }
 
+    /* FP4 fc2 already applied the MLP gate in its BF16 epilogue (it writes
+     * d_y), so skip the standalone gate like the INT8 R31 path does. */
+    if (gemm_epi || ctx->nvfp4_on) {
+        if (stats) stats->gate_mlp_ms = 0.0;
+        return 1;
+    }
     uly_klog("gate_mlp", "enter");
     if (!h3_cuda_gate_f32_dev(ctx->cuda, d_b, d_a, d_mod, d_map, seq, hidden,
                               slots, 5, d_y, &op, detail, sizeof(detail))) {
@@ -2114,7 +3609,7 @@ static int block_device_compute(
     if (!block_phase_qkv(ctx, block, w_qkv, d_x, d_mod, d_map, d_n1, d_a,
                          d_qkv, seq, stats, error, error_size))
         return 0;
-    if (!block_phase_attn(ctx, d_qkv, d_qn, d_kn, d_cos, d_sin, seq,
+    if (!block_phase_attn(ctx, block, d_qkv, d_qn, d_kn, d_cos, d_sin, seq,
                           (size_t)H3_DIT_W4A8_HEADS, d_wide, stats, error,
                           error_size))
         return 0;
@@ -2136,6 +3631,119 @@ static void destroy_block_graph(h3_dit_w4a8 *ctx) {
     ctx->graph_ok = 0;
     ctx->graph_seq = 0;
     ctx->graph_block = 0;
+}
+
+static void destroy_step_graph(h3_dit_w4a8 *ctx) {
+    if (!ctx) return;
+    if (ctx->step_graph_exec) {
+        cudaGraphExecDestroy(ctx->step_graph_exec);
+        ctx->step_graph_exec = NULL;
+    }
+    if (ctx->step_graph) {
+        cudaGraphDestroy(ctx->step_graph);
+        ctx->step_graph = NULL;
+    }
+    ctx->step_graph_ok = 0;
+    ctx->step_graph_seq = 0;
+    ctx->step_graph_first = 0;
+    ctx->step_graph_n = 0;
+    ctx->d_graph_aux_base = NULL;
+}
+
+/* P2b whole-step graph: only the static weight-resident range is
+ * graph-eligible. Layers above that boundary keep the eager sliding-window
+ * loop; they are appended after the graph replay so one layers_forward call
+ * can still span the full range. */
+static int all_blocks_resident(h3_dit_w4a8 *ctx, unsigned first_block,
+                               unsigned n_blocks) {
+    unsigned b;
+    if (ctx->nvfp4_on)
+        return 1; /* FP4 weights own the blocks; INT8 residency not required */
+    for (b = 0; b < n_blocks; b++) {
+        unsigned block = first_block + b;
+        if (!h3_w4a8_cache_block_is_resident(ctx->cache, block))
+            return 0;
+    }
+    return 1;
+}
+
+/* Whole-step graph diagnostics (same Tu latch pattern as
+ * h3_w4a8_cache_last_plan_reuse). mode: 0 off, 1 eager fallback, 2 replay. */
+static int s_step_graph_mode;
+static char s_step_graph_reason[64];
+static void step_graph_note(int mode, const char *reason) {
+    s_step_graph_mode = mode;
+    snprintf(s_step_graph_reason, sizeof(s_step_graph_reason), "%s",
+             reason ? reason : "");
+}
+
+void h3_dit_w4a8_cuda_graph_last(int *mode, const char **reason) {
+    if (mode) *mode = s_step_graph_mode;
+    if (reason) *reason = s_step_graph_reason;
+}
+
+static const char *step_graph_block_reason(h3_dit_w4a8 *ctx,
+                                           unsigned n_blocks) {
+    if (ctx->uly_u > 1) return "ulysses";
+    if (ctx->token_reduction) return "token_reduction";
+    if (ctx->lora) return "lora";
+    if (h3_cuda_sdpa_backend_name() &&
+        !strcmp(h3_cuda_sdpa_backend_name(), "cudnn"))
+        return "cudnn";
+    {
+        unsigned win = h3_w4a8_cache_window_size(ctx->cache);
+        if (win > 0 && win < n_blocks) return "weight_window";
+    }
+    return NULL;
+}
+
+static int run_all_blocks_device(
+    h3_dit_w4a8 *ctx, unsigned first_block, unsigned n_blocks, float *d_x,
+    float *d_y, float *d_aux_base, size_t aux_stride, size_t mod_elems,
+    uint32_t *d_map, float *d_cos, float *d_sin, float *d_a, float *d_b,
+    float *d_qkv, float *d_wide, size_t seq, char *error, size_t error_size) {
+    const size_t hidden = H3_DIT_W4A8_HIDDEN;
+    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
+    unsigned b;
+    char detail[384];
+    for (b = 0; b < n_blocks; b++) {
+        unsigned block = first_block + b;
+        const h3_cuda_w4a8_weight *w_qkv = NULL, *w_out = NULL, *w_fc1 = NULL,
+                                  *w_fc2 = NULL;
+        float *layer = d_aux_base + (size_t)b * aux_stride;
+        float *d_mod = layer;
+        float *d_n1 = layer + mod_elems;
+        float *d_n2 = d_n1 + hidden;
+        float *d_qn = d_n2 + hidden;
+        float *d_kn = d_qn + head_dim;
+        if (!ctx->nvfp4_on) {
+            w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error,
+                               error_size);
+            w_out = w_qkv ? get_weight(ctx, block, H3_W4A8_LINEAR_OUT, error,
+                                       error_size)
+                          : NULL;
+            w_fc1 = w_out ? get_weight(ctx, block, H3_W4A8_LINEAR_FC1, error,
+                                       error_size)
+                          : NULL;
+            w_fc2 = w_fc1 ? get_weight(ctx, block, H3_W4A8_LINEAR_FC2, error,
+                                       error_size)
+                          : NULL;
+            if (!w_fc2) return 0;
+        }
+        if (!block_device_compute(ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x,
+                                  d_y, d_mod, d_map, d_cos, d_sin, d_n1, d_n2,
+                                  d_qn, d_kn, d_a, d_b, d_qkv, d_wide, seq,
+                                  NULL, detail, sizeof(detail))) {
+            snprintf(error, error_size, "%s", detail);
+            return 0;
+        }
+        {
+            float *tmp = d_x;
+            d_x = d_y;
+            d_y = tmp;
+        }
+    }
+    return 1;
 }
 
 /* GPU-resident block: one H2D of inputs + one D2H of y; no per-linear PCIe. */
@@ -2168,20 +3776,23 @@ static int block_forward_gpu_resident(
         return 0;
     }
 
-    w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error, error_size);
-    if (!w_qkv) return 0;
-    w_out = get_weight(ctx, block, H3_W4A8_LINEAR_OUT, error, error_size);
-    if (!w_out) return 0;
-    w_fc1 = get_weight(ctx, block, H3_W4A8_LINEAR_FC1, error, error_size);
-    if (!w_fc1) return 0;
-    w_fc2 = get_weight(ctx, block, H3_W4A8_LINEAR_FC2, error, error_size);
-    if (!w_fc2) return 0;
+    w_qkv = w_out = w_fc1 = w_fc2 = NULL;
+    if (!ctx->nvfp4_on) {
+        w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error, error_size);
+        if (!w_qkv) return 0;
+        w_out = get_weight(ctx, block, H3_W4A8_LINEAR_OUT, error, error_size);
+        if (!w_out) return 0;
+        w_fc1 = get_weight(ctx, block, H3_W4A8_LINEAR_FC1, error, error_size);
+        if (!w_fc1) return 0;
+        w_fc2 = get_weight(ctx, block, H3_W4A8_LINEAR_FC2, error, error_size);
+        if (!w_fc2) return 0;
+    }
 
     need = 0;
     need += seq * hidden * sizeof(float);                 /* x */
     need += seq * hidden * sizeof(float);                 /* y */
     need += mod_elems * sizeof(float);                    /* mod */
-    need += ((seq * sizeof(uint32_t) + 7) & ~(size_t)7);  /* map */
+    need += H3_WS_MAP_BYTES(seq);  /* map */
     need += seq * rope_half * sizeof(float) * 2;          /* cos/sin */
     need += (hidden * 2 + head_dim * 2) * sizeof(float);  /* norms */
     need += seq * hidden * sizeof(float);                 /* a */
@@ -2197,7 +3808,7 @@ static int block_forward_gpu_resident(
     d_y = H3_WS_F32(seq * hidden);
     d_mod = H3_WS_F32(mod_elems);
     {
-        size_t map_bytes = (seq * sizeof(uint32_t) + 7) & ~(size_t)7;
+        size_t map_bytes = H3_WS_MAP_BYTES(seq);
         d_map = (uint32_t *)(base + off);
         off += map_bytes;
     }
@@ -2264,7 +3875,21 @@ static int block_forward_gpu_resident(
         /* cuDNN fused SDPA is often uncapturable; keep quiet path instead. */
         if (want_graph) {
             const char *be = h3_cuda_sdpa_backend_name();
-            if (be && !strcmp(be, "cudnn")) want_graph = 0;
+            if (be && !strcmp(be, "cudnn")) {
+                static int logged_eager;
+                want_graph = 0;
+                if (!logged_eager) {
+                    fprintf(stderr,
+                            "dit_graph: eager reason=cudnn_uncapturable\n");
+                    logged_eager = 1;
+                }
+            }
+        } else {
+            static int logged_off;
+            if (!logged_off) {
+                fprintf(stderr, "dit_graph: eager reason=off\n");
+                logged_off = 1;
+            }
         }
         if (want_graph) {
             /* Warm scratch/hadamard/lt workspace once outside capture. */
@@ -2340,13 +3965,19 @@ static int block_forward_gpu_resident(
         }
 
         if (use_graph && ctx->graph_exec) {
+            static int logged_hit;
             if (cudaGraphLaunch(ctx->graph_exec, 0) != cudaSuccess) {
                 fail(error, error_size, "cudaGraphLaunch failed");
                 return 0;
             }
+            if (!logged_hit) {
+                fprintf(stderr, "dit_graph: graph=hit seq=%zu block=%u\n", seq,
+                        block);
+                logged_hit = 1;
+            }
             if (stats) {
                 snprintf(stats->sdpa_backend, sizeof(stats->sdpa_backend), "%s",
-                         "cuda_graph");
+                         h3_cuda_sdpa_last_backend_name());
             }
         } else {
             if (want_quiet) {
@@ -2379,7 +4010,7 @@ static int block_forward_gpu_resident(
                         stats->sdpa_ms = 0.0;
                         snprintf(stats->sdpa_backend,
                                  sizeof(stats->sdpa_backend), "%s",
-                                 "cuda_quiet_block");
+                                 h3_cuda_sdpa_last_backend_name());
                     }
                     cudaEventDestroy(wall0);
                     cudaEventDestroy(wall1);
@@ -2852,6 +4483,16 @@ int h3_dit_w4a8_load_core(const h3_w4a8_store *store, h3_dit_w4a8_core *core,
                                      error_size);
 }
 
+int h3_dit_w4a8_load_core_nvfp4(const h3_nvfp4_store *store,
+                                h3_dit_w4a8_core *core, char *error,
+                                size_t error_size) {
+    if (!store || !core) {
+        fail(error, error_size, "invalid load_core_nvfp4 args");
+        return 0;
+    }
+    return h3_dit_w4a8_load_core_hdr(&store->header, core, error, error_size);
+}
+
 int h3_dit_w4a8_load_core_int8(const h3_dit_int8_store *store,
                                h3_dit_w4a8_core *core, char *error,
                                size_t error_size) {
@@ -3253,7 +4894,7 @@ static int final_head_cuda(h3_dit_w4a8 *ctx, const h3_dit_w4a8_core *core,
     need = (x_on_dev ? 0 : seq * hidden * sizeof(float)) +
            seq * hidden * sizeof(float) + /* normed */
            mod_n * sizeof(float) + seq * out_dim * sizeof(float) +
-           ((seq * sizeof(uint32_t) + 7) & ~(size_t)7);
+           H3_WS_MAP_BYTES(seq);
     if (!ctx->d_final_ws || ctx->d_final_ws_bytes < need) {
         void *fresh = NULL;
         if (cudaMalloc(&fresh, need) != cudaSuccess) {
@@ -3516,7 +5157,7 @@ static int uly_do_phase(uly_job *j) {
     }
     if (j->phase == ULY_PH_ATTN) {
         size_t pad_elems;
-        if (!block_phase_attn(rc, w->d_qkv, w->d_qn, w->d_kn, w->d_cos,
+        if (!block_phase_attn(rc, j->block, w->d_qkv, w->d_qn, w->d_kn, w->d_cos,
                               w->d_sin, j->seq_real, j->heads_attn, w->d_wide,
                               NULL, detail, sizeof(detail))) {
             snprintf(j->err, sizeof j->err, "ulysses r%d phase2: %s", j->rank,
@@ -3638,7 +5279,8 @@ static int uly_join_ranks(uly_job *jobs, int u, char *error, size_t error_size) 
                 return 0;
             }
         } else {
-            cudaError_t ce = cudaDeviceSynchronize();
+            /* Default stream only — DeviceSynchronize drained copy/other. */
+            cudaError_t ce = cudaStreamSynchronize((cudaStream_t)0);
             if (ce != cudaSuccess) {
                 snprintf(error, error_size, "ulysses: join r%d: %s", r,
                          cudaGetErrorString(ce));
@@ -3662,18 +5304,25 @@ static int uly_h2d_aux(uly_job *j) {
         return 0;
     }
     w = j->ws;
-    if (cudaMemcpy(w->d_mod, j->modulation, j->mod_elems * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(w->d_n1, j->aux->norm1, j->hidden * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(w->d_n2, j->aux->norm2, j->hidden * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(w->d_qn, j->aux->q_norm, j->head_dim * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(w->d_kn, j->aux->k_norm, j->head_dim * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-        snprintf(j->err, sizeof j->err, "ulysses: aux H2D");
-        return 0;
+    {
+        cudaStream_t st =
+            j->compute_stream ? (cudaStream_t)j->compute_stream : (cudaStream_t)0;
+        if (cudaMemcpyAsync(w->d_mod, j->modulation,
+                            j->mod_elems * sizeof(float), cudaMemcpyHostToDevice,
+                            st) != cudaSuccess ||
+            cudaMemcpyAsync(w->d_n1, j->aux->norm1, j->hidden * sizeof(float),
+                            cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaMemcpyAsync(w->d_n2, j->aux->norm2, j->hidden * sizeof(float),
+                            cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaMemcpyAsync(w->d_qn, j->aux->q_norm,
+                            j->head_dim * sizeof(float), cudaMemcpyHostToDevice,
+                            st) != cudaSuccess ||
+            cudaMemcpyAsync(w->d_kn, j->aux->k_norm,
+                            j->head_dim * sizeof(float), cudaMemcpyHostToDevice,
+                            st) != cudaSuccess) {
+            snprintf(j->err, sizeof j->err, "ulysses: aux H2D");
+            return 0;
+        }
     }
     return 1;
 }
@@ -3700,6 +5349,7 @@ static int uly_resolve_weights(uly_job *j) {
     if (j->phase == ULY_PH_ATTN)
         return 1;
     if (j->phase == ULY_PH_QKV) {
+        if (rc->nvfp4_on) return 1;
         j->w_qkv = get_weight(rc, j->block, H3_W4A8_LINEAR_QKV, j->err,
                               sizeof j->err);
         if (!j->w_qkv)
@@ -3715,6 +5365,7 @@ static int uly_resolve_weights(uly_job *j) {
         return 1;
     }
     if (j->phase == ULY_PH_MLP) {
+        if (rc->nvfp4_on) return 1;
         j->w_out = get_weight(rc, j->block, H3_W4A8_LINEAR_OUT, j->err,
                               sizeof j->err);
         j->w_fc1 = j->w_out ? get_weight(rc, j->block, H3_W4A8_LINEAR_FC1,
@@ -3798,7 +5449,14 @@ static int uly_sync_rank(uly_job *j, char *error, size_t error_size) {
         fail(error, error_size, "ulysses: set device");
         return 0;
     }
-    ce = cudaDeviceSynchronize();
+    /* Per-rank compute stream (or event), not DeviceSynchronize — that
+     * drained copy/other streams every phase. */
+    if (j->compute_stream)
+        ce = cudaStreamSynchronize((cudaStream_t)j->compute_stream);
+    else if (j->ev_comp)
+        ce = cudaEventSynchronize((cudaEvent_t)j->ev_comp);
+    else
+        ce = cudaStreamSynchronize((cudaStream_t)0);
     if (ce != cudaSuccess) {
         snprintf(error, error_size, "ulysses: join r%d phase%d: %s", j->rank,
                  j->phase, cudaGetErrorString(ce));
@@ -3970,7 +5628,7 @@ static int layers_forward_ulysses(
         }
         need += seq_local * hidden * sizeof(float) * 2;
         need += mod_elems * sizeof(float);
-        need += ((seq_local * sizeof(uint32_t) + 7) & ~(size_t)7);
+        need += H3_WS_MAP_BYTES(seq_local);
         need += seq_real * rope_half * sizeof(float) * 2;
         need += (hidden * 2 + head_dim * 2) * sizeof(float);
         need += seq_local * hidden * sizeof(float) * 2;
@@ -3978,7 +5636,7 @@ static int layers_forward_ulysses(
         need += seq_local * wide * sizeof(float);
         if (!ensure_block_ws(rc, need, error, error_size))
             goto done;
-        if (rc->int8_store && rc->cache &&
+        if ((rc->int8_store || rc->nvfp4_store) && rc->cache &&
             !h3_w4a8_cache_refit_after_workspace(rc->cache, detail,
                                                  sizeof(detail))) {
             snprintf(error, error_size, "INT8 cache refit: %s", detail);
@@ -4018,7 +5676,7 @@ static int layers_forward_ulysses(
         ws[r].d_y = H3_ULY_F32(seq_local * hidden);
         ws[r].d_mod = H3_ULY_F32(mod_elems);
         {
-            size_t map_bytes = (seq_local * sizeof(uint32_t) + 7) & ~(size_t)7;
+            size_t map_bytes = H3_WS_MAP_BYTES(seq_local);
             ws[r].d_map = (uint32_t *)(base + off);
             off += map_bytes;
         }
@@ -4337,6 +5995,9 @@ int h3_dit_w4a8_layers_forward_f32(
                                       row_map, rope_cos, rope_sin, y,
                                       auto_prefetch, stats, error, error_size);
 
+    if (ctx->cache)
+        h3_w4a8_cache_set_async_h2d(ctx->cache, 1);
+
     if (stats) {
         stats->first_block = first_block;
         stats->n_blocks = n_blocks;
@@ -4387,7 +6048,7 @@ int h3_dit_w4a8_layers_forward_f32(
 
         need = 0;
         need += act_bytes;
-        need += ((seq * sizeof(uint32_t) + 7) & ~(size_t)7);
+        need += H3_WS_MAP_BYTES(seq);
         need += seq * rope_half * sizeof(float) * 2;
         need += n_blocks * aux_stride * sizeof(float);
         need += seq * hidden * sizeof(float) * 2;
@@ -4398,7 +6059,9 @@ int h3_dit_w4a8_layers_forward_f32(
          * there is no existing block WS at all. A slightly-short old WS
          * falls through to dual-bank instead of dropping 13 layers. */
         if (!ensure_block_ws(ctx, need, detail, sizeof(detail))) {
-            if (ctx->int8_store && ctx->cache && !ctx->d_block_ws) {
+            if ((ctx->int8_store || ctx->nvfp4_store) && ctx->cache &&
+                !ctx->d_block_ws &&
+                !env_flag_is_one("H3_DIT_NO_WS_MAKE_ROOM")) {
                 char room_err[256];
                 size_t keep = need + ((size_t)512ULL << 20);
                 if (!h3_w4a8_cache_make_room(ctx->cache, keep, room_err,
@@ -4411,7 +6074,7 @@ int h3_dit_w4a8_layers_forward_f32(
             size_t need_bank = 0;
             need_bank += act_bytes;
             need_bank += mod_elems * sizeof(float) * 2;
-            need_bank += ((seq * sizeof(uint32_t) + 7) & ~(size_t)7);
+            need_bank += H3_WS_MAP_BYTES(seq);
             need_bank += seq * rope_half * sizeof(float) * 2;
             need_bank += (hidden * 2 + head_dim * 2) * sizeof(float) * 2;
             need_bank += seq * hidden * sizeof(float) * 2;
@@ -4426,7 +6089,7 @@ int h3_dit_w4a8_layers_forward_f32(
                 snprintf(error, error_size, "dit scratch: %s", detail);
                 goto done;
             }
-            if (ctx->int8_store &&
+            if ((ctx->int8_store || ctx->nvfp4_store) &&
                 !h3_w4a8_cache_refit_after_workspace(ctx->cache, detail,
                                                      sizeof(detail))) {
                 snprintf(error, error_size, "INT8 cache refit: %s", detail);
@@ -4450,7 +6113,7 @@ int h3_dit_w4a8_layers_forward_f32(
                 d_mod[0] = H3_WS_F32(mod_elems);
                 d_mod[1] = H3_WS_F32(mod_elems);
                 {
-                    size_t map_bytes = (seq * sizeof(uint32_t) + 7) & ~(size_t)7;
+                    size_t map_bytes = H3_WS_MAP_BYTES(seq);
                     d_map = (uint32_t *)(base + off);
                     off += map_bytes;
                 }
@@ -4501,12 +6164,13 @@ int h3_dit_w4a8_layers_forward_f32(
                 }
                 t0 = clock(); /* placeholder; reset after warm prefetch */
                 if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 1);
-                /* WS-first: workspace already in d_block_ws; now reside window. */
+                /* WS-first: only first two blocks so compute overlaps later H2D. */
                 {
                     unsigned win = h3_w4a8_cache_window_size(ctx->cache);
-                    unsigned n_pref = n_blocks;
+                    unsigned n_pref = 2;
                     double ignore = 0.0;
                     if (win > 0 && win < n_pref) n_pref = win;
+                    if (n_pref > n_blocks) n_pref = n_blocks;
                     if (!h3_dit_w4a8_prefetch(ctx, first_block, n_pref, &ignore,
                                               error, error_size)) {
                         if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
@@ -4518,41 +6182,15 @@ int h3_dit_w4a8_layers_forward_f32(
                 for (b = 0; b < n_blocks; b++) {
                     unsigned block = first_block + b;
                     const h3_dit_w4a8_block_aux *aux;
-                    const h3_cuda_w4a8_weight *w_qkv, *w_out, *w_fc1, *w_fc2;
+                    const h3_cuda_w4a8_weight *w_qkv = NULL, *w_out = NULL,
+                                                *w_fc1 = NULL, *w_fc2 = NULL;
                     unsigned win = h3_w4a8_cache_window_size(ctx->cache);
                     int cur = bank;
-                    if (win > 2 && b + 1 < n_blocks &&
-                        ((b + 1) % win) == (win / 2)) {
-                        unsigned next_start = ((b + 1) / win + 1) * win;
-                        if (next_start < n_blocks) {
-                            unsigned n_pref = n_blocks - next_start;
-                            double ignore = 0.0;
-                            if (n_pref > win) n_pref = win;
-                            if (!h3_dit_w4a8_prefetch(ctx,
-                                                      first_block + next_start,
-                                                      n_pref, &ignore, error,
-                                                      error_size)) {
-                                if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                                goto done;
-                            }
-                        }
-                    }
-                    if (win > 0 && b + 1 < n_blocks && (b + 1) % win == 0) {
-                        unsigned n_pref = n_blocks - (b + 1);
-                        double ignore = 0.0;
-                        if (n_pref > win) n_pref = win;
-                        if (!h3_dit_w4a8_prefetch(ctx, block + 1, n_pref,
-                                                  &ignore, error, error_size)) {
-                            if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                            goto done;
-                        }
-                    } else if (b + 1 < n_blocks && win <= 1) {
-                        double ignore = 0.0;
-                        if (!h3_dit_w4a8_prefetch(ctx, block + 1, 1, &ignore,
-                                                  error, error_size)) {
-                            if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                            goto done;
-                        }
+                    (void)win;
+                    if (!prefetch_next_u1(ctx, block + 1, first_block + n_blocks,
+                                          error, error_size)) {
+                        if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
+                        goto done;
                     }
                     aux = dit_aux_cached(ctx, block, error, error_size);
                     if (!aux) {
@@ -4564,6 +6202,7 @@ int h3_dit_w4a8_layers_forward_f32(
                         if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
                         goto done;
                     }
+                    if (ctx->nvfp4_on) goto have_weights_dual;
                     w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error,
                                        error_size);
                     w_out = w_qkv
@@ -4582,6 +6221,7 @@ int h3_dit_w4a8_layers_forward_f32(
                         if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
                         goto done;
                     }
+                have_weights_dual:
                     if (!next_ready) {
                         cudaStream_t st = copy_stream
                                               ? (cudaStream_t)copy_stream
@@ -4671,6 +6311,7 @@ int h3_dit_w4a8_layers_forward_f32(
                     }
                 }
                 if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
+                dit_lora_log_ms(ctx, stats);
                 if (leave_act_dev) {
                     ctx->io_d_result = d_x;
                 } else if (cudaMemcpy(y, d_x, seq * hidden * sizeof(float),
@@ -4711,7 +6352,7 @@ int h3_dit_w4a8_layers_forward_f32(
             snprintf(error, error_size, "dit scratch: %s", detail);
             goto done;
         }
-        if (ctx->int8_store &&
+        if ((ctx->int8_store || ctx->nvfp4_store) &&
             !h3_w4a8_cache_refit_after_workspace(ctx->cache, detail,
                                                  sizeof(detail))) {
             snprintf(error, error_size, "INT8 cache refit: %s", detail);
@@ -4729,7 +6370,7 @@ int h3_dit_w4a8_layers_forward_f32(
             d_y = H3_WS_F32(seq * hidden);
         }
         {
-            size_t map_bytes = (seq * sizeof(uint32_t) + 7) & ~(size_t)7;
+            size_t map_bytes = H3_WS_MAP_BYTES(seq);
             d_map = (uint32_t *)(base + off);
             off += map_bytes;
         }
@@ -4810,6 +6451,11 @@ int h3_dit_w4a8_layers_forward_f32(
                 fail(error, error_size, "layers rope H2D failed");
                 goto done_dev;
             }
+            /* A fresh aux pack can land at a different d_block_ws offset than
+             * the one baked into the step graph (e.g. TR pool/expand grew the
+             * workspace in between). Invalidate when the layout moved. */
+            if (ctx->step_graph_ok && d_aux_base != ctx->d_graph_aux_base)
+                destroy_step_graph(ctx);
             if (cudaMemcpyAsync(d_aux_base, h_aux_pack,
                                 n_blocks * aux_stride * sizeof(float),
                                 cudaMemcpyHostToDevice, st) != cudaSuccess) {
@@ -4851,16 +6497,114 @@ int h3_dit_w4a8_layers_forward_f32(
             if (ev_b) cudaEventDestroy(ev_b);
         }
 
+        /* P2b whole-step CUDA Graph: first eligible call eager-runs the block
+         * loop below to settle cuBLASLt plans / Hadamard / act-scratch sizes,
+         * the next call captures, subsequent same-shape calls replay. The
+         * captured region contains kernel launches only — all cross-step
+         * inputs (act, modulation, rope, map) live in fixed device buffers
+         * that are re-uploaded above before the replay. */
+        step_graph_note(0, "off");
+        if (env_flag_is_one("H3_DIT_W4A8_CUDA_GRAPH")) {
+            const char *block_reason =
+                step_graph_block_reason(ctx, n_blocks);
+            if (block_reason) {
+                step_graph_note(1, block_reason);
+            } else if (!use_ext_act || !ctx->io_d_act_a || !ctx->io_d_act_b) {
+                /* The graph bakes d_x/d_y = io act buffers; only the resident
+                 * forward pins those (WS-carved d_x could move on realloc). */
+                step_graph_note(1, "no_resident_act");
+            } else if (!all_blocks_resident(ctx, first_block, n_blocks)) {
+                step_graph_note(1, "weights_not_resident");
+            } else if (!(ctx->step_graph_ok && ctx->step_graph_exec &&
+                         ctx->step_graph_seq == seq &&
+                         ctx->step_graph_first == first_block &&
+                         ctx->step_graph_n == n_blocks &&
+                         ctx->d_graph_aux_base == d_aux_base)) {
+                cudaError_t gst;
+                cudaGraph_t g = NULL;
+                destroy_step_graph(ctx);
+                (void)cudaGetLastError();
+                h3_cuda_set_graph_capture(ctx->cuda, 1);
+                gst = cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+                if (gst == cudaSuccess) {
+                    int cok = run_all_blocks_device(
+                        ctx, first_block, n_blocks, d_x, d_y, d_aux_base,
+                        aux_stride, mod_elems, d_map, d_cos, d_sin, d_a, d_b,
+                        d_qkv, d_wide, seq, detail, sizeof(detail));
+                    gst = cudaStreamEndCapture(0, &g);
+                    h3_cuda_set_graph_capture(ctx->cuda, 0);
+                    if (cok && gst == cudaSuccess && g) {
+                        cudaGraphExec_t ge = NULL;
+                        if (cudaGraphInstantiate(&ge, g, 0) == cudaSuccess) {
+                            ctx->step_graph = g;
+                            ctx->step_graph_exec = ge;
+                            ctx->step_graph_seq = seq;
+                            ctx->step_graph_first = first_block;
+                            ctx->step_graph_n = n_blocks;
+                            ctx->d_graph_aux_base = d_aux_base;
+                            ctx->step_graph_ok = 1;
+                            step_graph_note(2, "capture");
+                        } else {
+                            cudaGraphDestroy(g);
+                            step_graph_note(1, "instantiate_fail");
+                        }
+                    } else {
+                        if (g) cudaGraphDestroy(g);
+                        step_graph_note(1, "capture_fail");
+                    }
+                    (void)cudaGetLastError();
+                } else {
+                    h3_cuda_set_graph_capture(ctx->cuda, 0);
+                    (void)cudaGetLastError();
+                    step_graph_note(1, "begin_capture_fail");
+                }
+                /* Capture executed the block chain once with current inputs.
+                 * On failure the activation ping-pong may have advanced —
+                 * restore it so the eager fallback below sees pristine d_x. */
+                if (!ctx->step_graph_ok) {
+                    float *in_act =
+                        (n_blocks & 1u) ? ctx->io_d_act_b : ctx->io_d_act_a;
+                    if (use_ext_act && in_act != ctx->io_d_act_a) {
+                        if (cudaMemcpy(ctx->io_d_act_a, in_act,
+                                       seq * hidden * sizeof(float),
+                                       cudaMemcpyDeviceToDevice) !=
+                            cudaSuccess) {
+                            fail(error, error_size,
+                                 "step graph fallback act restore failed");
+                            goto done_dev;
+                        }
+                    }
+                }
+            } else {
+                step_graph_note(2, "replay");
+            }
+        }
+
+        if (ctx->step_graph_ok && ctx->step_graph_exec &&
+            ctx->step_graph_seq == seq &&
+            ctx->step_graph_first == first_block &&
+            ctx->step_graph_n == n_blocks &&
+            ctx->d_graph_aux_base == d_aux_base) {
+            if (cudaGraphLaunch(ctx->step_graph_exec, 0) != cudaSuccess) {
+                fail(error, error_size, "step cudaGraphLaunch failed");
+                goto done_dev;
+            }
+            /* Result buffer after n_blocks ping-pong swaps (see loop below). */
+            d_x = (n_blocks & 1u) ? ctx->io_d_act_b : ctx->io_d_act_a;
+            if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 1);
+            goto blocks_chain_done;
+        }
+
         t0 = clock(); /* placeholder; reset after warm prefetch */
         if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 1);
-        /* WS-first: d_block_ws already allocated; warm sliding window next
-         * (cuts mid-run unpack thrash; weights after activation headroom). */
+        /* WS-first: warm 2 blocks; remaining H2D overlaps compute (U=1). */
         {
             unsigned win = h3_w4a8_cache_window_size(ctx->cache);
-            unsigned n_pref = n_blocks;
+            unsigned n_pref = 2;
             double unpack_ms = 0.0;
             clock_t tp0 = clock(), tp1;
             if (win > 0 && win < n_pref) n_pref = win;
+            if (n_pref > n_blocks) n_pref = n_blocks;
             if (!h3_dit_w4a8_prefetch(ctx, first_block, n_pref, &unpack_ms, error,
                                       error_size)) {
                 if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
@@ -4884,8 +6628,8 @@ int h3_dit_w4a8_layers_forward_f32(
             }
         for (b = 0; b < n_blocks; b++) {
             unsigned block = first_block + b;
-            const h3_cuda_w4a8_weight *w_qkv, *w_out, *w_fc1, *w_fc2;
-            unsigned win = h3_w4a8_cache_window_size(ctx->cache);
+            const h3_cuda_w4a8_weight *w_qkv = NULL, *w_out = NULL,
+                                        *w_fc1 = NULL, *w_fc2 = NULL;
             float *layer = d_aux_base + b * aux_stride;
             float *d_mod = layer;
             float *d_n1 = layer + mod_elems;
@@ -4893,55 +6637,29 @@ int h3_dit_w4a8_layers_forward_f32(
             float *d_qn = d_n2 + hidden;
             float *d_kn = d_qn + head_dim;
 
-            /* Early next-window prefetch: kick off at mid-window so unpack
-             * overlaps remaining layers on the default stream. */
-            if (win > 2 && b + 1 < n_blocks &&
-                ((b + 1) % win) == (win / 2)) {
-                unsigned next_start = ((b + 1) / win + 1) * win;
-                if (next_start < n_blocks) {
-                    unsigned n_pref = n_blocks - next_start;
-                    double ignore = 0.0;
-                    if (n_pref > win) n_pref = win;
-                    if (!h3_dit_w4a8_prefetch(ctx, first_block + next_start,
-                                              n_pref, &ignore, error,
-                                              error_size)) {
-                        if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                        goto done_dev;
-                    }
-                }
-            }
-            if (win > 0 && b + 1 < n_blocks && (b + 1) % win == 0) {
-                unsigned n_pref = n_blocks - (b + 1);
-                double ignore = 0.0;
-                if (n_pref > win) n_pref = win;
-                if (!h3_dit_w4a8_prefetch(ctx, block + 1, n_pref, &ignore,
-                                          error, error_size)) {
-                    if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                    goto done_dev;
-                }
-            } else if (b + 1 < n_blocks && win <= 1) {
-                double ignore = 0.0;
-                if (!h3_dit_w4a8_prefetch(ctx, block + 1, 1, &ignore, error,
-                                          error_size)) {
-                    if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
-                    goto done_dev;
-                }
-            }
-
-            w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error,
-                               error_size);
-            w_out = w_qkv ? get_weight(ctx, block, H3_W4A8_LINEAR_OUT, error,
-                                       error_size)
-                          : NULL;
-            w_fc1 = w_out ? get_weight(ctx, block, H3_W4A8_LINEAR_FC1, error,
-                                       error_size)
-                          : NULL;
-            w_fc2 = w_fc1 ? get_weight(ctx, block, H3_W4A8_LINEAR_FC2, error,
-                                       error_size)
-                          : NULL;
-            if (!w_fc2) {
+            /* Next-block H2D on the copy stream; GEMM wait_ready fences. */
+            if (!prefetch_next_u1(ctx, block + 1, first_block + n_blocks,
+                                  error, error_size)) {
                 if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
                 goto done_dev;
+            }
+
+            if (!ctx->nvfp4_on) {
+                w_qkv = get_weight(ctx, block, H3_W4A8_LINEAR_QKV, error,
+                                   error_size);
+                w_out = w_qkv ? get_weight(ctx, block, H3_W4A8_LINEAR_OUT,
+                                           error, error_size)
+                              : NULL;
+                w_fc1 = w_out ? get_weight(ctx, block, H3_W4A8_LINEAR_FC1,
+                                           error, error_size)
+                              : NULL;
+                w_fc2 = w_fc1 ? get_weight(ctx, block, H3_W4A8_LINEAR_FC2,
+                                           error, error_size)
+                              : NULL;
+                if (!w_fc2) {
+                    if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
+                    goto done_dev;
+                }
             }
 
             if (!block_device_compute(ctx, block, w_qkv, w_out, w_fc1, w_fc2, d_x, d_y,
@@ -4970,6 +6688,8 @@ int h3_dit_w4a8_layers_forward_f32(
             if (ev_c1) cudaEventDestroy(ev_c1);
         }
         if (want_quiet) h3_cuda_set_quiet(ctx->cuda, 0);
+    blocks_chain_done:
+        dit_lora_log_ms(ctx, stats);
         /* After loop, result is in d_x (swapped). */
         {
             cudaEvent_t ev_d0 = NULL, ev_d1 = NULL;
@@ -5091,8 +6811,11 @@ int h3_dit_w4a8_layers_forward_f32(
         }
     }
     dit_aux_log_disk_loads(ctx);
+    dit_lora_log_ms(ctx, stats);
     ok = 1;
 done:
+    if (ctx && ctx->lora_ev_n > 0)
+        ctx->lora_ev_n = 0;
     if (ok && ctx && ctx->cache) h3_w4a8_cache_freeze_window(ctx->cache);
     free(buf_a);
     free(buf_b);
@@ -5137,7 +6860,7 @@ static int refine_dense(h3_dit_w4a8 *ctx, const float *x, const float *weight,
 
 static int run_refiner_block_f32(h3_dit_w4a8 *ctx,
                                  const h3_dit_w4a8_refiner_block *rb,
-                                 float *hidden, size_t tokens, float *norm,
+                                 unsigned rbi, float *hidden, size_t tokens, float *norm,
                                  float *qkv, float *query, float *key,
                                  float *value, float *heads, float *branch,
                                  float *fc1, float *act, char *error,
@@ -5155,6 +6878,12 @@ static int run_refiner_block_f32(h3_dit_w4a8 *ctx,
     if (!refine_dense(ctx, norm, rb->qkv_w, NULL, tokens, inner * 3, hidden_w,
                       qkv, error, error_size))
         return 0;
+    if (ctx && ctx->lora && ctx->lora->n_refiner_pairs > 0 &&
+        rbi < (unsigned)H3_LORA_N_REFINER) {
+        if (!h3_lora_apply_f32(&ctx->lora->refiner[rbi].qkv, ctx->lora->scale,
+                               norm, qkv, tokens, error, error_size))
+            return 0;
+    }
     /* Comfy TokenRefiner Attention: contiguous QKV + Q/K RMS, no RoPE. */
     if (!h3_dit_w4a8_qkv_rope_f32(qkv, rb->q_norm, rb->k_norm, NULL, NULL,
                                   tokens, heads_n, head_dim, 0, eps, query,
@@ -5173,6 +6902,12 @@ static int run_refiner_block_f32(h3_dit_w4a8 *ctx,
     if (!refine_dense(ctx, heads, rb->out_w, NULL, tokens, hidden_w, inner,
                       branch, error, error_size))
         return 0;
+    if (ctx && ctx->lora && ctx->lora->n_refiner_pairs > 0 &&
+        rbi < (unsigned)H3_LORA_N_REFINER) {
+        if (!h3_lora_apply_f32(&ctx->lora->refiner[rbi].out, ctx->lora->scale,
+                               heads, branch, tokens, error, error_size))
+            return 0;
+    }
     n = tokens * hidden_w;
     for (i = 0; i < n; i++) hidden[i] += branch[i];
 
@@ -5180,6 +6915,12 @@ static int run_refiner_block_f32(h3_dit_w4a8 *ctx,
     if (!refine_dense(ctx, norm, rb->fc1_w, NULL, tokens, ffn * 2, hidden_w,
                       fc1, error, error_size))
         return 0;
+    if (ctx && ctx->lora && ctx->lora->n_refiner_pairs > 0 &&
+        rbi < (unsigned)H3_LORA_N_REFINER) {
+        if (!h3_lora_apply_f32(&ctx->lora->refiner[rbi].fc1, ctx->lora->scale,
+                               norm, fc1, tokens, error, error_size))
+            return 0;
+    }
     if (ctx && ctx->cuda) {
         if (!h3_cuda_swiglu_f32(ctx->cuda, fc1, tokens, ffn, act, &ignore,
                                 error, error_size))
@@ -5190,6 +6931,12 @@ static int run_refiner_block_f32(h3_dit_w4a8 *ctx,
     if (!refine_dense(ctx, act, rb->fc2_w, NULL, tokens, hidden_w, ffn, branch,
                       error, error_size))
         return 0;
+    if (ctx && ctx->lora && ctx->lora->n_refiner_pairs > 0 &&
+        rbi < (unsigned)H3_LORA_N_REFINER) {
+        if (!h3_lora_apply_f32(&ctx->lora->refiner[rbi].fc2, ctx->lora->scale,
+                               act, branch, tokens, error, error_size))
+            return 0;
+    }
     for (i = 0; i < n; i++) hidden[i] += branch[i];
     return 1;
 }
@@ -5235,7 +6982,7 @@ int h3_dit_w4a8_refine_text_f32(h3_dit_w4a8 *ctx, const h3_dit_w4a8_core *core,
     }
 
     for (bi = 0; bi < 2; bi++) {
-        if (!run_refiner_block_f32(ctx, &core->refiner[bi], text_hidden, tokens,
+        if (!run_refiner_block_f32(ctx, &core->refiner[bi], bi, text_hidden, tokens,
                                    norm, qkv, query, key, value, heads, branch,
                                    fc1, act, error, error_size))
             goto done;
@@ -5909,7 +7656,7 @@ int h3_dit_w4a8_forward_video_f32(
             layers_io_clear(ctx);
             goto done;
         }
-        if (stats) stats->layers_ms = lst.total_ms;
+        if (stats) copy_layer_stats(stats, &lst);
         d_final_x = ctx->io_d_result;
         if (!d_final_x) {
             layers_io_clear(ctx);
@@ -5949,7 +7696,7 @@ int h3_dit_w4a8_forward_video_f32(
                 full_pw, spatial_scale, auto_prefetch, 0, &lst, error,
                 error_size))
             goto done;
-        if (stats) stats->layers_ms = lst.total_ms;
+        if (stats) copy_layer_stats(stats, &lst);
 
         t0 = clock();
         if (!h3_dit_w4a8_final_video_cuda(
@@ -6218,7 +7965,7 @@ int h3_dit_w4a8_forward_avc_f32(
             layers_io_clear(ctx);
             goto done;
         }
-        if (stats) stats->layers_ms = lst.total_ms;
+        if (stats) copy_layer_stats(stats, &lst);
         d_final_x = ctx->io_d_result;
         if (!d_final_x) {
             layers_io_clear(ctx);
@@ -6274,7 +8021,7 @@ int h3_dit_w4a8_forward_avc_f32(
                 cos, sin, full_pt, full_ph, full_pw, spatial_scale,
                 auto_prefetch, 0, &lst, error, error_size))
             goto done;
-        if (stats) stats->layers_ms = lst.total_ms;
+        if (stats) copy_layer_stats(stats, &lst);
 
         t0 = clock();
         if (!h3_dit_w4a8_final_video_cuda(

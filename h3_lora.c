@@ -81,11 +81,23 @@ static const char *parse_suffix(const char *name) {
 }
 
 static int parse_ab(const char *name, int *is_a) {
+    const char *p;
     if (strstr(name, "lora_A") || strstr(name, "lora_down")) {
         *is_a = 1;
         return 1;
     }
     if (strstr(name, "lora_B") || strstr(name, "lora_up")) {
+        *is_a = 0;
+        return 1;
+    }
+    /* TaoMate: *.lora_a / *.lora_b — do not match lora_alpha. */
+    p = strstr(name, ".lora_a");
+    if (p && (p[7] == '\0' || p[7] == '.')) {
+        *is_a = 1;
+        return 1;
+    }
+    p = strstr(name, ".lora_b");
+    if (p && (p[7] == '\0' || p[7] == '.')) {
         *is_a = 0;
         return 1;
     }
@@ -111,6 +123,57 @@ int h3_lora_parse_name(const char *name, unsigned *block, const char **suffix,
         return lora_fail(err, err_size, "lora parse: token_refiner");
     if (!parse_ab(name, &ab))
         return lora_fail(err, err_size, "lora parse: not A/B");
+    if (!parse_block_index(name, &b))
+        return lora_fail(err, err_size, "lora parse: no block index");
+    suf = parse_suffix(name);
+    if (!suf)
+        return lora_fail(err, err_size, "lora parse: unknown linear suffix");
+    *block = b;
+    *suffix = suf;
+    *is_a = ab;
+    return 1;
+}
+
+int h3_lora_parse_tensor(const char *name, int *scope, unsigned *block,
+                         const char **suffix, int *is_a, char *err,
+                         size_t err_size) {
+    unsigned b = 0;
+    const char *suf;
+    int ab = 0;
+    const char *p;
+    char *end = NULL;
+    unsigned long v;
+
+    if (err && err_size)
+        err[0] = '\0';
+    if (!name || !scope || !block || !suffix || !is_a)
+        return lora_fail(err, err_size, "lora parse: null args");
+    *scope = H3_LORA_SCOPE_DIT;
+    if (h3_lora_name_is_vsa(name))
+        return lora_fail(err, err_size, "lora parse: vsa tensor");
+    if (!parse_ab(name, &ab))
+        return lora_fail(err, err_size, "lora parse: not A/B");
+    p = strstr(name, "token_refiner.blocks.");
+    if (p) {
+        p += strlen("token_refiner.blocks.");
+        if (!isdigit((unsigned char)*p))
+            return lora_fail(err, err_size, "lora parse: refiner index");
+        v = strtoul(p, &end, 10);
+        if (!end || (*end != '.' && *end != '_'))
+            return lora_fail(err, err_size, "lora parse: refiner index");
+        if (v >= (unsigned long)H3_LORA_N_REFINER)
+            return lora_fail(err, err_size, "lora parse: refiner index");
+        suf = parse_suffix(name);
+        if (!suf)
+            return lora_fail(err, err_size, "lora parse: unknown linear suffix");
+        *scope = H3_LORA_SCOPE_REFINER;
+        *block = (unsigned)v;
+        *suffix = suf;
+        *is_a = ab;
+        return 1;
+    }
+    if (strstr(name, "token_refiner"))
+        return lora_fail(err, err_size, "lora parse: token_refiner");
     if (!parse_block_index(name, &b))
         return lora_fail(err, err_size, "lora parse: no block index");
     suf = parse_suffix(name);
@@ -174,6 +237,16 @@ void h3_lora_free(h3_lora_set *set) {
         free(set->blocks[i].fc1.B);
         free(set->blocks[i].fc2.A);
         free(set->blocks[i].fc2.B);
+    }
+    for (i = 0; i < H3_LORA_N_REFINER; i++) {
+        free(set->refiner[i].qkv.A);
+        free(set->refiner[i].qkv.B);
+        free(set->refiner[i].out.A);
+        free(set->refiner[i].out.B);
+        free(set->refiner[i].fc1.A);
+        free(set->refiner[i].fc1.B);
+        free(set->refiner[i].fc2.A);
+        free(set->refiner[i].fc2.B);
     }
     memset(set, 0, sizeof(*set));
 }
@@ -242,9 +315,15 @@ static int assign_ab(h3_lora_pair *p, int is_a, float *data, const h3_st_tensor 
 
 int h3_lora_load(const char *path, float scale, h3_lora_set *out, char *err,
                  size_t err_size) {
+    return h3_lora_load_flags(path, scale, 0u, out, err, err_size);
+}
+
+int h3_lora_load_flags(const char *path, float scale, unsigned flags,
+                       h3_lora_set *out, char *err, size_t err_size) {
     h3_st_header hdr;
     size_t i;
     int complete = 0;
+    int want_refiner = (flags & H3_LORA_REQUIRE_REFINER) ? 1 : 0;
 
     if (err && err_size)
         err[0] = '\0';
@@ -273,6 +352,7 @@ int h3_lora_load(const char *path, float scale, h3_lora_set *out, char *err,
         unsigned block = 0;
         const char *suffix = NULL;
         int is_a = 0;
+        int scope = H3_LORA_SCOPE_DIT;
         char perr[192];
         float *data;
         size_t elems = 0;
@@ -286,13 +366,19 @@ int h3_lora_load(const char *path, float scale, h3_lora_set *out, char *err,
             fprintf(stderr, "h3_lora: ignore VSA tensor %s\n", t->name);
             continue;
         }
-        if (strstr(t->name, ".alpha") || strstr(t->name, "lora_magnitude"))
+        if (strstr(t->name, ".alpha") || strstr(t->name, "lora_magnitude") ||
+            strstr(t->name, "lora_alpha"))
             continue;
         perr[0] = '\0';
-        if (!h3_lora_parse_name(t->name, &block, &suffix, &is_a, perr,
-                                sizeof(perr))) {
+        if (!h3_lora_parse_tensor(t->name, &scope, &block, &suffix, &is_a, perr,
+                                  sizeof(perr))) {
             fprintf(stderr, "h3_lora: skip unrecognized %s (%s)\n", t->name,
                     perr);
+            continue;
+        }
+        if (scope == H3_LORA_SCOPE_REFINER && !want_refiner) {
+            fprintf(stderr, "h3_lora: skip token_refiner %s (not required)\n",
+                    t->name);
             continue;
         }
         data = h3_st_load_f32(&hdr, t->name, &elems, &dt, err, err_size);
@@ -301,7 +387,9 @@ int h3_lora_load(const char *path, float scale, h3_lora_set *out, char *err,
             h3_st_free_header(&hdr);
             return 0;
         }
-        pair = pair_for(&out->blocks[block], suffix);
+        pair = pair_for(scope == H3_LORA_SCOPE_REFINER ? &out->refiner[block]
+                                                       : &out->blocks[block],
+                        suffix);
         if (!assign_ab(pair, is_a, data, t, suffix, err, err_size)) {
             h3_lora_free(out);
             h3_st_free_header(&hdr);
@@ -332,6 +420,29 @@ int h3_lora_load(const char *path, float scale, h3_lora_set *out, char *err,
         }
     }
     out->n_pairs = complete;
+    if (want_refiner) {
+        int rcomplete = 0;
+        for (i = 0; i < H3_LORA_N_REFINER; i++) {
+            const h3_lora_block *b = &out->refiner[i];
+            const h3_lora_pair *ps[4];
+            int p;
+            ps[0] = &b->qkv;
+            ps[1] = &b->out;
+            ps[2] = &b->fc1;
+            ps[3] = &b->fc2;
+            for (p = 0; p < 4; p++) {
+                if (!ps[p]->A || !ps[p]->B || ps[p]->r < 1) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                             "lora 非金线：缺 token_refiner.blocks.%zu A/B", i);
+                    h3_lora_free(out);
+                    return lora_fail(err, err_size, buf);
+                }
+                rcomplete++;
+            }
+        }
+        out->n_refiner_pairs = rcomplete;
+    }
     return 1;
 }
 

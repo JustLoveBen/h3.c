@@ -26,6 +26,24 @@ int main(void) {
     expect(h3_lora_parse_name("token_refiner.blocks.0.attn.qkv_proj.lora_A.weight",
                               &b, &suf, &is_a, err, sizeof err) == 0,
            "token_refiner not dit block");
+    {
+        int scope = -1;
+        expect(h3_lora_parse_tensor(
+                   "blocks.3.attn.qkv_proj.lora_a", &scope, &b, &suf, &is_a, err,
+                   sizeof err) == 1,
+               "taomate lora_a");
+        expect(scope == H3_LORA_SCOPE_DIT && b == 3 && is_a == 1, "taomate A");
+        expect(h3_lora_parse_tensor(
+                   "token_refiner.blocks.1.mlp.fc2.lora_b", &scope, &b, &suf,
+                   &is_a, err, sizeof err) == 1,
+               "refiner lora_b");
+        expect(scope == H3_LORA_SCOPE_REFINER && b == 1 && is_a == 0 &&
+                   strcmp(suf, "fc2") == 0,
+               "refiner fields");
+        expect(h3_lora_parse_tensor("blocks.0.attn.qkv_proj.lora_alpha", &scope,
+                                    &b, &suf, &is_a, err, sizeof err) == 0,
+               "lora_alpha not A");
+    }
     expect(h3_lora_load("/no/such.safetensors", 1.0f, NULL, err, sizeof err) == 0,
            "missing file");
     expect(strstr(err, "非金线") != NULL || strstr(err, "cannot") != NULL,

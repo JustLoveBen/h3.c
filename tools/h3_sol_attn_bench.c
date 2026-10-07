@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     size_t seq = 15973, heads = 56, dim = 128;
     int warmup = 2, iters = 4, gaussian = 0, iarg;
     int device = 0;
+    int skip_sol = 0, skip_flash = 0;
     char error[512], be[64];
     h3_cuda *cuda = NULL;
     float *hq = NULL, *hk = NULL, *hv = NULL, *ho_ref = NULL, *ho_sol = NULL;
@@ -121,6 +122,10 @@ int main(int argc, char **argv) {
             iters = atoi(argv[++iarg]);
         else if (!strcmp(argv[iarg], "--gaussian"))
             gaussian = 1;
+        else if (!strcmp(argv[iarg], "--skip-sol"))
+            skip_sol = 1;
+        else if (!strcmp(argv[iarg], "--skip-flash"))
+            skip_flash = 1;
         else if (!strcmp(argv[iarg], "--device") && iarg + 1 < argc)
             device = atoi(argv[++iarg]);
         else {
@@ -171,9 +176,11 @@ int main(int argc, char **argv) {
         printf("cudnn  backend=%s  %.2f ms/iter\n", be, ms_cudnn);
     }
 
-    ok_sol = time_backend(cuda, "sol", dq, dk, dv, dout, seq, heads, dim, scale,
-                          warmup, iters, &ms_sol, be, sizeof(be), error,
-                          sizeof(error));
+    ok_sol = 0;
+    if (!skip_sol)
+        ok_sol = time_backend(cuda, "sol", dq, dk, dv, dout, seq, heads, dim, scale,
+                              warmup, iters, &ms_sol, be, sizeof(be), error,
+                              sizeof(error));
     if (ok_sol) {
         cudaMemcpy(ho_sol, dout, bytes, cudaMemcpyDeviceToHost);
         printf("sol    backend=%s  %.2f ms/iter  exact_frac=%.3f  rel_l2_vs_cudnn=%.4f\n",
@@ -181,9 +188,11 @@ int main(int argc, char **argv) {
                ok_cudnn ? rel_l2(ho_sol, ho_ref, elems) : -1.0);
     }
 
-    ok_flash = time_backend(cuda, "flash", dq, dk, dv, dout, seq, heads, dim,
-                            scale, 1, 1, &ms_flash, be, sizeof(be), error,
-                            sizeof(error));
+    ok_flash = 0;
+    if (!skip_flash)
+        ok_flash = time_backend(cuda, "flash", dq, dk, dv, dout, seq, heads, dim,
+                                scale, 1, 1, &ms_flash, be, sizeof(be), error,
+                                sizeof(error));
     if (ok_flash)
         printf("flash  backend=%s  %.2f ms (1 iter, context only)\n", be,
                ms_flash);
@@ -191,6 +200,12 @@ int main(int argc, char **argv) {
     printf("\n=== verdict ===\n");
     if (!ok_cudnn) {
         printf("cuDNN failed; abort.\n");
+        goto done;
+    }
+    if (skip_sol) {
+        printf("cudnn-only  %.2f ms/iter  (nested-loop sol skipped)\n",
+               ms_cudnn);
+        rc = 0;
         goto done;
     }
     if (!ok_sol) {

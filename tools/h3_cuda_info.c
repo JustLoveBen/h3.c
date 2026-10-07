@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* h3_gpu_cuda.cu.o pulls ConvRot Hadamard helpers; this probe never uses them. */
 float *h3_w4a8_hadamard_normalized(int size, char *error, size_t error_size) {
@@ -38,6 +39,32 @@ static void h3_cuda_print_version(const char *label, int version) {
     printf("%s: %d.%d\n", label, version / 1000, (version % 1000) / 10);
 }
 
+static void h3_cuda_print_env_path(const char *key) {
+    const char *v = getenv(key);
+    if (!v || !v[0]) {
+        printf("  %s: unset\n", key);
+        return;
+    }
+    printf("  %s: set path=%s exists=%d\n", key, v, access(v, F_OK) == 0);
+}
+
+static void h3_cuda_print_plugin_inventory(void) {
+    printf("plugin inventory (so presence ≠ kernel; see "
+           "tools/h3_sol_sage3_inventory.py):\n");
+    h3_cuda_print_env_path("H3_SAGE3_LIB");
+    h3_cuda_print_env_path("H3_SAGE3_ROOT");
+    h3_cuda_print_env_path("H3_SAGE3_TOOLS");
+    h3_cuda_print_env_path("H3_SOL_CUTE_LIB");
+    h3_cuda_print_env_path("H3_SOL_ATTN_ROOT");
+    h3_cuda_print_env_path("H3_SOL_CUTE_TOOLS");
+    h3_cuda_print_env_path("H3_TRITON_OVERLAY");
+    printf("  official CuTe names: cute_sm89 cute_sm90 cute_sm100 cute_sm120 "
+           "(5090=cute_sm120); triton=fake\n");
+    printf("  cute_sm120 official=%d triton official=%d\n",
+           h3_sdpa_sol_cute_is_official("cute_sm120"),
+           h3_sdpa_sol_cute_is_official("triton"));
+}
+
 int main(void) {
     char error[512];
     int count;
@@ -69,6 +96,7 @@ int main(void) {
                (req && req[0]) ? req : "auto", h3_sdpa_backend_id_name(id));
         printf("  resolve: %s\n", reason);
     }
+    h3_cuda_print_plugin_inventory();
     for (index = 0; index < count; index++) {
         h3_cuda_device_info info;
         h3_cuda_device_caps caps;

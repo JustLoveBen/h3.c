@@ -1,5 +1,6 @@
 #include "h3_ulysses_comm.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <stdio.h>
@@ -342,6 +343,22 @@ __global__ void ulysses_unpack_attn_f32(const float *in, float *out, int seq_loc
     }
 }
 
+__global__ void ulysses_f32_to_bf16(const float *in, __nv_bfloat16 *out,
+                                    size_t n) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (; idx < n; idx += stride)
+        out[idx] = __float2bfloat16(in[idx]);
+}
+
+__global__ void ulysses_bf16_to_f32(const __nv_bfloat16 *in, float *out,
+                                    size_t n) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (; idx < n; idx += stride)
+        out[idx] = __bfloat162float(in[idx]);
+}
+
 static void launch_n(size_t n, dim3 *grid, dim3 *block) {
     int t = 256;
     int g = (int)((n + (size_t)t - 1u) / (size_t)t);
@@ -391,19 +408,21 @@ static int publish_comm(h3_ulysses_comm_state *st, int r, char *err,
     return 1;
 }
 
-static int a2a_sendrecv(h3_ulysses_comm_state *st, size_t chunk, char *err,
-                        size_t err_size) {
+static int a2a_sendrecv(h3_ulysses_comm_state *st, size_t chunk, int dtype_bytes,
+                        char *err, size_t err_size) {
     int r, p;
+    size_t ebytes = (dtype_bytes == 2) ? 2u : 4u;
+    ncclDataType_t dt = (dtype_bytes == 2) ? ncclBfloat16 : ncclFloat32;
     if (ncclGroupStart() != ncclSuccess)
         return comm_fail(err, err_size, "ncclGroupStart");
     for (r = 0; r < st->n_dev; r++) {
         for (p = 0; p < st->n_dev; p++) {
-            char *s = (char *)st->pack[r] + p * chunk * sizeof(float);
-            char *d = (char *)st->unpack[r] + p * chunk * sizeof(float);
-            if (ncclSend(s, chunk, ncclFloat32, p, st->comms[r],
-                         st->streams[r]) != ncclSuccess ||
-                ncclRecv(d, chunk, ncclFloat32, p, st->comms[r],
-                         st->streams[r]) != ncclSuccess) {
+            char *s = (char *)st->pack[r] + p * chunk * ebytes;
+            char *d = (char *)st->unpack[r] + p * chunk * ebytes;
+            if (ncclSend(s, chunk, dt, p, st->comms[r], st->streams[r]) !=
+                    ncclSuccess ||
+                ncclRecv(d, chunk, dt, p, st->comms[r], st->streams[r]) !=
+                    ncclSuccess) {
                 ncclGroupEnd();
                 return comm_fail(err, err_size, "nccl send/recv a2a failed");
             }
@@ -416,10 +435,11 @@ static int a2a_sendrecv(h3_ulysses_comm_state *st, size_t chunk, char *err,
 
 /* U=2 only, and only when canAccessPeer+Enable succeeded both ways.
  * Destination-major pack: unpack[r][p] = pack[p][r]. */
-static int a2a_peer_u2(h3_ulysses_comm_state *st, size_t chunk, char *err,
-                       size_t err_size) {
+static int a2a_peer_u2(h3_ulysses_comm_state *st, size_t chunk, int dtype_bytes,
+                       char *err, size_t err_size) {
     int r, p;
-    size_t bytes = chunk * sizeof(float);
+    size_t ebytes = (dtype_bytes == 2) ? 2u : 4u;
+    size_t bytes = chunk * ebytes;
     for (r = 0; r < 2; r++) {
         if (cudaSetDevice(st->devs[r]) != cudaSuccess)
             return comm_fail(err, err_size, "ulysses peer: set device");
@@ -448,11 +468,11 @@ static int a2a_peer_u2(h3_ulysses_comm_state *st, size_t chunk, char *err,
     return 1;
 }
 
-static int a2a_exchange(h3_ulysses_comm_state *st, size_t chunk, char *err,
-                        size_t err_size) {
+static int a2a_exchange(h3_ulysses_comm_state *st, size_t chunk, int dtype_bytes,
+                        char *err, size_t err_size) {
     if (st->peer_a2a)
-        return a2a_peer_u2(st, chunk, err, err_size);
-    return a2a_sendrecv(st, chunk, err, err_size);
+        return a2a_peer_u2(st, chunk, dtype_bytes, err, err_size);
+    return a2a_sendrecv(st, chunk, dtype_bytes, err, err_size);
 }
 
 int h3_ulysses_a2a_qkv(h3_ulysses_cfg *cfg, const void *d_in, void *d_out,
@@ -465,8 +485,8 @@ int h3_ulysses_a2a_qkv(h3_ulysses_cfg *cfg, const void *d_in, void *d_out,
 
     if (!cfg || !cfg->comm)
         return comm_fail(err, err_size, "ulysses a2a_qkv: not inited");
-    if (dtype_bytes != 4)
-        return comm_fail(err, err_size, "ulysses a2a_qkv: only f32 in P1");
+    if (dtype_bytes != 4 && dtype_bytes != 2)
+        return comm_fail(err, err_size, "ulysses a2a_qkv: dtype_bytes 2 or 4");
     st = (h3_ulysses_comm_state *)cfg->comm;
     u = st->n_dev;
     if (u < 2 || heads % (size_t)u != 0)
@@ -495,14 +515,27 @@ int h3_ulysses_a2a_qkv(h3_ulysses_cfg *cfg, const void *d_in, void *d_out,
         ulysses_pack_qkv_f32<<<grid, block, 0, st->streams[r]>>>(
             (const float *)st->bound_in[r], (float *)st->pack[r],
             (int)seq_local, (int)heads, (int)head_dim, u);
+        if (dtype_bytes == 2)
+            ulysses_f32_to_bf16<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->pack[r], (__nv_bfloat16 *)st->pack[r],
+                elems);
     }
-    if (!a2a_exchange(st, chunk, err, err_size))
+    if (!a2a_exchange(st, chunk, dtype_bytes, err, err_size))
         return 0;
     for (r = 0; r < u; r++) {
         cudaSetDevice(st->devs[r]);
-        ulysses_unpack_qkv_f32<<<grid, block, 0, st->streams[r]>>>(
-            (const float *)st->unpack[r], (float *)st->bound_out[r],
-            (int)seq_local, (int)heads, (int)head_dim, u);
+        if (dtype_bytes == 2) {
+            ulysses_bf16_to_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const __nv_bfloat16 *)st->unpack[r], (float *)st->pack[r],
+                elems);
+            ulysses_unpack_qkv_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->pack[r], (float *)st->bound_out[r],
+                (int)seq_local, (int)heads, (int)head_dim, u);
+        } else {
+            ulysses_unpack_qkv_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->unpack[r], (float *)st->bound_out[r],
+                (int)seq_local, (int)heads, (int)head_dim, u);
+        }
         if (!publish_comm(st, r, err, err_size))
             return 0;
     }
@@ -521,8 +554,8 @@ int h3_ulysses_a2a_attn_out(h3_ulysses_cfg *cfg, const void *d_in, void *d_out,
 
     if (!cfg || !cfg->comm)
         return comm_fail(err, err_size, "ulysses a2a_attn: not inited");
-    if (dtype_bytes != 4)
-        return comm_fail(err, err_size, "ulysses a2a_attn: only f32 in P1");
+    if (dtype_bytes != 4 && dtype_bytes != 2)
+        return comm_fail(err, err_size, "ulysses a2a_attn: dtype_bytes 2 or 4");
     st = (h3_ulysses_comm_state *)cfg->comm;
     u = st->n_dev;
     if (d_in && d_out && cfg->rank >= 0 && cfg->rank < u) {
@@ -548,14 +581,27 @@ int h3_ulysses_a2a_attn_out(h3_ulysses_cfg *cfg, const void *d_in, void *d_out,
         ulysses_pack_attn_f32<<<grid, block, 0, st->streams[r]>>>(
             (const float *)st->bound_in[r], (float *)st->pack[r],
             (int)seq_local, (int)h_local, (int)head_dim, u);
+        if (dtype_bytes == 2)
+            ulysses_f32_to_bf16<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->pack[r], (__nv_bfloat16 *)st->pack[r],
+                elems);
     }
-    if (!a2a_exchange(st, chunk, err, err_size))
+    if (!a2a_exchange(st, chunk, dtype_bytes, err, err_size))
         return 0;
     for (r = 0; r < u; r++) {
         cudaSetDevice(st->devs[r]);
-        ulysses_unpack_attn_f32<<<grid, block, 0, st->streams[r]>>>(
-            (const float *)st->unpack[r], (float *)st->bound_out[r],
-            (int)seq_local, (int)heads, (int)head_dim, u);
+        if (dtype_bytes == 2) {
+            ulysses_bf16_to_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const __nv_bfloat16 *)st->unpack[r], (float *)st->pack[r],
+                elems);
+            ulysses_unpack_attn_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->pack[r], (float *)st->bound_out[r],
+                (int)seq_local, (int)heads, (int)head_dim, u);
+        } else {
+            ulysses_unpack_attn_f32<<<grid, block, 0, st->streams[r]>>>(
+                (const float *)st->unpack[r], (float *)st->bound_out[r],
+                (int)seq_local, (int)heads, (int)head_dim, u);
+        }
         if (!publish_comm(st, r, err, err_size))
             return 0;
     }

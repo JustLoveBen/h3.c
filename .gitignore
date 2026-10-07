@@ -35,3 +35,11 @@ libh3.a
 h3_*_probe
 h3_st_inventory
 tmp_*
+
+# Isolated accel-survey clones (do not commit trees or weights).
+third_party/accel_survey/vdn-minimax-h3/
+third_party/accel_survey/MiniMax-H3-MultiGPU-Lightning/
+third_party/accel_survey/FastVideo/
+third_party/accel_survey/comfyui-SelfLift/
+third_party/accel_survey/FreeToken/
+third_party/accel_survey/TaoMate-H3/

@@ -24,6 +24,11 @@ static double elapsed_ms(clock_t t0, clock_t t1) {
     return 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
 }
 
+static int env_flag_is_one(const char *name) {
+    const char *e = getenv(name);
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 int h3_vae_int8_store_copy(const h3_vae_int8_store *store, size_t file_offset,
                            void *dst, size_t nbytes, char *error,
                            size_t error_size) {
@@ -227,45 +232,185 @@ int h3_vae_int8_load_latent_stats(const h3_vae_int8_store *store,
     return 1;
 }
 
-int h3_vae_int8_prepare_rope(int t_len, int latent_h, int latent_w,
-                             size_t n_patches, size_t seq, float *cos,
-                             float *sin, char *error, size_t error_size) {
+/* Phase-A profile counters (RoPE table build). Zero-cost unless env var set. */
+static double g_vae_rope_profile_ms = 0.0;
+static unsigned long g_vae_rope_profile_calls = 0;
+
+void h3_vae_int8_rope_profile_get(double *ms, unsigned long *calls) {
+    if (ms) *ms = g_vae_rope_profile_ms;
+    if (calls) *calls = g_vae_rope_profile_calls;
+}
+
+void h3_vae_int8_rope_profile_reset(void) {
+    g_vae_rope_profile_ms = 0.0;
+    g_vae_rope_profile_calls = 0;
+}
+
+/* Per-shape memo cache for VAE RoPE tables.
+ * Key = (t_len, latent_h, latent_w, origin_h, origin_w, full_h, full_w, seq).
+ * Value = precomputed cos/sin table [seq, ROPE_HALF].
+ * Grow-only, process-lifetime. */
+typedef struct {
+    int t_len, latent_h, latent_w, origin_h, origin_w, full_h, full_w;
+    size_t seq;
+    float *cos_table;
+    float *sin_table;
+} vae_rope_memo_entry;
+
+static vae_rope_memo_entry *g_vae_rope_memo = NULL;
+static size_t g_vae_rope_memo_n = 0;
+static size_t g_vae_rope_memo_cap = 0;
+
+static int vae_rope_memo_grow(size_t need, char *error, size_t error_size) {
+    if (need <= g_vae_rope_memo_cap) return 1;
+    size_t new_cap = g_vae_rope_memo_cap ? g_vae_rope_memo_cap * 2 : 8;
+    if (new_cap < need) new_cap = need;
+    vae_rope_memo_entry *n = (vae_rope_memo_entry *)realloc(
+        g_vae_rope_memo, new_cap * sizeof(vae_rope_memo_entry));
+    if (!n) {
+        fail(error, error_size, "OOM vae rope memo grow");
+        return 0;
+    }
+    g_vae_rope_memo = n;
+    g_vae_rope_memo_cap = new_cap;
+    return 1;
+}
+
+static vae_rope_memo_entry *vae_rope_memo_find(int t_len, int latent_h,
+                                                int latent_w, int origin_h,
+                                                int origin_w, int full_h,
+                                                int full_w, size_t seq) {
+    size_t i;
+    for (i = 0; i < g_vae_rope_memo_n; i++) {
+        vae_rope_memo_entry *e = &g_vae_rope_memo[i];
+        if (e->t_len == t_len && e->latent_h == latent_h &&
+            e->latent_w == latent_w && e->origin_h == origin_h &&
+            e->origin_w == origin_w && e->full_h == full_h &&
+            e->full_w == full_w && e->seq == seq)
+            return e;
+    }
+    return NULL;
+}
+
+static vae_rope_memo_entry *vae_rope_memo_alloc(
+    int t_len, int latent_h, int latent_w, int origin_h, int origin_w,
+    int full_h, int full_w, size_t seq, char *error, size_t error_size) {
+    if (!vae_rope_memo_grow(g_vae_rope_memo_n + 1, error, error_size))
+        return NULL;
+    vae_rope_memo_entry *e = &g_vae_rope_memo[g_vae_rope_memo_n];
+    e->t_len = t_len;
+    e->latent_h = latent_h;
+    e->latent_w = latent_w;
+    e->origin_h = origin_h;
+    e->origin_w = origin_w;
+    e->full_h = full_h;
+    e->full_w = full_w;
+    e->seq = seq;
+    e->cos_table = (float *)malloc(seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+    e->sin_table = (float *)malloc(seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+    if (!e->cos_table || !e->sin_table) {
+        free(e->cos_table);
+        free(e->sin_table);
+        fail(error, error_size, "OOM vae rope memo table");
+        return NULL;
+    }
+    g_vae_rope_memo_n++;
+    return e;
+}
+
+static void vae_rope_memo_free_all(void) {
+    size_t i;
+    for (i = 0; i < g_vae_rope_memo_n; i++) {
+        free(g_vae_rope_memo[i].cos_table);
+        free(g_vae_rope_memo[i].sin_table);
+    }
+    free(g_vae_rope_memo);
+    g_vae_rope_memo = NULL;
+    g_vae_rope_memo_n = 0;
+    g_vae_rope_memo_cap = 0;
+}
+
+int h3_vae_int8_prepare_rope_ex(int t_len, int latent_h, int latent_w,
+                                int origin_h, int origin_w, int full_h,
+                                int full_w, size_t n_patches, size_t seq,
+                                float *cos, float *sin, char *error,
+                                size_t error_size) {
     size_t row = 0;
     int t, h, w;
     size_t index;
+    int denom_h, denom_w;
+    clock_t t0 = 0, t1 = 0;
+    const int profile = env_flag_is_one("H3_ROPE_PROFILE");
+    vae_rope_memo_entry *memo = NULL;
+    if (profile) t0 = clock();
     if (!cos || !sin || t_len < 1 || latent_h < 1 || latent_w < 1 ||
-        seq < n_patches ||
+        origin_h < 0 || origin_w < 0 || seq < n_patches ||
         n_patches != (size_t)t_len * (size_t)latent_h * (size_t)latent_w) {
         fail(error, error_size, "invalid prepare_rope args");
         return 0;
     }
-    for (t = 0; t < t_len; t++)
-        for (h = 0; h < latent_h; h++)
-            for (w = 0; w < latent_w; w++, row++) {
-                float axes[3] = {
-                    2.0f * (((float)t + 0.5f) / (float)t_len) - 1.0f,
-                    2.0f * (((float)h + 0.5f) / (float)latent_h) - 1.0f,
-                    2.0f * (((float)w + 0.5f) / (float)latent_w) - 1.0f};
-                unsigned axis, frequency;
-                for (axis = 0; axis < 3; axis++)
-                    for (frequency = 0; frequency < 8; frequency++) {
-                        float inverse =
-                            1.0f / powf(100.0f, (float)frequency * 0.125f);
-                        float angle = 2.0f * 3.14159265358979323846f *
-                                      axes[axis] * inverse;
-                        size_t offset = row * H3_VAE_INT8_ROPE_HALF +
-                                        (size_t)axis * 8 + frequency;
-                        cos[offset] = cosf(angle);
-                        sin[offset] = sinf(angle);
-                    }
+    denom_h = full_h > 0 ? full_h : latent_h;
+    denom_w = full_w > 0 ? full_w : latent_w;
+    if (origin_h + latent_h > denom_h || origin_w + latent_w > denom_w) {
+        fail(error, error_size, "prepare_rope tile exceeds canvas");
+        return 0;
+    }
+    memo = vae_rope_memo_find(t_len, latent_h, latent_w, origin_h, origin_w,
+                              full_h, full_w, seq);
+    if (!memo) {
+        memo = vae_rope_memo_alloc(t_len, latent_h, latent_w, origin_h,
+                                   origin_w, full_h, full_w, seq, error,
+                                   error_size);
+        if (!memo) return 0;
+        for (t = 0; t < t_len; t++)
+            for (h = 0; h < latent_h; h++)
+                for (w = 0; w < latent_w; w++, row++) {
+                    float axes[3] = {
+                        2.0f * (((float)t + 0.5f) / (float)t_len) - 1.0f,
+                        2.0f *
+                            (((float)(h + origin_h) + 0.5f) / (float)denom_h) -
+                            1.0f,
+                        2.0f *
+                            (((float)(w + origin_w) + 0.5f) / (float)denom_w) -
+                            1.0f};
+                    unsigned axis, frequency;
+                    for (axis = 0; axis < 3; axis++)
+                        for (frequency = 0; frequency < 8; frequency++) {
+                            float inverse =
+                                1.0f /
+                                powf(100.0f, (float)frequency * 0.125f);
+                            float angle = 2.0f * 3.14159265358979323846f *
+                                          axes[axis] * inverse;
+                            size_t offset = row * H3_VAE_INT8_ROPE_HALF +
+                                            (size_t)axis * 8 + frequency;
+                            memo->cos_table[offset] = cosf(angle);
+                            memo->sin_table[offset] = sinf(angle);
+                        }
+                }
+        for (; row < seq; row++) {
+            for (index = 0; index < H3_VAE_INT8_ROPE_HALF; index++) {
+                memo->cos_table[row * H3_VAE_INT8_ROPE_HALF + index] = 1.0f;
+                memo->sin_table[row * H3_VAE_INT8_ROPE_HALF + index] = 0.0f;
             }
-    for (; row < seq; row++) {
-        for (index = 0; index < H3_VAE_INT8_ROPE_HALF; index++) {
-            cos[row * H3_VAE_INT8_ROPE_HALF + index] = 1.0f;
-            sin[row * H3_VAE_INT8_ROPE_HALF + index] = 0.0f;
         }
     }
+    memcpy(cos, memo->cos_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+    memcpy(sin, memo->sin_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+    if (profile) {
+        t1 = clock();
+        g_vae_rope_profile_ms +=
+            1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+        g_vae_rope_profile_calls++;
+    }
     return 1;
+}
+
+int h3_vae_int8_prepare_rope(int t_len, int latent_h, int latent_w,
+                             size_t n_patches, size_t seq, float *cos,
+                             float *sin, char *error, size_t error_size) {
+    return h3_vae_int8_prepare_rope_ex(t_len, latent_h, latent_w, 0, 0,
+                                       latent_h, latent_w, n_patches, seq, cos,
+                                       sin, error, error_size);
 }
 
 /* Video VAE RoPE: Metal half-split (d ↔ d+rope_half), matching
@@ -437,6 +582,55 @@ int h3_vae_int8_store_open(const char *path, h3_vae_int8_store *store,
     return 1;
 }
 
+int h3_vae_int8_weight_cache_wanted(void) {
+    const char *e = getenv("H3_VAE_WEIGHT_CACHE");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
+}
+
+int h3_vae_int8_tile_batch_want(void) {
+    const char *e = getenv("H3_VAE_TILE_BATCH");
+    int n = 4;
+    if (e && e[0]) n = (int)strtol(e, NULL, 10);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    return n;
+}
+
+int h3_vae_int8_repeat_release_mode(void) {
+    const char *e = getenv("H3_VAE_REPEAT_RELEASE");
+    /* keep = DiT+VAE W together; 480P clip2 OOM on INT8 upload. Default
+     * device drop; hot load overlaps last NFE via vae_prewarm. */
+    if (!e || !e[0]) return H3_VAE_REPEAT_DEVICE;
+    if (e[0] == 'k' || e[0] == 'K') return H3_VAE_REPEAT_KEEP;
+    if (e[0] == 'f' || e[0] == 'F') return H3_VAE_REPEAT_FULL;
+    return H3_VAE_REPEAT_DEVICE;
+}
+
+int h3_vae_int8_gemm_f16_direct(void) {
+    const char *e = getenv("H3_VAE_GEMM_F16_DIRECT");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
+}
+
+int h3_vae_int8_fused_epilogue(void) {
+    const char *e = getenv("H3_VAE_FUSED_EPILOGUE");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
+}
+
+int h3_vae_int8_act_f16(void) {
+    const char *e = getenv("H3_VAE_ACT_F16");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
+}
+
+int h3_vae_int8_cuda_graph_wanted(void) {
+    const char *e = getenv("H3_VAE_CUDA_GRAPH");
+    if (e && e[0] == '1' && e[1] == '\0') return 1;
+    return 0;
+}
+
 void h3_vae_int8_store_free(h3_vae_int8_store *store) {
     if (!store) return;
     if (store->map && store->map_len) {
@@ -451,6 +645,7 @@ void h3_vae_int8_store_free(h3_vae_int8_store *store) {
     h3_st_free_header(&store->header);
     memset(store, 0, sizeof(*store));
     store->map_fd = -1;
+    vae_rope_memo_free_all();
 }
 
 int h3_vae_int8_find_linear(const h3_vae_int8_store *store, const char *base,
@@ -700,6 +895,72 @@ float *h3_vae_int8_unpack_dit_latent_f32(const float *packed, int latent_t,
     return chw;
 }
 
+int h3_vae_int8_pack_dit_latent_f32(const float *chw, int latent_t,
+                                    int latent_h, int latent_w, float *out,
+                                    char *error, size_t error_size) {
+    int t, c;
+    if (!chw || !out || latent_t < 1 || latent_h < 2 || latent_w < 2 ||
+        (latent_h % 2) || (latent_w % 2)) {
+        fail(error, error_size, "invalid pack_dit_latent dims");
+        return 0;
+    }
+    for (t = 0; t < latent_t; t++) {
+        int th = latent_h / 2, tw = latent_w / 2;
+        int yh, xw;
+        for (yh = 0; yh < th; yh++)
+            for (xw = 0; xw < tw; xw++) {
+                size_t tok =
+                    ((size_t)t * (size_t)th + (size_t)yh) * (size_t)tw +
+                    (size_t)xw;
+                float *dst = out + tok * 96;
+                int dy, dx;
+                size_t idx = 0;
+                for (c = 0; c < H3_VAE_INT8_LATENT_CH; c++)
+                    for (dy = 0; dy < 2; dy++)
+                        for (dx = 0; dx < 2; dx++, idx++) {
+                            int hh = yh * 2 + dy;
+                            int ww = xw * 2 + dx;
+                            size_t src =
+                                (((size_t)c * (size_t)latent_t + (size_t)t) *
+                                     (size_t)latent_h +
+                                 (size_t)hh) *
+                                    (size_t)latent_w +
+                                (size_t)ww;
+                            dst[idx] = chw[src];
+                        }
+            }
+    }
+    return 1;
+}
+
+void h3_vae_int8_denorm_vec_f32(float *x,
+                                const float mean[H3_VAE_INT8_LATENT_CH],
+                                const float std_[H3_VAE_INT8_LATENT_CH],
+                                size_t n) {
+    size_t c;
+    if (!x || !mean || !std_) return;
+    if (n > (size_t)H3_VAE_INT8_LATENT_CH) n = (size_t)H3_VAE_INT8_LATENT_CH;
+    for (c = 0; c < n; c++)
+        x[c] = x[c] * std_[c] + mean[c];
+}
+
+void h3_vae_int8_denorm_latent_chw(float *chw, int latent_t, int latent_h,
+                                   int latent_w,
+                                   const float mean[H3_VAE_INT8_LATENT_CH],
+                                   const float std_[H3_VAE_INT8_LATENT_CH]) {
+    size_t spat, c, i;
+    if (!chw || !mean || !std_ || latent_t < 1 || latent_h < 1 ||
+        latent_w < 1)
+        return;
+    spat = (size_t)latent_t * (size_t)latent_h * (size_t)latent_w;
+    for (c = 0; c < (size_t)H3_VAE_INT8_LATENT_CH; c++) {
+        float *p = chw + c * spat;
+        float m = mean[c], s = std_[c];
+        for (i = 0; i < spat; i++)
+            p[i] = p[i] * s + m;
+    }
+}
+
 static int run_block(const h3_vae_int8_store *store, unsigned block,
                      float *seq_h, size_t seq, const float *rope_cos,
                      const float *rope_sin, char *error, size_t error_size) {
@@ -905,8 +1166,10 @@ int h3_vae_int8_decode_f32(const h3_vae_int8_store *store,
                         ((c * (size_t)latent_t + t) * (size_t)latent_h + h) *
                             (size_t)latent_w +
                         w;
-                    x[c] = latent_chw[src] * latent_std[c] + latent_mean[c];
+                    x[c] = latent_chw[src];
                 }
+                h3_vae_int8_denorm_vec_f32(x, latent_mean, latent_std,
+                                           H3_VAE_INT8_LATENT_CH);
                 for (c = 0; c < H3_VAE_INT8_LATENT_CH; c++) {
                     const float *wr =
                         post_w + c * H3_VAE_INT8_LATENT_CH;
@@ -1115,9 +1378,27 @@ void h3_vae_int8_deblock16_rgb(float *rgb, int frames, int height, int width) {
     }
 }
 
+/* rgb free hook: GPU unpatch path pins rgb via cudaHostAlloc and must release
+ * it with cudaFreeHost, but this host file does not link CUDA directly. The
+ * CUDA side registers its free fn once; NULL means plain free (host path). */
+static void (*g_vae_rgb_host_free_fn)(void *) = NULL;
+void h3_vae_int8_set_rgb_host_free(void (*fn)(void *)) {
+    g_vae_rgb_host_free_fn = fn;
+}
+
 void h3_vae_int8_frames_free(h3_vae_int8_frames *frames) {
     if (!frames) return;
-    free(frames->rgb);
+    /* Only ==1 is a true cudaHostAlloc buffer; route it to the host_free fn
+     * (cudaFreeHost). ==0 is the plain-malloc fallback and ==2 is a pinned
+     * pool slot already released by the consumer (rgb is NULL by then) — both
+     * take plain free(). Routing ==0 through cudaFreeHost latches
+     * cudaErrorInvalidValue into the CUDA error state, which surfaces as a
+     * spurious kernel failure at the next non-quiet cudaGetLastError (the hot
+     * clip-2 DiT step-0 crash). */
+    if (frames->rgb && frames->rgb_pinned == 1 && g_vae_rgb_host_free_fn)
+        g_vae_rgb_host_free_fn(frames->rgb);
+    else
+        free(frames->rgb);
     memset(frames, 0, sizeof(*frames));
 }
 

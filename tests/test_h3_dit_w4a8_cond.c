@@ -584,6 +584,76 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         return 1;
     }
+    unsetenv("H3_DIT_ACT_F16");
+    if (!h3_dit_w4a8_act_f16()) {
+        fprintf(stderr, "error: act_f16 default should be on (AdaLN prescale)\n");
+        return 1;
+    }
+    setenv("H3_DIT_ACT_F16", "0", 1);
+    if (h3_dit_w4a8_act_f16()) {
+        fprintf(stderr, "error: H3_DIT_ACT_F16=0 should disable\n");
+        return 1;
+    }
+    setenv("H3_DIT_ACT_F16", "1", 1);
+    if (!h3_dit_w4a8_act_f16()) {
+        fprintf(stderr, "error: H3_DIT_ACT_F16=1 should enable\n");
+        return 1;
+    }
+    unsetenv("H3_DIT_ACT_F16");
+    puts("ok: H3_DIT_ACT_F16 default on / 0 disables");
+    unsetenv("H3_DIT_FUSED_EPILOGUE");
+    if (!h3_dit_w4a8_fused_epilogue()) {
+        fprintf(stderr, "error: fused epi default should be on\n");
+        return 1;
+    }
+    setenv("H3_DIT_FUSED_EPILOGUE", "0", 1);
+    if (h3_dit_w4a8_fused_epilogue()) {
+        fprintf(stderr, "error: H3_DIT_FUSED_EPILOGUE=0 should disable\n");
+        return 1;
+    }
+    setenv("H3_DIT_FUSED_EPILOGUE", "1", 1);
+    if (!h3_dit_w4a8_fused_epilogue()) {
+        fprintf(stderr, "error: H3_DIT_FUSED_EPILOGUE=1 should enable\n");
+        return 1;
+    }
+    unsetenv("H3_DIT_FUSED_EPILOGUE");
+    puts("ok: H3_DIT_FUSED_EPILOGUE default on / 0 disables");
+    unsetenv("H3_DIT_LORA_F16");
+    if (h3_dit_w4a8_lora_f16()) {
+        fprintf(stderr, "error: lora f16 default should be off (mixed n=64)\n");
+        return 1;
+    }
+    setenv("H3_DIT_LORA_F16", "1", 1);
+    if (!h3_dit_w4a8_lora_f16()) {
+        fprintf(stderr, "error: H3_DIT_LORA_F16=1 should enable\n");
+        return 1;
+    }
+    unsetenv("H3_DIT_LORA_F16");
+    puts("ok: H3_DIT_LORA_F16 default off / 1 enables");
+    unsetenv("H3_DIT_LORA_TF32");
+    if (h3_dit_w4a8_lora_tf32()) {
+        fprintf(stderr, "error: lora tf32 default should be off (clip1 NaN)\n");
+        return 1;
+    }
+    setenv("H3_DIT_LORA_TF32", "1", 1);
+    if (!h3_dit_w4a8_lora_tf32()) {
+        fprintf(stderr, "error: H3_DIT_LORA_TF32=1 should enable\n");
+        return 1;
+    }
+    unsetenv("H3_DIT_LORA_TF32");
+    puts("ok: H3_DIT_LORA_TF32 default off / 1 enables");
+    unsetenv("H3_DIT_LORA_OVERLAP");
+    if (h3_dit_w4a8_lora_overlap()) {
+        fprintf(stderr, "error: lora overlap default should be off (hot waffle)\n");
+        return 1;
+    }
+    setenv("H3_DIT_LORA_OVERLAP", "1", 1);
+    if (!h3_dit_w4a8_lora_overlap()) {
+        fprintf(stderr, "error: H3_DIT_LORA_OVERLAP=1 should enable\n");
+        return 1;
+    }
+    unsetenv("H3_DIT_LORA_OVERLAP");
+    puts("ok: H3_DIT_LORA_OVERLAP default off / 1 enables");
     if (!dit_path) {
         fprintf(stderr, "usage: %s DIT_INT8.safetensors\n", argv[0]);
         return 2;

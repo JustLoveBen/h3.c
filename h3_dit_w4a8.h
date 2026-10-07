@@ -3,6 +3,7 @@
 
 #include "h3_gpu_cuda.h"
 #include "h3_lora.h"
+#include "h3_nvfp4.h"
 #include "h3_w4a8.h"
 #include "h3_w4a8_cache.h"
 #include "h3_w4a8_dequant.h"
@@ -171,12 +172,18 @@ typedef struct {
     double d2h_ms;           /* y D2H */
     double prefetch_wait_ms; /* 侧流 unpack 空等粗估（0=未测） */
     double gemm_ms_sum;
+    double lora_ms; /* GPU LoRA GEMM wall (already-scaled delta), 0=unmeasured */
     int all_finite;
 } h3_dit_w4a8_layers_stats;
 
 typedef struct {
     double patch_ms;
     double layers_ms;
+    double layers_prefetch_ms;
+    double layers_h2d_ms;
+    double layers_compute_ms;
+    double layers_d2h_ms;
+    double layers_prefetch_wait_ms;
     double final_ms;
     double total_ms;
     unsigned first_block;
@@ -199,13 +206,37 @@ h3_dit_w4a8 *h3_dit_w4a8_open(h3_cuda *cuda, h3_w4a8_store *store,
 h3_dit_w4a8 *h3_dit_w4a8_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
                                    const h3_w4a8_cache_config *cfg, char *error,
                                    size_t error_size);
+/* Community NVFP4 DiT (dequant→INT8 GEMM). Not gold. ConvRot off. */
+h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
+                                    const h3_w4a8_cache_config *cfg,
+                                    char *error, size_t error_size);
+int h3_dit_w4a8_load_core_nvfp4(const h3_nvfp4_store *store,
+                                h3_dit_w4a8_core *core, char *error,
+                                size_t error_size);
 void h3_dit_w4a8_free(h3_dit_w4a8 *ctx);
 
 h3_w4a8_cache *h3_dit_w4a8_cache(h3_dit_w4a8 *ctx);
+void h3_dit_w4a8_release_block_workspace(h3_dit_w4a8 *ctx);
+/* SelfLift hires: allocate fwd-act + all-aux block WS for `seq` BEFORE
+ * refitting INT8. Matches layers_forward resident need (ext act). */
+int h3_dit_w4a8_pregrow_layers_ws(h3_dit_w4a8 *ctx, size_t seq,
+                                  unsigned n_blocks, char *error,
+                                  size_t error_size);
 h3_cuda *h3_dit_w4a8_cuda(h3_dit_w4a8 *ctx);
 const h3_w4a8_store *h3_dit_w4a8_store(const h3_dit_w4a8 *ctx);
 int h3_dit_w4a8_convrot_groupsize(const h3_dit_w4a8 *ctx);
 int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx);
+/* DiT INT8 act ConvRot in F16. Default ON after AdaLN-range prescale
+ * (5090 KPI-B finite). Rollback = H3_DIT_ACT_F16=0. */
+int h3_dit_w4a8_act_f16(void);
+/* Fuse post-GEMM gate/AdaLN/SwiGLU. Default ON. Rollback = H3_DIT_FUSED_EPILOGUE=0. */
+int h3_dit_w4a8_fused_epilogue(void);
+/* LoRA A/B as F16 + mixed GEMM. Opt-in H3_DIT_LORA_F16=1 (cuBLAS mixed n=64 不支持). */
+int h3_dit_w4a8_lora_f16(void);
+/* LoRA F32 GEMM TF32. Opt-in H3_DIT_LORA_TF32=1 (KPI-B clip1 NaN, 不进产品). */
+int h3_dit_w4a8_lora_tf32(void);
+/* LoRA GEMM on side stream overlapping INT8. Opt-in H3_DIT_LORA_OVERLAP=1 (hot waffle). */
+int h3_dit_w4a8_lora_overlap(void);
 
 /* Metal --token-reduction: pair horizontal video tokens in middle blocks.
  * Default off. Env: H3_TOKEN_REDUCTION_BLOCKS=BEGIN:END,
@@ -213,6 +244,20 @@ int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx);
 void h3_dit_w4a8_set_token_reduction(h3_dit_w4a8 *ctx, int enabled);
 int h3_dit_w4a8_token_reduction_enabled(const h3_dit_w4a8 *ctx);
 void h3_dit_w4a8_set_denoise_step(h3_dit_w4a8 *ctx, int step);
+
+/* TaoMate layer-wise clean AV KV: Q stays current packed seq; K/V grow only
+ * at SDPA. max_tokens is the resident hist cap (sink+recent), not full clip.
+ * mode: 0=off, 1=noisy (read hist), 2=commit (read + stage selected rows). */
+int h3_dit_w4a8_clean_kv_enable(h3_dit_w4a8 *ctx, size_t max_tokens, char *error,
+                                size_t error_size);
+void h3_dit_w4a8_clean_kv_free(h3_dit_w4a8 *ctx);
+int h3_dit_w4a8_clean_kv_enabled(const h3_dit_w4a8 *ctx);
+size_t h3_dit_w4a8_clean_kv_max_tokens(const h3_dit_w4a8 *ctx);
+size_t h3_dit_w4a8_clean_kv_hist_tokens(const h3_dit_w4a8 *ctx);
+int h3_dit_w4a8_clean_kv_begin(h3_dit_w4a8 *ctx, int mode,
+                               const uint32_t *save_idx, size_t save_n,
+                               size_t save_dst, char *error, size_t error_size);
+void h3_dit_w4a8_clean_kv_finish(h3_dit_w4a8 *ctx, size_t hist_n);
 /* Borrowed Metal DiT text tags (0=VIDEO, 1=TEXT, 2=AUDIO). NULL → all TEXT.
  * Vision span rows in the packed TE sequence must be tag=0 (h3_multimodal.c).
  * Does not copy; caller keeps the buffer alive across forward_avc. */
@@ -267,6 +312,10 @@ int h3_dit_w4a8_linear_shape(h3_dit_w4a8 *ctx, unsigned block,
                              h3_w4a8_linear_kind kind, size_t *n_out,
                              size_t *k_out, char *error, size_t error_size);
 
+/* Whole-step CUDA Graph diagnostics (H3_DIT_W4A8_CUDA_GRAPH=1).
+ * mode: 0=off, 1=eager-fallback, 2=graph replay. reason: short tag. */
+void h3_dit_w4a8_cuda_graph_last(int *mode, const char **reason);
+
 /* Quantized linear for DiT CUDA:
  *   X_rot = ConvRot(X) along K (group = convrot_groupsize)
  *   X_i8, scales = per-row INT8 quant
@@ -310,6 +359,11 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
                                 const float *pos_w, float spatial_scale,
                                 float *cos_out, float *sin_out, char *error,
                                 size_t error_size);
+
+/* Phase-A profile: cumulative RoPE table build time and call count.
+ * Enable with H3_ROPE_PROFILE=1. */
+void h3_dit_w4a8_rope_profile_get(double *ms, unsigned long *calls);
+void h3_dit_w4a8_rope_profile_reset(void);
 
 /* Metal h3_layout video/audio RoPE coords (float). video_seq=T*(H/2)*(W/2).
  * text_len is the temporal cursor start (same as layout builder). */
@@ -406,6 +460,36 @@ int h3_dit_w4a8_qkv_rope_f32(const float *qkv, const float *q_norm,
                              size_t head_dim, size_t rope_half, float epsilon,
                              float *query, float *key, float *value,
                              char *error, size_t error_size);
+
+/* P1 FP verification paths (NVIDIA Sol-Engine Pillar-1 MAE gates).
+ * Default-OFF switches H3_DIT_QKV_MERGE / H3_DIT_QKNORM_ROPE_FUSE gate the
+ * experiments in probes; these reference helpers are pure math, no env reads.
+ *
+ * h3_dit_w4a8_fp_qkv_split3_f32: treat wqkv [3*n, k] as three stacked
+ * [n, k] projections (q rows [0,n), k rows [n,2n), v rows [2n,3n)) and run
+ * three narrow GEMMs y[m,3n] = x[m,k] @ W^T.  Because the split happens along
+ * the output (N) axis, the per-row dot products are identical to one wide
+ * merged GEMM (each output column is an independent dot), which is exactly
+ * what the resident INT8 path already executes.  The probe uses this to
+ * compute MAE(merged, split3) and prove it is 0 (FP32) — the FP math
+ * equivalence gate required before INT8 evaluation.
+ *
+ * h3_dit_w4a8_fp_qknorm_rope_unfused_f32: two-pass reference that first
+ * RMS-normalizes Q/K into a materialized intermediate buffer (the unfused
+ * baseline the fused h3_dit_w4a8_qkv_rope_f32 replaces), then applies RoPE.
+ * Used to compute MAE(fused, unfused) — expected ~1e-7 (single vs double
+ * rounding on the normalized value). */
+int h3_dit_w4a8_fp_qkv_split3_f32(const float *x, const float *wqkv,
+                                  size_t m, size_t n, size_t k, float *y,
+                                  char *error, size_t error_size);
+int h3_dit_w4a8_fp_qknorm_rope_unfused_f32(
+    const float *qkv, const float *q_norm, const float *k_norm,
+    const float *rope_cos, const float *rope_sin, size_t seq, size_t heads,
+    size_t head_dim, size_t rope_half, float epsilon, float *query, float *key,
+    float *value, char *error, size_t error_size);
+/* Opt-in wiring: 1 when H3_DIT_QKV_MERGE=1 / H3_DIT_QKNORM_ROPE_FUSE=1. */
+int h3_dit_w4a8_fp_qkv_merge_enabled(void);
+int h3_dit_w4a8_fp_qknorm_rope_fuse_enabled(void);
 
 /* Naive SDPA: out[seq, heads*dim], scale typically 1/sqrt(head_dim). */
 int h3_dit_w4a8_sdpa_f32(const float *query, const float *key,

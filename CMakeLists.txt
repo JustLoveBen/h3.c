@@ -201,11 +201,12 @@ set(H3_CUDNN_FRONTEND_DIR
 add_library(h3_gpu_cuda STATIC
   h3_gpu_cuda.cu
   h3_gpu_cuda_audio.cu
+  h3_gpu_cuda_vae.cu
   h3_nvfp4_cuda.cu
   h3_cuda_device_caps.c
   h3_sdpa_registry.c)
 target_include_directories(h3_gpu_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(h3_gpu_cuda PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt ${CMAKE_DL_LIBS})
+target_link_libraries(h3_gpu_cuda PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver ${CMAKE_DL_LIBS})
 # Toolkit first so NVRTC/JIT matches gold cafe. Distro libstdc++ is added
 # later on generate (DT_RPATH) so NCCL's copy cannot win. libcudart.so.13
 # beats distro CUDA 11 by SONAME.
@@ -379,6 +380,28 @@ add_executable(h3_dit_int8_probe
 target_include_directories(h3_dit_int8_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_int8_probe PRIVATE c_std_11)
 
+add_executable(h3_dit_nvfp4_probe
+  tools/h3_dit_nvfp4_probe.c
+  h3_safetensors.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c
+  h3_w4a8.c
+  h3_w4a8_dequant.c)
+target_include_directories(h3_dit_nvfp4_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_dit_nvfp4_probe PRIVATE c_std_11)
+target_link_libraries(h3_dit_nvfp4_probe PRIVATE h3_gpu_cuda m)
+
+add_executable(h3_nvfp4_int8_sidecar
+  tools/h3_nvfp4_int8_sidecar.c
+  h3_safetensors.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c
+  h3_w4a8.c
+  h3_w4a8_dequant.c)
+target_include_directories(h3_nvfp4_int8_sidecar PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_nvfp4_int8_sidecar PRIVATE c_std_11)
+target_link_libraries(h3_nvfp4_int8_sidecar PRIVATE h3_gpu_cuda m)
+
 add_executable(h3_st_inventory
   tools/h3_st_inventory.c
   h3_safetensors.c
@@ -443,7 +466,9 @@ add_executable(h3_w4a8_cache_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
 target_include_directories(h3_w4a8_cache_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_w4a8_cache_probe PRIVATE c_std_11)
 target_link_libraries(h3_w4a8_cache_probe PRIVATE h3_gpu_cuda m)
@@ -456,7 +481,9 @@ add_executable(h3_dit_w4a8_block_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
 target_include_directories(h3_dit_w4a8_block_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_block_probe PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_block_probe PRIVATE h3_gpu_cuda m pthread)
@@ -469,7 +496,9 @@ add_executable(h3_dit_w4a8_layers_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
 target_include_directories(h3_dit_w4a8_layers_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_layers_probe PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_layers_probe PRIVATE h3_gpu_cuda m pthread)
@@ -482,10 +511,27 @@ add_executable(h3_dit_w4a8_forward_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
 target_include_directories(h3_dit_w4a8_forward_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_forward_probe PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_forward_probe PRIVATE h3_gpu_cuda m pthread)
+
+# P1 FP MAE gates: merged QKV GEMM vs split3, fused QKNorm+RoPE vs unfused.
+add_executable(h3_dit_w4a8_p1_fp_probe
+  tools/h3_dit_w4a8_p1_fp_probe.c
+  h3_dit_w4a8.c
+  h3_safetensors.c
+  h3_w4a8.c
+  h3_w4a8_dequant.c
+  h3_w4a8_cache.c
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
+target_include_directories(h3_dit_w4a8_p1_fp_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_dit_w4a8_p1_fp_probe PRIVATE c_std_11)
+target_link_libraries(h3_dit_w4a8_p1_fp_probe PRIVATE h3_gpu_cuda m pthread)
 
 # P4 M3 / E2: Euler sample loop (+ optional text context).
 add_executable(h3_dit_w4a8_sample_probe
@@ -496,7 +542,8 @@ add_executable(h3_dit_w4a8_sample_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c)
 target_include_directories(h3_dit_w4a8_sample_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_sample_probe PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_sample_probe PRIVATE h3_gpu_cuda m pthread)
@@ -535,7 +582,8 @@ add_executable(h3_w4a8_generate_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c)
 target_include_directories(h3_w4a8_generate_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_w4a8_generate_probe PRIVATE c_std_11)
 target_link_libraries(h3_w4a8_generate_probe PRIVATE h3_gpu_cuda m pthread)
@@ -545,6 +593,7 @@ add_executable(h3_cuda_generate
   tools/h3_cuda_generate.c
   h3_dit_w4a8.c
   h3_dit_int8.c
+  h3_dit_nvfp4.c
   h3_nvfp4.c
   h3_token_ids.c
   h3_ffmpeg.c
@@ -560,13 +609,35 @@ add_executable(h3_cuda_generate
   h3_w4a8_cache.c
   h3_step_cache.c
   h3_generate_preset.c
+  h3_taomate.c
   h3_lora.c
   h3_tae.c
+  h3_tae_cuda.cu
   h3_te_cache.c
-  h3_ulysses.c)
+  h3_ulysses.c
+  h3_selflift.c
+  h3_latent_upscaler.c
+  h3_latent_upscaler.cu
+  h3_vae_prewarm.c
+  h3_av_sync.c
+  h3_waffle.c
+  h3_run_report.c
+  h3_kpi_guard.c)
 target_include_directories(h3_cuda_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_cuda_generate PRIVATE c_std_11)
+target_compile_definitions(h3_cuda_generate PRIVATE H3_TAE_HAVE_CUDA=1)
 target_link_libraries(h3_cuda_generate PRIVATE h3_gpu_cuda m pthread)
+
+add_executable(h3_lbh_oracle
+  tools/h3_lbh_oracle.c
+  h3_latent_upscaler.c
+  h3_latent_upscaler.cu
+  h3_safetensors.c
+  h3_w4a8.c
+  h3_w4a8_dequant.c)
+target_include_directories(h3_lbh_oracle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_lbh_oracle PRIVATE c_std_11)
+target_link_libraries(h3_lbh_oracle PRIVATE h3_gpu_cuda m pthread)
 # Default OFF: linking libnccl pulls $ORIGIN libstdc++ 6.0.34 into generate
 # and drops the gold cuDNN plan. a2a test still links NCCL when present.
 # Opt-in H3_LINK_NCCL_IN_GENERATE=ON for U>1 experiments (U=1 cuDNN then
@@ -598,6 +669,16 @@ if(H3_NCCL_LIBRARY AND H3_NCCL_INCLUDE_DIR AND H3_LINK_NCCL_IN_GENERATE)
   target_sources(h3_cuda_generate PRIVATE h3_ulysses_comm.cu)
   target_include_directories(h3_cuda_generate PRIVATE ${H3_NCCL_INCLUDE_DIR})
   target_link_libraries(h3_cuda_generate PRIVATE ${H3_NCCL_LIBRARY})
+  # NCCL wheel/prefix needs CXXABI_1.3.15. Gold stub never takes this branch.
+  get_filename_component(_h3_nccl_libdir "${H3_NCCL_LIBRARY}" DIRECTORY)
+  if(EXISTS "${_h3_nccl_libdir}/libstdc++.so.6")
+    target_link_libraries(h3_cuda_generate PRIVATE
+      "-Wl,--no-as-needed"
+      "${_h3_nccl_libdir}/libstdc++.so.6"
+      "-Wl,--as-needed")
+    message(STATUS
+      "H3: NCCL generate links ${_h3_nccl_libdir}/libstdc++.so.6 (not gold)")
+  endif()
   message(STATUS
     "H3: generate links NCCL ${H3_NCCL_LIBRARY} (U=1 cuDNN may have no engine)")
 else()
@@ -691,7 +772,8 @@ add_executable(h3_condition_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c)
 target_include_directories(h3_condition_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_condition_probe PRIVATE c_std_11)
 target_link_libraries(h3_condition_probe PRIVATE h3_gpu_cuda m pthread)
@@ -707,7 +789,8 @@ add_executable(h3_t2av_timing_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c)
 target_include_directories(h3_t2av_timing_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_t2av_timing_probe PRIVATE c_std_11)
 target_link_libraries(h3_t2av_timing_probe PRIVATE h3_gpu_cuda m pthread)
@@ -763,7 +846,9 @@ add_executable(h3_dit_w4a8_audio_probe
   h3_w4a8.c
   h3_w4a8_dequant.c
   h3_w4a8_cache.c
-  h3_dit_int8.c)
+  h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c)
 target_include_directories(h3_dit_w4a8_audio_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_audio_probe PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_audio_probe PRIVATE h3_gpu_cuda m pthread)
@@ -772,10 +857,13 @@ add_executable(h3_dit_w4a8_cond_test
   tests/test_h3_dit_w4a8_cond.c
   h3_dit_w4a8.c
   h3_dit_int8.c
+  h3_dit_nvfp4.c
+  h3_nvfp4.c
   h3_safetensors.c
   h3_w4a8.c
   h3_w4a8_dequant.c
-  h3_w4a8_cache.c)
+  h3_w4a8_cache.c
+  h3_lora.c)
 target_include_directories(h3_dit_w4a8_cond_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_dit_w4a8_cond_test PRIVATE c_std_11)
 target_link_libraries(h3_dit_w4a8_cond_test PRIVATE h3_gpu_cuda m pthread)
@@ -787,11 +875,25 @@ target_include_directories(h3_step_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_compile_features(h3_step_cache_test PRIVATE c_std_11)
 target_link_libraries(h3_step_cache_test PRIVATE m)
 
+add_executable(h3_taomate_test
+  tests/test_h3_taomate.c
+  h3_taomate.c)
+target_include_directories(h3_taomate_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_taomate_test PRIVATE c_std_11)
+target_link_libraries(h3_taomate_test PRIVATE m)
+
 add_executable(h3_generate_preset_test
   tests/test_h3_generate_preset.c
   h3_generate_preset.c)
 target_include_directories(h3_generate_preset_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_generate_preset_test PRIVATE c_std_11)
+
+add_executable(h3_selflift_test
+  tests/test_h3_selflift.c
+  h3_selflift.c)
+target_include_directories(h3_selflift_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_selflift_test PRIVATE c_std_11)
+target_link_libraries(h3_selflift_test PRIVATE m)
 
 add_executable(h3_lora_test
   tests/test_h3_lora.c
@@ -812,6 +914,121 @@ add_executable(h3_te_cache_test
   h3_te_cache.c)
 target_include_directories(h3_te_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(h3_te_cache_test PRIVATE c_std_11)
+
+add_executable(h3_tae_test
+  tests/test_h3_tae.c
+  h3_tae.c
+  h3_safetensors.c)
+target_include_directories(h3_tae_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_tae_test PRIVATE c_std_11)
+target_link_libraries(h3_tae_test PRIVATE m)
+
+add_executable(h3_vae_rope_test
+  tests/test_h3_vae_rope.c
+  h3_vae_int8.c
+  h3_safetensors.c
+  h3_w4a8_dequant.c
+  h3_w4a8.c)
+target_include_directories(h3_vae_rope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_vae_rope_test PRIVATE c_std_11)
+target_link_libraries(h3_vae_rope_test PRIVATE m)
+
+add_executable(h3_vae_resident_test
+  tests/test_h3_vae_resident.c
+  h3_vae_int8.c
+  h3_safetensors.c
+  h3_w4a8_dequant.c
+  h3_w4a8.c)
+target_include_directories(h3_vae_resident_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_vae_resident_test PRIVATE c_std_11)
+target_link_libraries(h3_vae_resident_test PRIVATE m)
+
+add_executable(h3_vae_layout_test
+  tests/test_h3_vae_layout.c
+  h3_vae_int8.c
+  h3_safetensors.c
+  h3_w4a8_dequant.c
+  h3_w4a8.c)
+target_include_directories(h3_vae_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_vae_layout_test PRIVATE c_std_11)
+target_link_libraries(h3_vae_layout_test PRIVATE m)
+
+add_executable(h3_sage3_require_test
+  tests/test_h3_sage3_require.c)
+target_include_directories(h3_sage3_require_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_sage3_require_test PRIVATE c_std_11)
+
+add_executable(h3_sol_cute_backend_test
+  tests/test_h3_sol_cute_backend.c)
+target_include_directories(h3_sol_cute_backend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_sol_cute_backend_test PRIVATE c_std_11)
+
+add_executable(h3_kpi_guard_test
+  tests/test_h3_kpi_guard.c
+  h3_kpi_guard.c)
+target_include_directories(h3_kpi_guard_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_kpi_guard_test PRIVATE c_std_11)
+
+add_executable(h3_dit_act_f16_test
+  tests/test_h3_dit_act_f16.c)
+target_include_directories(h3_dit_act_f16_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_dit_act_f16_test PRIVATE c_std_11)
+target_link_libraries(h3_dit_act_f16_test PRIVATE m)
+
+add_executable(h3_dit_fused_epi_test
+  tests/test_h3_dit_fused_epi.c)
+target_include_directories(h3_dit_fused_epi_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_dit_fused_epi_test PRIVATE c_std_11)
+target_link_libraries(h3_dit_fused_epi_test PRIVATE m)
+
+add_executable(h3_w4a8_window_test
+  tests/test_h3_w4a8_window.c)
+target_include_directories(h3_w4a8_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_w4a8_window_test PRIVATE c_std_11)
+
+add_executable(h3_vae_prewarm_test
+  tests/test_h3_vae_prewarm.c)
+target_include_directories(h3_vae_prewarm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_vae_prewarm_test PRIVATE c_std_11)
+
+add_executable(h3_av_sync_test
+  tests/test_h3_av_sync.c
+  h3_av_sync.c
+  h3_ffmpeg.c)
+target_include_directories(h3_av_sync_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_av_sync_test PRIVATE c_std_11)
+target_link_libraries(h3_av_sync_test PRIVATE m pthread)
+
+add_executable(h3_waffle_test
+  tests/test_h3_waffle.c
+  h3_waffle.c)
+target_include_directories(h3_waffle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_waffle_test PRIVATE c_std_11)
+
+add_executable(h3_ffmpeg_args_test
+  tests/test_h3_ffmpeg_args.c
+  h3_ffmpeg.c)
+target_include_directories(h3_ffmpeg_args_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_ffmpeg_args_test PRIVATE c_std_11)
+target_link_libraries(h3_ffmpeg_args_test PRIVATE pthread)
+add_executable(h3_ffmpeg_stream_test
+  tests/test_h3_ffmpeg_stream.c
+  h3_ffmpeg.c)
+target_include_directories(h3_ffmpeg_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_ffmpeg_stream_test PRIVATE c_std_11)
+target_link_libraries(h3_ffmpeg_stream_test PRIVATE pthread)
+
+add_executable(h3_run_report_test
+  tests/test_h3_run_report.c
+  h3_run_report.c)
+target_include_directories(h3_run_report_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_run_report_test PRIVATE c_std_11)
+
+add_executable(h3_waffle_probe
+  tools/h3_waffle_probe.c
+  h3_waffle.c)
+target_include_directories(h3_waffle_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_waffle_probe PRIVATE c_std_11)
 
 add_executable(h3_vae_encode_f32_test
   tests/test_h3_vae_encode_f32.c
@@ -840,7 +1057,7 @@ if(OpenMP_C_FOUND)
   target_link_libraries(h3_multimodal_cuda_test PRIVATE OpenMP::OpenMP_C)
 endif()
 
-install(TARGETS h3_cuda_info h3_sol_attn_bench h3_w4a8_probe h3_dit_int8_probe h3_st_inventory h3_w4a8_matmul_probe
+install(TARGETS h3_cuda_info h3_sol_attn_bench h3_w4a8_probe h3_dit_int8_probe h3_dit_nvfp4_probe h3_st_inventory h3_w4a8_matmul_probe
                 h3_w4a8_cuda_probe h3_w4a8_blocks_probe h3_w4a8_int8_cuda_probe
                 h3_w4a8_device_probe h3_w4a8_cache_probe
                 h3_dit_w4a8_block_probe h3_dit_w4a8_layers_probe
@@ -853,10 +1070,29 @@ install(TARGETS h3_cuda_info h3_sol_attn_bench h3_w4a8_probe h3_dit_int8_probe h
                 h3_dit_w4a8_audio_probe
                 h3_dit_w4a8_cond_test
                 h3_vae_encode_f32_test
+                h3_vae_rope_test
+                h3_vae_resident_test
+                h3_vae_layout_test
+                h3_sage3_require_test
+                h3_sol_cute_backend_test
+                h3_kpi_guard_test
+                h3_w4a8_window_test
+                h3_dit_act_f16_test
+                h3_dit_fused_epi_test
+                h3_vae_prewarm_test
+                h3_av_sync_test
+                h3_waffle_test
+                h3_ffmpeg_args_test
+                h3_ffmpeg_stream_test
+                h3_run_report_test
+                h3_waffle_probe
                 h3_multimodal_cuda_test
                 h3_step_cache_test
                 h3_generate_preset_test
+                h3_taomate_test
+                h3_selflift_test
                 h3_lora_test
                 h3_ulysses_test
                 h3_te_cache_test
+                h3_tae_test
   RUNTIME DESTINATION bin)

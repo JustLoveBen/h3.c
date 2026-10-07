@@ -297,6 +297,12 @@ int h3_w4a8_convrot_weight_f32(const float *weight_in, size_t n, size_t k,
         fail(error, error_size, "invalid convrot_weight arguments");
         return 0;
     }
+    /* gs<=0: identity (NVFP4 requant → INT8 GEMM; no ConvRot). */
+    if (convrot_groupsize <= 0) {
+        if (weight_in != weight_out)
+            memcpy(weight_out, weight_in, n * k * sizeof(float));
+        return 1;
+    }
     if (convrot_groupsize < 4 || k % (size_t)convrot_groupsize != 0) {
         fail(error, error_size, "K=%zu not divisible by convrot_groupsize=%d",
              k, convrot_groupsize);

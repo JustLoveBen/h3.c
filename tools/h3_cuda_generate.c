@@ -12,7 +12,11 @@
  */
 #include "h3_dit_w4a8.h"
 #include "h3_dit_int8.h"
+#include "h3_dit_nvfp4.h"
+#include "h3_av_sync.h"
 #include "h3_ffmpeg.h"
+#include "h3_run_report.h"
+#include "h3_waffle.h"
 #include "h3_multimodal_cuda.h"
 #include "h3_nvfp4.h"
 #include "h3_nvfp4_cuda.h"
@@ -20,26 +24,34 @@
 #include "h3_vae_encode_f32.h"
 #include "h3_vae_int8.h"
 #include "h3_vae_int8_cuda.h"
+#include "h3_vae_prewarm.h"
 #include "h3_vision_cuda.h"
 #include "h3_audio_vae_cuda.h"
 #include "h3_audio_vae_layout.h"
 #include "h3_cuda_device_caps.h"
 #include "h3_generate_preset.h"
+#include "h3_latent_upscaler.h"
 #include "h3_lora.h"
+#include "h3_kpi_guard.h"
 #include "h3_sdpa.h"
+#include "h3_selflift.h"
 #include "h3_step_cache.h"
 #include "h3_tae.h"
+#include "h3_taomate.h"
 #include "h3_te_cache.h"
 #include "h3_ulysses.h"
 #include "h3_ulysses_comm.h"
+#include "h3_w4a8_window.h"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <fcntl.h>
 #include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +79,142 @@ static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* Opt-in nsys capture of the first hot-clip high-res NFE. Default off. */
+static int h3_nsys_hires_begin(int clip_i, int first_hi_nfe) {
+    const char *e = getenv("H3_NSYS_HIRES");
+    if (!(e && e[0] == '1' && e[1] == '\0' && clip_i > 0 && first_hi_nfe))
+        return 0;
+    printf("nsys_hires: profiler_start clip=%d\n", clip_i + 1);
+    fflush(stdout);
+    cudaProfilerStart();
+    return 1;
+}
+
+static void h3_nsys_hires_end(int on, double dit_ms) {
+    if (!on)
+        return;
+    cudaProfilerStop();
+    printf("nsys_hires: profiler_stop dit_ms=%.1f\n", dit_ms);
+    fflush(stdout);
+}
+
+static void gen_mem_trace(h3_cuda *cuda, const char *phase) {
+    const char *e = getenv("H3_GEN_MEM_TRACE");
+    size_t free_b = 0, total_b = 0;
+    char err[64];
+    if (!e || e[0] != '1' || e[1] != '\0' || !phase)
+        return;
+    err[0] = '\0';
+    if (cuda)
+        (void)h3_cuda_mem_info(cuda, &free_b, &total_b, err, sizeof(err));
+    printf("mem: phase=%s free_gib=%.2f total_gib=%.2f\n", phase,
+           (double)free_b / (1024.0 * 1024.0 * 1024.0),
+           (double)total_b / (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+}
+
+/* Spatial adjacent-pixel energy on one HxW plane. Checkerboard → ratio ~1. */
+static float chw_adj_ratio(const float *z, int t, int h, int w) {
+    double s = 0.0, d = 0.0;
+    int hh, ww, n = 0;
+    (void)t;
+    if (!z || h < 1 || w < 2)
+        return 0.0f;
+    for (hh = 0; hh < h; hh++)
+        for (ww = 0; ww < w; ww++) {
+            float v = z[(size_t)hh * (size_t)w + (size_t)ww];
+            s += fabsf(v);
+            if (ww + 1 < w) {
+                d += fabsf(v - z[(size_t)hh * (size_t)w + (size_t)(ww + 1)]);
+                n++;
+            }
+        }
+    if (s < 1e-8 || n < 1)
+        return 0.0f;
+    return (float)((d / (double)n) / (s / (double)(h * w)));
+}
+
+static void dump_f32_bin(const char *path, const float *z, size_t n) {
+    FILE *f;
+    if (!path || !z || !n)
+        return;
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fwrite(z, sizeof(float), n, f);
+    fclose(f);
+}
+
+/* Per-channel CTHW stats. Flower-screen often hides in ch≠0. */
+static void dump_chw_channel_stats(const char *tag, const float *z, int t,
+                                   int h, int w) {
+    int c, worst_c = 0;
+    float worst = 0.0f;
+    size_t plane = (size_t)h * (size_t)w;
+    size_t ct = (size_t)t * plane;
+    if (!z || t < 1 || h < 1 || w < 1)
+        return;
+    printf("selflift: %s CTHW=24x%dx%dx%d\n", tag, t, h, w);
+    for (c = 0; c < H3_VAE_INT8_LATENT_CH; c++) {
+        const float *base = z + (size_t)c * ct;
+        double mn = 1e30, mx = -1e30, sm = 0.0;
+        size_t i, n = ct;
+        float adj = chw_adj_ratio(base, 1, h, w);
+        int nan = 0;
+        for (i = 0; i < n; i++) {
+            double v = (double)base[i];
+            if (!isfinite(v))
+                nan++;
+            if (v < mn)
+                mn = v;
+            if (v > mx)
+                mx = v;
+            sm += v;
+        }
+        if (adj > worst) {
+            worst = adj;
+            worst_c = c;
+        }
+        if (c < 3 || c == 8 || c == 16 || c == 23 || adj > 0.25f || nan) {
+            printf("selflift: %s ch%02d min=%.4g max=%.4g mean=%.4g "
+                   "adj_t0=%.4g nan=%d\n",
+                   tag, c, mn, mx, sm / (double)n, (double)adj, nan);
+        }
+    }
+    printf("selflift: %s worst_adj ch%02d=%.4g (~1=checkerboard)\n", tag,
+           worst_c, (double)worst);
+    fflush(stdout);
+}
+
+static void dump_chw_pgm(const char *path, const float *z, int h, int w) {
+    FILE *f;
+    int i, g;
+    float mn = 1e30f, mx = -1e30f;
+    if (!path || !z || h < 1 || w < 1)
+        return;
+    for (i = 0; i < h * w; i++) {
+        if (z[i] < mn)
+            mn = z[i];
+        if (z[i] > mx)
+            mx = z[i];
+    }
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "P5\n%d %d\n255\n", w, h);
+    for (i = 0; i < h * w; i++) {
+        g = 0;
+        if (mx > mn)
+            g = (int)((z[i] - mn) / (mx - mn) * 255.0f + 0.5f);
+        if (g < 0)
+            g = 0;
+        if (g > 255)
+            g = 255;
+        fputc(g, f);
+    }
+    fclose(f);
 }
 
 static int h3_path_is_file(const char *path) {
@@ -173,6 +321,7 @@ typedef struct {
     double ms;
     char err[256];
     int ok;
+    volatile int done;
 } dit_host_stage_job;
 
 static void *dit_host_stage_th(void *arg) {
@@ -180,6 +329,7 @@ static void *dit_host_stage_th(void *arg) {
     if (!j || !j->dit) return NULL;
     j->ok = h3_dit_w4a8_stage_host(j->dit, j->first, j->n, &j->ms, j->err,
                                    sizeof(j->err));
+    j->done = 1;
     return NULL;
 }
 
@@ -197,7 +347,7 @@ static void kick_dit_host_stage(void *arg) {
     *k->t0 = now_ms();
     if (pthread_create(k->th, NULL, dit_host_stage_th, k->job) == 0) {
         *k->ok = 1;
-        printf("dit_host_stage: after_te_packed disk→host blocks=%u "
+        printf("dit_host_stage: kick disk→host blocks=%u "
                "(no GPU; H3_DIT_HOST_STAGE_TE=0 disables)\n",
                k->job->n);
     } else {
@@ -217,6 +367,72 @@ static void *vae_willneed_th(void *arg) {
 #endif
     close(fd);
     return NULL;
+}
+
+/* R11: last-2 NFE kick. Thread body lives in h3_vae_prewarm.c. */
+static int kick_vae_prewarm(pthread_t *th, h3_vae_prewarm_job *job,
+                            const char *path, h3_vae_int8_store *store,
+                            int *opened, int device, int at_step, int want_dev,
+                            unsigned n_blocks) {
+    if (!th || !job || !path || !path[0] || !store) return 0;
+    if (!h3_vae_prewarm_wanted()) return 0;
+    memset(job, 0, sizeof(*job));
+    job->path = path;
+    job->store = store;
+    job->opened = opened;
+    job->device = device;
+    job->want_hostreg = 1;
+    job->want_dev = want_dev;
+    job->n_blocks = n_blocks;
+    job->at_step = at_step;
+    if (pthread_create(th, NULL, h3_vae_prewarm_th, job) != 0) return 0;
+    printf("vae_th: created at=dit_step%d want_dev=%d\n", at_step, want_dev);
+    fflush(stdout);
+    return 1;
+}
+
+/* T4-c: prewarm 线程预填 device W 消除热 clip vae_load 余尾（~0.3s）。
+ * H3_VAE_PREWARM_DEV=auto（默认）：仅当当前空闲显存 ≥ 3×VAE device W
+ * （~1.8GiB 权 + ~3.6GiB 安全垫给解码激活/scratch + sol_cute 激活）
+ * 才预填，768P/480P hot clip 32GB 无 headroom 时自动退回 want_dev=0
+ * （现状，零风险）；=1 强制预填；=0 关闭。 */
+static int vae_prewarm_want_dev(int device) {
+    const char *e = getenv("H3_VAE_PREWARM_DEV");
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    if (e && e[0] == '1' && e[1] == '\0') return 1;
+    {
+        const size_t need = (size_t)6 * 1024 * 1024 * 1024ull;
+        size_t free_b = 0, total_b = 0;
+        if (device < 0 || cudaSetDevice(device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (free_b < need) {
+            printf("vae_prewarm_dev: free=%.2fGiB < %.2fGiB gate → host-only "
+                   "prewarm (H3_VAE_PREWARM_DEV=1 forces)\n",
+                   (double)free_b / (1024.0 * 1024.0 * 1024.0),
+                   (double)need / (1024.0 * 1024.0 * 1024.0));
+            fflush(stdout);
+            return 0;
+        }
+        printf("vae_prewarm_dev: free=%.2fGiB ≥ gate → device W prefill\n",
+               (double)free_b / (1024.0 * 1024.0 * 1024.0));
+        fflush(stdout);
+        return 1;
+    }
+}
+
+/* R20: decode|ppm|0. Default decode (overlap video VAE). */
+static int audio_vae_overlap_mode(void) {
+    const char *ov = getenv("H3_AUDIO_VAE_OVERLAP");
+    if (!ov || !ov[0]) return 2;
+    if (ov[0] == '0' && ov[1] == '\0') return 0;
+    if (strcmp(ov, "ppm") == 0) return 1;
+    return 2;
 }
 
 typedef struct {
@@ -273,6 +489,91 @@ static int load_f32_raw(const char *path, float *dst, size_t n, char *error,
         return 0;
     }
     return 1;
+}
+
+/* P0 A/B verification only (H3_DUMP_LATENT / H3_REPLAY_LATENT): dump the
+ * final packed DiT latent (f32, layout [T,H/2,W/2,96], same as latent.raw)
+ * before VAE consumes it, and replay a dump straight into VAE decode so the
+ * async D2H arm can be compared bit-exact on a fixed input. Not a product
+ * path; both switches default off. */
+static int dump_latent_file(const char *path, const float *latent, size_t n,
+                            int t, int h, int w, char *error,
+                            size_t error_size) {
+    char hdr[64];
+    FILE *fp;
+    if (!path || !path[0] || !latent) return 1;
+    snprintf(hdr, sizeof(hdr), "H3LAT1 %d %d %d %zu\n", t, h, w, n);
+    fp = fopen(path, "wb");
+    if (!fp) {
+        snprintf(error, error_size, "cannot open %s for write", path);
+        return 0;
+    }
+    if (fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
+        fwrite(latent, sizeof(float), n, fp) != n) {
+        fclose(fp);
+        snprintf(error, error_size, "short write %s", path);
+        return 0;
+    }
+    fclose(fp);
+    return 1;
+}
+
+static int load_latent_file(const char *path, float *latent, size_t n_expect,
+                            int *t_out, int *h_out, int *w_out, char *error,
+                            size_t error_size) {
+    char hdr[64], magic[7];
+    FILE *fp;
+    int t = 0, h = 0, w = 0;
+    size_t n = 0;
+    fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(error, error_size, "cannot open latent dump %s", path);
+        return 0;
+    }
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
+        sscanf(hdr, "%6s %d %d %d %zu", magic, &t, &h, &w, &n) != 5 ||
+        strcmp(magic, "H3LAT1") != 0) {
+        fclose(fp);
+        snprintf(error, error_size, "bad latent dump header in %s", path);
+        return 0;
+    }
+    if (t < 1 || h < 2 || w < 2 || (h % 2) || (w % 2) ||
+        n != (size_t)t * (size_t)(h / 2) * (size_t)(w / 2) * 96) {
+        fclose(fp);
+        snprintf(error, error_size,
+                 "latent dump %s shape %dx%dx%d inconsistent with n=%zu", path,
+                 t, h, w, n);
+        return 0;
+    }
+    if (latent) {
+        if (n != n_expect) {
+            fclose(fp);
+            snprintf(error, error_size,
+                     "latent dump n=%zu, run buffer %zu (geometry mismatch)",
+                     n, n_expect);
+            return 0;
+        }
+        if (fread(latent, sizeof(float), n, fp) != n) {
+            fclose(fp);
+            snprintf(error, error_size, "short read %s", path);
+            return 0;
+        }
+    }
+    fclose(fp);
+    if (t_out) *t_out = t;
+    if (h_out) *h_out = h;
+    if (w_out) *w_out = w;
+    return 1;
+}
+
+static uint64_t fnv1a64_bytes(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
 static uint8_t *frames_to_rgb24(const h3_vae_int8_frames *frames, size_t *nbytes,
@@ -557,7 +858,45 @@ static void fill_normal_f32(uint64_t seed, float *dst, size_t count) {
         dst[i] = radius * cosf(angle);
         dst[i + 1] = radius * sinf(angle);
     }
-    if (i < count) dst[i] = hash_to_unit(seed, i);
+    if (i < count)     dst[i] = hash_to_unit(seed, i);
+}
+
+/* --repeat N: unique mux per in-process clip. clip_i is 0-based. */
+static void mux_path_for_clip(char *dst, size_t dst_sz, const char *base,
+                              int clip_i, int n) {
+    const char *dot;
+    const char *slash;
+    if (!dst || dst_sz < 8) return;
+    if (!base || !base[0]) {
+        dst[0] = '\0';
+        return;
+    }
+    if (n <= 1) {
+        snprintf(dst, dst_sz, "%s", base);
+        return;
+    }
+    slash = strrchr(base, '/');
+    dot = strrchr(base, '.');
+    if (dot && (!slash || dot > slash))
+        snprintf(dst, dst_sz, "%.*s_r%d%s", (int)(dot - base), base, clip_i + 1,
+                 dot);
+    else
+        snprintf(dst, dst_sz, "%s_r%d", base, clip_i + 1);
+}
+
+static int grow_f32(float **p, size_t n, char *err, size_t err_size) {
+    float *q;
+    if (n == 0) {
+        snprintf(err, err_size, "grow_f32 empty");
+        return 0;
+    }
+    q = (float *)realloc(*p, n * sizeof(float));
+    if (!q) {
+        snprintf(err, err_size, "OOM realloc %zu f32", n);
+        return 0;
+    }
+    *p = q;
+    return 1;
 }
 
 static int ensure_dir(const char *path) {
@@ -623,6 +962,19 @@ static int dump_meta_txt(const char *dir, size_t context, int latent_t,
 #define H3_CUDA_AUDIO_SIGMA_SHIFT 3.0f
 #endif
 
+/* DMAD 复验（docs/research/2026-10-07-dmad-noise-diagnosis.md）：DMAD 官方
+ * audio sigma shift=2.0（基座管线默认 3.0）。H3_AUDIO_SIGMA_SHIFT 环境变量
+ * opt-in 覆盖；缺省 3.0 不改任何既有行为/金线。 */
+static float audio_sigma_shift_effective(void) {
+    const char *e = getenv("H3_AUDIO_SIGMA_SHIFT");
+    if (e && e[0]) {
+        float v = strtof(e, NULL);
+        if (isfinite(v) && v >= 1.0f && v <= 20.0f)
+            return v;
+    }
+    return H3_CUDA_AUDIO_SIGMA_SHIFT;
+}
+
 static float shifted_sigma_from_base(float base, float shift) {
     if (!(base > 0.0f)) return 0.0f;
     return shift * base / (1.0f + (shift - 1.0f) * base);
@@ -636,6 +988,611 @@ static int build_serving_sigmas(int steps, float shift, float *sigmas) {
         sigmas[i] = shifted_sigma_from_base(base, shift);
     }
     sigmas[steps] = 0.0f;
+    return 1;
+}
+
+static void taomate_copy_video_t(const float *src, float *dst, int t0, int t1,
+                                 size_t t_floats) {
+    size_t n = (size_t)(t1 - t0) * t_floats;
+    memcpy(dst, src + (size_t)t0 * t_floats, n * sizeof(float));
+}
+
+static void taomate_copy_audio_t(const float *src, float *dst, int audio_t,
+                                 int a0, int a1) {
+    int n = a1 - a0;
+    size_t ch = (size_t)H3_DIT_W4A8_AUDIO_CH;
+    memcpy(dst, src + (size_t)a0 * ch, (size_t)n * ch * sizeof(float));
+    memcpy(dst + (size_t)n * ch, src + ((size_t)audio_t + (size_t)a0) * ch,
+           (size_t)n * ch * sizeof(float));
+}
+
+static void taomate_write_audio_t(float *dst, const float *src, int audio_t,
+                                  int a0, int a1) {
+    int n = a1 - a0;
+    size_t ch = (size_t)H3_DIT_W4A8_AUDIO_CH;
+    memcpy(dst + (size_t)a0 * ch, src, (size_t)n * ch * sizeof(float));
+    memcpy(dst + ((size_t)audio_t + (size_t)a0) * ch, src + (size_t)n * ch,
+           (size_t)n * ch * sizeof(float));
+}
+
+static void taomate_copy_audio_pos(const float *src, float *dst, int audio_t,
+                                   int a0, int a1) {
+    int n = a1 - a0;
+    memcpy(dst, src + a0, (size_t)n * sizeof(float));
+    memcpy(dst + n, src + audio_t + a0, (size_t)n * sizeof(float));
+}
+
+static int taomate_clamp_ov_t(long v) {
+    if (v < 0)
+        return 0;
+    if (v > 12)
+        return 12;
+    return (int)v;
+}
+
+static unsigned lift_hires_window_want(void) {
+    unsigned want = 50;
+    const char *hw = getenv("H3_LIFT_HIRES_WINDOW");
+    if (hw && hw[0]) {
+        long v = strtol(hw, NULL, 10);
+        if (v >= 8 && v <= 50)
+            want = (unsigned)v;
+    }
+    return want;
+}
+
+static void lift_fit_hires_window(h3_w4a8_cache *cw, h3_cuda *cuda,
+                                  size_t packed_seq, unsigned want) {
+    h3_w4a8_cache_stats st;
+    size_t free_b = 0, total_b = 0;
+    unsigned fit = 8;
+    char mem_err[128];
+    memset(&st, 0, sizeof(st));
+    (void)h3_w4a8_cache_get_stats(cw, &st, NULL, 0);
+    mem_err[0] = '\0';
+    if (!h3_cuda_mem_info(cuda, &free_b, &total_b, mem_err, sizeof(mem_err))) {
+        h3_w4a8_cache_set_window_size(cw, want < 24 ? want : 24);
+        printf("selflift: hires mem_info failed (%s); window=%u\n", mem_err,
+               h3_w4a8_cache_window_size(cw));
+        fflush(stdout);
+        return;
+    }
+    if (st.bytes_per_block_est > 0) {
+        size_t reserve = (size_t)1536ULL << 20;
+        size_t budget = free_b > reserve ? free_b - reserve : 0;
+        fit = (unsigned)(budget / st.bytes_per_block_est);
+    }
+    if (fit < 8)
+        fit = 8;
+    if (fit > want)
+        fit = want;
+    h3_w4a8_cache_set_window_size(cw, fit);
+    printf("selflift: hires seq=%zu window=%u free_giB=%.2f (INT8 after WS)\n",
+           packed_seq, fit, (double)free_b / (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+}
+
+static int lift_prepare_hires_vram(h3_dit_w4a8 *dit, h3_cuda *cuda,
+                                   size_t packed_seq, double *switch_ms,
+                                   char *error, size_t error_size) {
+    h3_w4a8_cache *cw;
+    char scratch_err[256];
+    unsigned want;
+    int ws_ok;
+    double t_all, t_drop, t_pre, t_refit;
+    int skip_sage_prebuild = 0;
+    unsigned window_after = 0;
+    if (switch_ms)
+        *switch_ms = 0.0;
+    if (!dit || !cuda)
+        return 1;
+    cw = h3_dit_w4a8_cache(dit);
+    want = lift_hires_window_want();
+    t_all = now_ms();
+    /* WS-first: drop INT8, grow hires act/block WS, then refit INT8 into
+     * leftover VRAM. Keeping 50 then allocating 8.8GiB WS made make_room
+     * drop 50→32 and the next w_i8 malloc OOM (hires 2 NFE ~31s thrash). */
+    if (cw) {
+        h3_w4a8_cache_unfreeze_window(cw);
+        h3_w4a8_cache_reset_refit(cw);
+        h3_w4a8_cache_drop_device_weights(cw);
+        h3_w4a8_cache_log_window(cw, "hires_before");
+    }
+    h3_dit_w4a8_release_block_workspace(dit);
+    h3_cuda_release_heavy_workspace(cuda);
+    /* R4: leftover low-res sage pool is the wrong seq and pins window=1.
+     * 768P sage3 is a fake hit (R3) — drop unless hits==want on this run. */
+    {
+        unsigned long long sw = 0, sh = 0, sf = 0;
+        size_t free_b = 0, total_b = 0;
+        size_t sage_now = h3_cuda_sage3_pool_bytes();
+        size_t sage_hi = 4ull * packed_seq * (size_t)H3_DIT_W4A8_HEADS *
+                         (size_t)H3_DIT_W4A8_HEAD_DIM * 2ull;
+        size_t reserve = (size_t)1536ULL << 20;
+        size_t bpb = cw ? h3_w4a8_cache_bytes_per_block(cw) : 0;
+        unsigned n_blocks = 50;
+        unsigned fit_with, fit_without;
+        int sage_true = 0;
+        char mem_err[128];
+        h3_cuda_sage3_get_stats(&sw, &sh, &sf);
+        sage_true = (sw > 0ull && sh == sw);
+        mem_err[0] = '\0';
+        (void)h3_cuda_mem_info(cuda, &free_b, &total_b, mem_err,
+                               sizeof(mem_err));
+        if (cw && h3_w4a8_cache_max_blocks_fit(cw) > 0)
+            n_blocks = 50;
+        fit_with = h3_w4a8_cache_max_blocks_fit_calc(
+            free_b, reserve, sage_now + sage_hi, bpb, n_blocks);
+        fit_without = h3_w4a8_cache_max_blocks_fit_calc(free_b, reserve, 0, bpb,
+                                                        n_blocks);
+        skip_sage_prebuild = h3_w4a8_cache_should_drop_sage_pool(
+            fit_with, fit_without, 8, sage_true);
+        if (h3_sdpa_cached_id() != H3_SDPA_ID_SAGE3)
+            skip_sage_prebuild = 1;
+        if (skip_sage_prebuild) {
+            h3_cuda_sage3_drop_pool();
+            printf("dit_int8_cache: tag=hires_drop_sage fit_with=%u "
+                   "fit_without=%u sage_true=%d sage_now_mib=%.1f "
+                   "sage_hi_mib=%.1f\n",
+                   fit_with, fit_without, sage_true,
+                   (double)sage_now / (1024.0 * 1024.0),
+                   (double)sage_hi / (1024.0 * 1024.0));
+            fflush(stdout);
+        }
+        /* Low-res sol QKVO is the wrong seq and sits in the torch cache. */
+        h3_cuda_sol_cute_drop_pool();
+        h3_cuda_sol_cute_trim_cache();
+    }
+    t_drop = now_ms() - t_all;
+    t_all = now_ms();
+    scratch_err[0] = '\0';
+    if (!h3_cuda_pregrow_dit_scratch(cuda, packed_seq, H3_DIT_W4A8_HIDDEN,
+                                     (size_t)H3_DIT_W4A8_HEADS,
+                                     (size_t)H3_DIT_W4A8_HEAD_DIM,
+                                     (size_t)H3_DIT_W4A8_FFN, scratch_err,
+                                     sizeof(scratch_err))) {
+        snprintf(error, error_size, "%s", scratch_err);
+        return 0;
+    }
+    scratch_err[0] = '\0';
+    ws_ok = h3_dit_w4a8_pregrow_layers_ws(dit, packed_seq,
+                                          (unsigned)H3_DIT_W4A8_N_BLOCKS,
+                                          scratch_err, sizeof(scratch_err));
+    if (!ws_ok) {
+        printf("selflift: hires WS pregrow failed (%s); continue, fit after SDPA\n",
+               scratch_err[0] ? scratch_err : "unknown");
+        fflush(stdout);
+    }
+    /* WS-first order for 32GB: compile hires sol while INT8 is down, drop
+     * QKVO, then refit window=32, then prefetch INT8 before first SDPA
+     * reallocates QKVO. Skip hires cuDNN plan when sol will own DiT attn. */
+    if (h3_sdpa_cached_id() == H3_SDPA_ID_SOL_CUTE &&
+        h3_sol_cute_seq_allowed(packed_seq)) {
+        printf("selflift: hires sol warmup seq=%zu (compile then drop QKVO)\n",
+               packed_seq);
+        fflush(stdout);
+        h3_cuda_sol_cute_warmup_shape(packed_seq, (size_t)H3_DIT_W4A8_HEADS,
+                                      (size_t)H3_DIT_W4A8_HEAD_DIM);
+        h3_cuda_sol_cute_trim_cache();
+        printf("selflift: skip hires cudnn prebuild seq=%zu (sol owns attn)\n",
+               packed_seq);
+        fflush(stdout);
+    } else if (h3_sdpa_cached_id() == H3_SDPA_ID_SOL_CUTE) {
+        printf("selflift: mixed arm seq=%zu max_seq=%zu (hires cudnn)\n",
+               packed_seq, h3_sol_cute_max_seq());
+        fflush(stdout);
+        {
+            float attn_scale = 1.0f / sqrtf((float)H3_DIT_W4A8_HEAD_DIM);
+            char pb_err[256];
+            pb_err[0] = '\0';
+            if (!h3_cuda_sdpa_prebuild(cuda, packed_seq,
+                                       (size_t)H3_DIT_W4A8_HEADS,
+                                       (size_t)H3_DIT_W4A8_HEAD_DIM, attn_scale,
+                                       0, pb_err, sizeof(pb_err))) {
+                printf("selflift: hires cudnn prebuild seq=%zu failed (%s)\n",
+                       packed_seq, pb_err[0] ? pb_err : "unknown");
+            }
+            fflush(stdout);
+        }
+    } else if (!skip_sage_prebuild) {
+        float attn_scale = 1.0f / sqrtf((float)H3_DIT_W4A8_HEAD_DIM);
+        char pb_err[256];
+        pb_err[0] = '\0';
+        if (!h3_cuda_sdpa_prebuild(cuda, packed_seq, (size_t)H3_DIT_W4A8_HEADS,
+                                   (size_t)H3_DIT_W4A8_HEAD_DIM, attn_scale, 0,
+                                   pb_err, sizeof(pb_err))) {
+            printf("selflift: hires sdpa_prebuild seq=%zu failed (%s)\n",
+                   packed_seq, pb_err[0] ? pb_err : "unknown");
+        } else {
+            printf("selflift: hires sdpa_prebuild seq=%zu "
+                   "(after WS, before INT8)\n",
+                   packed_seq);
+        }
+        fflush(stdout);
+    } else if (h3_sdpa_cached_id() != H3_SDPA_ID_SAGE3) {
+        float attn_scale = 1.0f / sqrtf((float)H3_DIT_W4A8_HEAD_DIM);
+        char pb_err[256];
+        pb_err[0] = '\0';
+        if (!h3_cuda_sdpa_prebuild(cuda, packed_seq, (size_t)H3_DIT_W4A8_HEADS,
+                                   (size_t)H3_DIT_W4A8_HEAD_DIM, attn_scale, 0,
+                                   pb_err, sizeof(pb_err))) {
+            printf("selflift: hires cudnn prebuild seq=%zu failed (%s)\n",
+                   packed_seq, pb_err[0] ? pb_err : "unknown");
+        }
+        fflush(stdout);
+    } else {
+        printf("selflift: skip sage3 prebuild seq=%zu (R4 window)\n",
+               packed_seq);
+        fflush(stdout);
+    }
+    t_pre = now_ms() - t_all;
+    t_all = now_ms();
+    if (cw) {
+        char refit_err[256];
+        h3_w4a8_cache_set_window_size(cw, want);
+        refit_err[0] = '\0';
+        if (!h3_w4a8_cache_refit_after_workspace(cw, refit_err,
+                                                 sizeof(refit_err))) {
+            printf("selflift: hires INT8 refit failed (%s); fit from free\n",
+                   refit_err[0] ? refit_err : "unknown");
+            fflush(stdout);
+            lift_fit_hires_window(cw, cuda, packed_seq, want);
+        } else {
+            printf("selflift: hires WS-first seq=%zu INT8 window=%u "
+                   "(no make_room drop)\n",
+                   packed_seq, h3_w4a8_cache_window_size(cw));
+            fflush(stdout);
+        }
+        h3_w4a8_cache_freeze_window(cw);
+        h3_w4a8_cache_log_window(cw, "hires_after");
+        window_after = h3_w4a8_cache_window_size(cw);
+    }
+    t_refit = now_ms() - t_all;
+    if (switch_ms)
+        *switch_ms = t_drop + t_pre + t_refit;
+    printf("lift_switch: drop_ms=%.1f prebuild_ms=%.1f refit_ms=%.1f "
+           "window_after=%u overlap=%d\n",
+           t_drop, t_pre, t_refit, window_after, 0);
+    fflush(stdout);
+    gen_mem_trace(cuda, "lift_switch");
+    return 1;
+}
+
+static void taomate_append_video_kv(float *kv_v, float *kv_pt, float *kv_ph,
+                                    float *kv_pw, size_t *kv_vseq,
+                                    const float *latent, const float *pt,
+                                    const float *ph, const float *pw, int t0,
+                                    int t1, size_t spatial, size_t t_floats) {
+    size_t hvs, hvn;
+    if (!kv_v || !kv_vseq || t1 <= t0)
+        return;
+    hvs = (size_t)(t1 - t0) * spatial;
+    hvn = (size_t)(t1 - t0) * t_floats;
+    memcpy(kv_v + (*kv_vseq) * (size_t)H3_DIT_W4A8_VIDEO_PATCH,
+           latent + (size_t)t0 * t_floats, hvn * sizeof(float));
+    memcpy(kv_pt + *kv_vseq, pt + (size_t)t0 * spatial, hvs * sizeof(float));
+    memcpy(kv_ph + *kv_vseq, ph + (size_t)t0 * spatial, hvs * sizeof(float));
+    memcpy(kv_pw + *kv_vseq, pw + (size_t)t0 * spatial, hvs * sizeof(float));
+    *kv_vseq += hvs;
+}
+
+static void taomate_append_audio_kv(float *kv_a, float *kv_apt, float *kv_aph,
+                                    float *kv_apw, size_t *kv_aseq,
+                                    const float *audio_rows, const float *apt,
+                                    const float *aph, const float *apw,
+                                    int audio_t, int a0, int a1) {
+    size_t has;
+    if (!kv_a || !kv_aseq || a1 <= a0)
+        return;
+    has = (size_t)(a1 - a0);
+    taomate_copy_audio_t(audio_rows,
+                         kv_a + (*kv_aseq) * (size_t)H3_DIT_W4A8_AUDIO_CH,
+                         audio_t, a0, a1);
+    memcpy(kv_apt + *kv_aseq, apt + (size_t)a0, has * sizeof(float));
+    memcpy(kv_aph + *kv_aseq, aph + (size_t)a0, has * sizeof(float));
+    memcpy(kv_apw + *kv_aseq, apw + (size_t)a0, has * sizeof(float));
+    memcpy(kv_apt + *kv_aseq + has, apt + (size_t)audio_t + (size_t)a0,
+           has * sizeof(float));
+    memcpy(kv_aph + *kv_aseq + has, aph + (size_t)audio_t + (size_t)a0,
+           has * sizeof(float));
+    memcpy(kv_apw + *kv_aseq + has, apw + (size_t)audio_t + (size_t)a0,
+           has * sizeof(float));
+    *kv_aseq += has * 2u;
+}
+
+/* Bounded overlap cond (default). Full-chunk CLEAN_KV is opt-in and can OOM. */
+static void taomate_pack_history(const h3_taomate_plan *plan, int pi,
+                                 int clean_kv, int hist_t, int sink_t,
+                                 const float *latent, const float *pt,
+                                 const float *ph, const float *pw,
+                                 const float *audio_rows, const float *apt,
+                                 const float *aph, const float *apw,
+                                 int pack_audio, int audio_t, size_t spatial,
+                                 size_t t_floats, float *kv_v, float *kv_pt,
+                                 float *kv_ph, float *kv_pw, float *kv_a,
+                                 float *kv_apt, float *kv_aph, float *kv_apw,
+                                 size_t *kv_vseq, size_t *kv_aseq) {
+    *kv_vseq = 0;
+    *kv_aseq = 0;
+    if (!plan || pi <= 0 || !kv_v)
+        return;
+    if (clean_kv) {
+        int hist[4];
+        int nhist = 0;
+        int hi;
+        hist[nhist++] = 0;
+        if (pi - 1 != 0)
+            hist[nhist++] = pi - 1;
+        if (pi >= 2 && (pi - 2) != 0 && (pi - 2) != (pi - 1))
+            hist[nhist++] = pi - 2;
+        for (hi = 0; hi < nhist; hi++) {
+            const h3_taomate_phase *hp = &plan->phases[hist[hi]];
+            taomate_append_video_kv(kv_v, kv_pt, kv_ph, kv_pw, kv_vseq, latent,
+                                    pt, ph, pw, hp->video_t0, hp->video_t1,
+                                    spatial, t_floats);
+            if (pack_audio && kv_a && hp->audio_t1 > hp->audio_t0)
+                taomate_append_audio_kv(kv_a, kv_apt, kv_aph, kv_apw, kv_aseq,
+                                        audio_rows, apt, aph, apw, audio_t,
+                                        hp->audio_t0, hp->audio_t1);
+        }
+        return;
+    }
+    if (hist_t <= 0 && sink_t <= 0)
+        return;
+    {
+        h3_taomate_ov_span sp[H3_TAOMATE_MAX_OV_SPANS];
+        int ns = h3_taomate_overlap_spans(plan, pi, hist_t, sink_t, sp);
+        int si;
+        for (si = 0; si < ns; si++) {
+            taomate_append_video_kv(kv_v, kv_pt, kv_ph, kv_pw, kv_vseq, latent,
+                                    pt, ph, pw, sp[si].video_t0, sp[si].video_t1,
+                                    spatial, t_floats);
+            if (pack_audio && kv_a && sp[si].audio_t1 > sp[si].audio_t0)
+                taomate_append_audio_kv(kv_a, kv_apt, kv_aph, kv_apw, kv_aseq,
+                                        audio_rows, apt, aph, apw, audio_t,
+                                        sp[si].audio_t0, sp[si].audio_t1);
+        }
+    }
+}
+
+static size_t taomate_phase_packed_seq(const h3_taomate_plan *plan, int pi,
+                                       size_t context, size_t spatial,
+                                       int pack_audio, int clean_kv, int hist_t,
+                                       int sink_t) {
+    const h3_taomate_phase *ph;
+    size_t vs, as, extra_v = 0, extra_a = 0;
+    int t0w, a0w;
+    int denoise_ov = clean_kv ? 0 : hist_t;
+    int cond_hist = clean_kv ? hist_t : 0;
+    if (!plan || pi < 0 || pi >= plan->n_phases)
+        return context;
+    ph = &plan->phases[pi];
+    t0w = h3_taomate_denoise_t0(plan, pi, denoise_ov);
+    a0w = h3_taomate_denoise_a0(plan, pi, denoise_ov);
+    vs = (size_t)(ph->video_t1 - t0w) * spatial;
+    as = pack_audio ? (size_t)(ph->audio_t1 - a0w) * 2u : 0;
+    /* Cond tokens: sink (identity) and/or full-chunk CLEAN_KV. Not full-clip Q. */
+    if (pi > 0 && (cond_hist > 0 || sink_t > 0)) {
+        h3_taomate_ov_span sp[H3_TAOMATE_MAX_OV_SPANS];
+        int ns = h3_taomate_overlap_spans(plan, pi, cond_hist, sink_t, sp);
+        int si;
+        for (si = 0; si < ns; si++) {
+            extra_v += (size_t)(sp[si].video_t1 - sp[si].video_t0) * spatial;
+            extra_a += pack_audio
+                           ? (size_t)(sp[si].audio_t1 - sp[si].audio_t0) * 2u
+                           : 0;
+        }
+    }
+    return context + vs + as + extra_v + extra_a;
+}
+
+static void taomate_blend_video_overlap(float *latent, const float *v_chunk,
+                                        int t0_ov, int t0, int t1,
+                                        size_t t_floats) {
+    int t, ov = t0 - t0_ov;
+    size_t i;
+    if (!latent || !v_chunk || t1 <= t0)
+        return;
+    for (t = 0; t < ov; t++) {
+        float w = (float)(t + 1) / (float)(ov + 1);
+        const float *ns = v_chunk + (size_t)t * t_floats;
+        float *ds = latent + (size_t)(t0_ov + t) * t_floats;
+        for (i = 0; i < t_floats; i++)
+            ds[i] = (1.0f - w) * ds[i] + w * ns[i];
+    }
+    memcpy(latent + (size_t)t0 * t_floats,
+           v_chunk + (size_t)ov * t_floats,
+           (size_t)(t1 - t0) * t_floats * sizeof(float));
+}
+
+static void taomate_blend_audio_overlap(float *dst, const float *src_win,
+                                        int audio_t, int a0_ov, int a0,
+                                        int a1) {
+    int n_win = a1 - a0_ov;
+    int ov = a0 - a0_ov;
+    int n_new = a1 - a0;
+    size_t ch = (size_t)H3_DIT_W4A8_AUDIO_CH;
+    int t, s, i;
+    if (!dst || !src_win || n_new < 0)
+        return;
+    for (s = 0; s < 2; s++) {
+        float *dstream = dst + (size_t)(s ? audio_t : 0) * ch;
+        const float *sstream = src_win + (size_t)(s ? n_win : 0) * ch;
+        for (t = 0; t < ov; t++) {
+            float w = (float)(t + 1) / (float)(ov + 1);
+            float *d = dstream + (size_t)(a0_ov + t) * ch;
+            const float *n = sstream + (size_t)t * ch;
+            for (i = 0; i < (int)ch; i++)
+                d[i] = (1.0f - w) * d[i] + w * n[i];
+        }
+        if (n_new > 0)
+            memcpy(dstream + (size_t)a0 * ch, sstream + (size_t)ov * ch,
+                   (size_t)n_new * ch * sizeof(float));
+    }
+}
+
+/* Dual-sample on TaoMate 3-step: x0 from noisy x+σv, LBH, re-noise, euler.
+ * already_x0=1: latent is already clean x0 (all Euler at low-res); LBH then
+ * decode, no re-noise / high DiT. Return 1=continue high-res, 2=Z0 stop, 0=fail. */
+static int generate_lbh_transition(
+    float **latent, float **vel, float **pt, float **ph, float **pw,
+    float **apt, float **aph, float **apw, size_t *n_lat, size_t *video_seq,
+    int *latent_h, int *latent_w, int latent_t, int hi_lh, int hi_lw,
+    int target_rope_t0, float sigma_k, float sigma_next, int pack_audio,
+    int audio_t, size_t n_audio, float *audio_rows, float *audio_vel,
+    float audio_sigma_k, float audio_sigma_next, unsigned long long seed,
+    const float *lift_mean, const float *lift_std, h3_latent_upscaler *lat_up,
+    h3_cuda *cuda, h3_dit_w4a8 *dit, size_t context, size_t audio_seq,
+    int already_x0, double *out_ms, char *error, size_t error_size) {
+    float *x0_pack = NULL, *z_low = NULL, *z_high = NULL, *z0_pack = NULL;
+    float *noise_hi = NULL;
+    int lo_h = *latent_h, lo_w = *latent_w;
+    size_t n_hi, video_seq_hi, n_tok_hi, ii;
+    double t_lift;
+    int z0_only = 0;
+    const char *z0env;
+
+    if (out_ms)
+        *out_ms = 0.0;
+    if (!latent || !*latent || !lat_up || !lift_mean || !lift_std)
+        return 0;
+    if (!already_x0 && (!vel || !*vel))
+        return 0;
+    if (!already_x0 && !(sigma_k > 1e-8f)) {
+        snprintf(error, error_size, "lbh: bad sigma");
+        return 0;
+    }
+    t_lift = now_ms();
+    if (!already_x0 && pack_audio && audio_rows && audio_vel && n_audio) {
+        if (!h3_dit_w4a8_euler_step_f32(audio_rows, audio_vel, n_audio,
+                                        audio_sigma_k, audio_sigma_next, error,
+                                        error_size))
+            return 0;
+    }
+    x0_pack = (float *)malloc(*n_lat * sizeof(float));
+    if (!x0_pack) {
+        snprintf(error, error_size, "OOM lift x0");
+        return 0;
+    }
+    if (already_x0) {
+        memcpy(x0_pack, *latent, *n_lat * sizeof(float));
+    } else {
+        for (ii = 0; ii < *n_lat; ii++)
+            x0_pack[ii] = (*latent)[ii] + sigma_k * (*vel)[ii];
+    }
+    z_low = h3_vae_int8_unpack_dit_latent_f32(x0_pack, latent_t, lo_h, lo_w,
+                                              error, error_size);
+    free(x0_pack);
+    x0_pack = NULL;
+    if (!z_low)
+        return 0;
+    dump_chw_channel_stats("z_low", z_low, latent_t, lo_h, lo_w);
+    z_high = (float *)malloc((size_t)H3_VAE_INT8_LATENT_CH * (size_t)latent_t *
+                             (size_t)hi_lh * (size_t)hi_lw * sizeof(float));
+    if (!z_high) {
+        free(z_low);
+        snprintf(error, error_size, "OOM lift z_high");
+        return 0;
+    }
+    if (!h3_latent_upscaler_forward(lat_up, cuda, z_low, latent_t, lo_h, lo_w,
+                                    hi_lh, hi_lw, lift_mean, lift_std, z_high,
+                                    error, error_size)) {
+        free(z_low);
+        free(z_high);
+        return 0;
+    }
+    {
+        float r_lo = chw_adj_ratio(z_low, latent_t, lo_h, lo_w);
+        float r_hi = chw_adj_ratio(z_high, latent_t, hi_lh, hi_lw);
+        printf("selflift: chw_adj ch0/t0 low=%.4g high=%.4g "
+               "(~1=checkerboard, ~0.1=smooth)\n",
+               (double)r_lo, (double)r_hi);
+        dump_chw_channel_stats("z_high", z_high, latent_t, hi_lh, hi_lw);
+        fflush(stdout);
+    }
+    free(z_low);
+    z_low = NULL;
+    video_seq_hi = (size_t)latent_t * (size_t)(hi_lh / 2) * (size_t)(hi_lw / 2);
+    n_tok_hi = video_seq_hi * (size_t)H3_DIT_W4A8_VIDEO_PATCH;
+    z0_pack = (float *)malloc(n_tok_hi * sizeof(float));
+    if (!z0_pack ||
+        !h3_vae_patchify_video_96(z_high, latent_t, hi_lh, hi_lw, z0_pack,
+                                  n_tok_hi)) {
+        snprintf(error, error_size, "lift pack failed");
+        free(z_high);
+        free(z0_pack);
+        return 0;
+    }
+    free(z_high);
+    z_high = NULL;
+    n_hi = n_tok_hi;
+    if (!grow_f32(latent, n_hi, error, error_size) ||
+        !grow_f32(vel, n_hi, error, error_size) ||
+        !grow_f32(pt, video_seq_hi, error, error_size) ||
+        !grow_f32(ph, video_seq_hi, error, error_size) ||
+        !grow_f32(pw, video_seq_hi, error, error_size)) {
+        free(z0_pack);
+        return 0;
+    }
+    z0env = getenv("H3_LIFT_Z0_ONLY");
+    z0_only = already_x0 || (z0env && z0env[0] == '1') ? 1 : 0;
+    if (z0_only) {
+        memcpy(*latent, z0_pack, n_hi * sizeof(float));
+        *latent_h = hi_lh;
+        *latent_w = hi_lw;
+        *video_seq = video_seq_hi;
+        *n_lat = n_hi;
+        free(z0_pack);
+        printf("selflift: Z0_ONLY decode lifted endpoint (no remaining DiT)\n");
+        if (out_ms)
+            *out_ms = now_ms() - t_lift;
+        return 2;
+    }
+    noise_hi = (float *)malloc(n_hi * sizeof(float));
+    if (!noise_hi) {
+        free(z0_pack);
+        snprintf(error, error_size, "OOM lift noise");
+        return 0;
+    }
+    fill_normal_f32(seed + 1ULL, noise_hi, n_hi);
+    for (ii = 0; ii < n_hi; ii++) {
+        float z0 = z0_pack[ii];
+        (*latent)[ii] = sigma_k * noise_hi[ii] + (1.0f - sigma_k) * z0;
+        (*vel)[ii] = (z0 - (*latent)[ii]) / sigma_k;
+    }
+    free(noise_hi);
+    free(z0_pack);
+    if (!h3_dit_w4a8_euler_step_f32(*latent, *vel, n_hi, sigma_k, sigma_next,
+                                    error, error_size))
+        return 0;
+    *latent_h = hi_lh;
+    *latent_w = hi_lw;
+    *video_seq = video_seq_hi;
+    *n_lat = n_hi;
+    if (!h3_dit_w4a8_fill_metal_video_pos((size_t)target_rope_t0, latent_t,
+                                          *latent_h, *latent_w, *pt, *ph, *pw,
+                                          error, error_size))
+        return 0;
+    if (pack_audio && apt && aph && apw && *apt && *aph && *apw) {
+        if (!h3_dit_w4a8_fill_metal_audio_pos((size_t)target_rope_t0, audio_t,
+                                              *latent_h, *latent_w, *apt, *aph,
+                                              *apw, error, error_size))
+            return 0;
+    }
+    (void)context;
+    (void)audio_seq;
+    if (dit && cuda) {
+        h3_dit_w4a8_release_block_workspace(dit);
+        h3_cuda_release_heavy_workspace(cuda);
+    }
+    printf("selflift: transition σ=%.4g→%.4g latent %dx%d→%dx%d tokens %zu "
+           "lift_ms=%.1f (TaoMate 3-step; no extra DiT NFE)\n",
+           (double)sigma_k, (double)sigma_next, lo_h, lo_w, hi_lh, hi_lw, *n_lat,
+           now_ms() - t_lift);
+    fflush(stdout);
+    if (out_ms)
+        *out_ms = now_ms() - t_lift;
+    (void)audio_t;
     return 1;
 }
 
@@ -750,16 +1707,25 @@ static int gen_uly_set_compute(void *cfg, int rank, void *stream, char *err,
                                        err_size);
 }
 
+static int gen_uly_a2a_dtype(void) {
+    const char *e = getenv("H3_ULYSSES_A2A_F32");
+    if (e && e[0] == '1' && e[1] == '\0')
+        return 4;
+    return 2; /* Phase 2: BF16 A2A default. Gold U=1 never calls this. */
+}
+
 static int gen_uly_a2a_qkv(void *cfg, size_t seq_local, size_t heads,
                            size_t head_dim, char *err, size_t err_size) {
     return h3_ulysses_a2a_qkv((h3_ulysses_cfg *)cfg, NULL, NULL, seq_local,
-                              heads, head_dim, 4, err, err_size);
+                              heads, head_dim, gen_uly_a2a_dtype(), err,
+                              err_size);
 }
 
 static int gen_uly_a2a_attn(void *cfg, size_t seq_local, size_t heads,
                             size_t head_dim, char *err, size_t err_size) {
     return h3_ulysses_a2a_attn_out((h3_ulysses_cfg *)cfg, NULL, NULL, seq_local,
-                                   heads, head_dim, 4, err, err_size);
+                                   heads, head_dim, gen_uly_a2a_dtype(), err,
+                                   err_size);
 }
 
 static void gen_uly_free_ranks(h3_dit_w4a8 *dit0, h3_dit_w4a8 **uly_dit,
@@ -782,6 +1748,12 @@ static void gen_uly_free_ranks(h3_dit_w4a8 *dit0, h3_dit_w4a8 **uly_dit,
 }
 
 int main(int argc, char **argv) {
+    /* True-FP32 VAE SDPA: TF32 must be off before the CUDA context exists. */
+    {
+        const char *vae_f32 = getenv("H3_VAE_SDPA_F32");
+        if (vae_f32 && vae_f32[0] == '1' && vae_f32[1] == '\0')
+            setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+    }
     const char *dit_path = NULL, *vae_path = NULL, *te_path = NULL;
     const char *audio_vae_path = NULL;
     char audio_vae_resolved[1024];
@@ -789,17 +1761,43 @@ int main(int argc, char **argv) {
     int audio_vae_explicit = 0;
     const char *out_dir = "out_cuda_t2v";
     const char *sdpa = "cudnn";
+    char sdpa_effective[64] = "";
     const char *preset_name = NULL;
     const char *lora_path = NULL;
     const char *vae_decode = "official";
     const char *tae_path = NULL;
     const char *te_cache_dir = NULL;
+    const char *latent_upscaler_path = NULL;
+    int lift_transition_cli = 0;
+    int lift_on = 0;
+    int lift_k = 0;
+    int hi_lh = 0, hi_lw = 0;
+    h3_latent_upscaler *lat_up = NULL;
+    /* Cold-clip waffle observability gate (direction A): clip1 max_b16 uses
+     * an independent, looser threshold than the hot golden line. WARN-only —
+     * never FAILs, never alters generation. H3_WAFFLE_COLD_GUARD=1 replaces
+     * the free()'d clip1 mux frames with a bit-identical re-decode before the
+     * clip1 mux write (an H3_WAFFLE_GUARD_RETRY-style retry for the cold
+     * clip; it hides the flaky decode from the muxed mp4 but the WARN is
+     * still logged with the pre-retry stats). */
+    int waffle_cold_guard = 0;
+    double waffle_cold_max_b16 = 0.0;
+    float lift_mean[H3_VAE_INT8_LATENT_CH];
+    float lift_std[H3_VAE_INT8_LATENT_CH];
+    int lift_stats_ok = 0;
     float lora_scale = 1.0f;
     int steps_explicit = 0, sdpa_explicit = 0;
     int ulysses = 1;
     h3_generate_preset_out preset_out;
     h3_lora_set lora_set;
     int lora_loaded = 0;
+    /* Opt-in 主体+收尾 LoRA 混合调度（taomate refiner A/B；默认关）。
+     * H3_REFINER_LORA=FILE + H3_REFINER_LORA_STEPS=N + H3_REFINER_LORA_SCALE=S:
+     * 主循环末 N 步（步号 >= steps-N）前临时切到该 LoRA，其余步保持 --lora 主体。 */
+    h3_lora_set refiner_lora_set;
+    int refiner_lora_loaded = 0;
+    int refiner_lora_attached = 0;
+    int refiner_lora_steps = 0;
     h3_ulysses_cfg ulysses_cfg;
     const char *token_ids_file = NULL;
     const char *token_ids_list = NULL;
@@ -819,10 +1817,18 @@ int main(int argc, char **argv) {
     const char *vae_encode_path = NULL;
     const char *vision_path = NULL;
     const char *mux_path = NULL;
+    const char *report_path = NULL;
     unsigned dit_layers = 50;
     unsigned vae_blocks = 36;
     unsigned te_layers = 50;
     int vae_repeats = 1;
+    int clip_repeat = 1;
+    int clip_i = 0;
+    int vae_opened = 0;
+    int orig_lh = 0, orig_lw = 0;
+    size_t orig_n_lat = 0, orig_vseq = 0;
+    char mux_clip_path[1024];
+    const char *mux_write = NULL;
     int steps = 2;
     int reuse = 0; /* 0=default full-eval baseline; --reuse N opt-in */
     float magcache_thresh = 0.0f; /* 0=off; lite Mag; ≠ independent Tea */
@@ -853,6 +1859,9 @@ int main(int argc, char **argv) {
     int device = 0, rc = 1, iarg, step, skip_te = 0, skip_vae = 0;
     const char *dump_dir = getenv("H3_DUMP_DIR");
     int dump_only = getenv("H3_DUMP_ONLY") && getenv("H3_DUMP_ONLY")[0] == '1';
+    const char *dump_latent_path = getenv("H3_DUMP_LATENT");
+    const char *replay_latent_path = getenv("H3_REPLAY_LATENT");
+    int replay_latent = replay_latent_path && replay_latent_path[0];
     int skip_audio = 0, skip_dit = 0, probe_vae_load = 0;
     /* Comfy fl2va always packs [text|audio|video] even for “video-only”
      * prompts (empty audio latent). Missing audio tokens → dialogue prior.
@@ -911,11 +1920,25 @@ int main(int argc, char **argv) {
     int mag_consec = 0;
     int mag_max_consec = 2; /* H3 Safe: at most 2 adjacent skips */
     int mag_fresh = 0; /* 1 after a small-delta eval; 0 after force_eval */
+    h3_taomate_plan tm_plan;
+    int tm_plan_ok = 0;
+    /* Packed-Q CLEAN_KV concatenates history into Q (OOM at 768P).
+     * Default overlap is denoise-window blend. H3_TAOMATE_LAYER_KV=1 is the
+     * real TaoMate hook: Q stays the chunk, K/V carry sink+recent. */
+    int tm_clean_kv = 0;
+    int tm_layer_kv = 0;
+    int tm_hist_t = 2;
+    int tm_sink_t = 0;
+    size_t tm_kv_sink_n = 0;
     char step_cache_err[256];
 
     h3_w4a8_store *dit_store = NULL;
     h3_dit_int8_store *dit_int8 = NULL;
+    h3_nvfp4_store dit_nvfp4;
     int dit_is_int8 = 0;
+    int dit_is_nvfp4 = 0;
+    int dit_nvfp4_opened = 0;
+    void *tae_keep = NULL;
     h3_cuda *cuda = NULL;
     h3_dit_w4a8 *dit = NULL;
     h3_cuda *uly_cuda[8];
@@ -939,6 +1962,7 @@ int main(int argc, char **argv) {
     float *pt = NULL, *ph = NULL, *pw = NULL;
     float *apt = NULL, *aph = NULL, *apw = NULL;
     double t_te = 0, t_dit = 0, t_vae = 0, t_audio = 0, t_ppm = 0, t_mux = 0;
+    double t_lift_switch = 0;
     double t0, t_all0;
     void *prefetch_done = NULL;
     int overlap = 1;
@@ -950,8 +1974,11 @@ int main(int argc, char **argv) {
     int vae_th_ok = 0;
     int audio_th_ok = 0;
     int host_stage_th_ok = 0;
+    int audio_overlap = 0;
     sdpa_prebuild_job sdpa_job;
     audio_decode_job audio_job;
+    h3_vae_prewarm_job vae_prewarm_job;
+    double vae_prewarm_t0 = 0.0;
     dit_host_stage_job host_stage_job;
     host_stage_kick host_stage_kick_job;
     double host_stage_t0 = 0.0;
@@ -966,10 +1993,14 @@ int main(int argc, char **argv) {
     memset(&ast, 0, sizeof(ast));
     memset(&sdpa_job, 0, sizeof(sdpa_job));
     memset(&audio_job, 0, sizeof(audio_job));
+    memset(&vae_prewarm_job, 0, sizeof(vae_prewarm_job));
     memset(&host_stage_job, 0, sizeof(host_stage_job));
     memset(&host_stage_kick_job, 0, sizeof(host_stage_kick_job));
     memset(&preset_out, 0, sizeof(preset_out));
+    memset(&dit_nvfp4, 0, sizeof(dit_nvfp4));
+    dit_nvfp4.map_fd = -1;
     memset(&lora_set, 0, sizeof(lora_set));
+    memset(&refiner_lora_set, 0, sizeof(refiner_lora_set));
     memset(&ulysses_cfg, 0, sizeof(ulysses_cfg));
     memset(uly_cuda, 0, sizeof(uly_cuda));
     memset(uly_dit, 0, sizeof(uly_dit));
@@ -1006,6 +2037,22 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[iarg], "--vae-repeats") && iarg + 1 < argc) {
             vae_repeats = (int)strtol(argv[++iarg], NULL, 10);
             if (vae_repeats < 1) vae_repeats = 1;
+        }         else if (!strcmp(argv[iarg], "--repeat") && iarg + 1 < argc) {
+            clip_repeat = (int)strtol(argv[++iarg], NULL, 10);
+            if (clip_repeat < 1) clip_repeat = 1;
+            /* R54 wants --repeat 30. Silent 8-cap made 30 a lie. */
+            if (clip_repeat > 32) clip_repeat = 32;
+            {
+                /* Registered in tools/h3_plugin.h; read via getenv here (the
+                 * registry helper is static to its header and has no linkable
+                 * TU). Semantics match h3_plugin_enabled. */
+                const char *wcg = getenv("H3_WAFFLE_COLD_GUARD");
+                waffle_cold_guard =
+                    wcg && wcg[0] && strcmp(wcg, "0") != 0 &&
+                    strcmp(wcg, "false") != 0 && strcmp(wcg, "off") != 0 &&
+                    strcmp(wcg, "no") != 0;
+            }
+            waffle_cold_max_b16 = h3_kpi_guard_cold_max_b16_threshold();
         }
         else if (!strcmp(argv[iarg], "--steps") && iarg + 1 < argc) {
             steps = (int)strtol(argv[++iarg], NULL, 10);
@@ -1133,6 +2180,8 @@ int main(int argc, char **argv) {
             lock_first_frame = 1;
         } else if (!strcmp(argv[iarg], "--mux") && iarg + 1 < argc) {
             mux_path = argv[++iarg];
+        } else if (!strcmp(argv[iarg], "--report") && iarg + 1 < argc) {
+            report_path = argv[++iarg];
         }         else if (!strcmp(argv[iarg], "--context") && iarg + 1 < argc)
             context = (size_t)strtoul(argv[++iarg], NULL, 10);
         else if (!strcmp(argv[iarg], "--seed") && iarg + 1 < argc)
@@ -1171,6 +2220,10 @@ int main(int argc, char **argv) {
             tae_path = argv[++iarg];
         else if (!strcmp(argv[iarg], "--te-cache") && iarg + 1 < argc)
             te_cache_dir = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--latent-upscaler") && iarg + 1 < argc)
+            latent_upscaler_path = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--lift-transition") && iarg + 1 < argc)
+            lift_transition_cli = (int)strtol(argv[++iarg], NULL, 10);
         else if (!strcmp(argv[iarg], "--window") && iarg + 1 < argc) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%s", argv[++iarg]);
@@ -1242,7 +2295,12 @@ int main(int argc, char **argv) {
                     "  --te-layers N      NVFP4 TE depth (default 50)\n"
                     "  --vae-repeats N    Repeat VAE decode in-process "
                     "(default 1; useful for load-cache A/B)\n"
+                    "  --repeat N         In-process clip loop after weights "
+                    "load (default 1, max 32). Reuses LoRA / INT8 pin / sage3 / DiT; "
+                    "does not re-pin. Hot clip i>1 is the serve-style e2e. "
+                    "Mux gets _rK suffix when N>1. Gold default stays 1.\n"
                     "  --probe-vae-load   Only measure VAE weights_load path\n"
+                    "  --report FILE.json  Write KPI JSON (clip N → FILE.clipN.json)\n"
                     "  --seconds N        Duration at 24 fps (default 5). "
                     "Frame count = N*24, aligned up to 5+17k. "
                     "Do not pass --frames if you want a real N-second mp4.\n"
@@ -1250,13 +2308,34 @@ int main(int argc, char **argv) {
                     "Mux is always 24 fps, so --frames 17 → ~0.92s even with "
                     "--seconds 5. For 5s/10s product clips omit this.\n"
                     "  --seed N           Noise seed (default 0x483343554441)\n"
-                    "  --preset gold|turbo4\n"
+                    "  --preset gold|turbo4|nvfp4|lift|taomate|taomate-lift\n"
                     "      gold（可省略）= 今日金线路径，不改 steps/backend/cache。\n"
                     "      turbo4 = 非金线极速档：steps=4 + sage3 + 要求 --lora；cache 关。\n"
+                    "      taomate = 非金线：TaoMate 3-step 锚点 {0,16,33,49} +\n"
+                    "              HF TaoLiveAIGC/TaoMate-H3 LoRA。\n"
+                    "              duration≤5s = Comfy 整段一次采（1 phase）；\n"
+                    "              10s+ 仍 codec chunk。H3_TAOMATE_FORCE_CHUNKS=1\n"
+                    "              恢复 5s 切块。须 --lora 或 H3_TAOMATE_LORA。\n"
+                    "              禁止 4-step。--steps 6 = 50 格中点（非 turbo4）。\n"
+                    "      taomate-lift = 同上 3-step LoRA，但 2 NFE 走 672×384 +\n"
+                    "              LBH + 1 NFE 高分收尾。须 --latent-upscaler。\n"
+                    "              5s 同样整段一次，不切块。\n"
+                    "              H3_LIFT_Z0_ONLY=1 → 3 NFE 全低分 + LBH + 0 高分 DiT。\n"
+                    "              不是 turbo4 lift。金线不走此档。\n"
+                    "      nvfp4 = 非金线加速档：steps=8 + cudnn，须 --dit pruned_nvfp4；\n"
+                    "              例 minimax_h3_fl2va_pruned_nvfp4.safetensors。\n"
+                    "              探测失败硬退出，不回退 INT8。可能有损，不是金线。\n"
+                    "      lift / self-lift = 非金线加速档：LBH 3D LatentResizer\n"
+                    "              接 Euler mid-σ（默认 8step、transition=6）。\n"
+                    "              必须 --latent-upscaler FILE；禁止 nearest-only。\n"
+                    "              金线 768P 仍走原生 8step，不传此 preset。\n"
                     "      未蒸馏 --steps 4 而无 LoRA 不是产品。缺省不传 preset。\n"
                     "      --preset fast4 已更名为 turbo4。\n"
                     "  --lora FILE.safetensors   turbo4 必填；金线禁止依赖此文件\n"
                     "  --lora-scale S            默认 1.0\n"
+                    "  --latent-upscaler FILE    lift / taomate-lift 必填；LBH 3D\n"
+                    "  --lift-transition K       低分 DiT 次数（8step 默认 6；4step=3；\n"
+                    "                            taomate 3-step 默认 2；Z0_ONLY 时=3）\n"
                     "  --ulysses N        Sequence-parallel Ulysses (default 1).\n"
                     "                     Experimental. Legal {1,2,4,8}; U=7 illegal.\n"
                     "                     N=1 does not init NCCL. Does not change sdpa.\n"
@@ -1265,9 +2344,11 @@ int main(int argc, char **argv) {
                     "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
                     "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
                     "                     Text-only; vision/multimodal never cached.\n"
-                    "  --vae-decode official|tae  Default official. tae 仅 turbo4\n"
-                    "                     （TAE 不是金线成片）；需 --tae 权，禁止静默 official。\n"
-                    "  --tae FILE         TAE weights (turbo + --vae-decode tae)\n"
+                    "  --vae-decode official|tae  Default official（金线必须 official）。\n"
+                    "                     tae 仅 turbo4/nvfp4 快档 opt-in：非金线、画质有损\n"
+                    "                     （纹理糊/色偏）；需 --tae 权，禁止静默 official。\n"
+                    "  --tae FILE         TAEHV taeh3 权（快档；写了即走 --vae-decode tae）。\n"
+                    "                     非无损。金线开 tae 硬失败 RC=1。\n"
                     "  --sdpa-backend B   DiT SDPA (h3_sdpa registry):\n"
                     "                     Tier-0 quality: cudnn (default) | auto→cudnn\n"
                     "                     Tier-1 accel:   sage3 | sol_cute  (first-class)\n"
@@ -1421,11 +2502,53 @@ int main(int argc, char **argv) {
         cfg_scale = preset_out.cfg_scale;
         if (preset_out.lora_path)
             lora_path = preset_out.lora_path;
+        if (preset_out.id == H3_PRESET_LIFT || preset_out.lift)
+            lift_on = 1;
+        if (preset_out.id == H3_PRESET_TAOMATE && latent_upscaler_path &&
+            latent_upscaler_path[0])
+            lift_on = 1;
+        if (preset_out.lift && !lift_on) {
+            fprintf(stderr,
+                    "h3: preset=taomate-lift 必须 --latent-upscaler FILE "
+                    "（或 H3_LATENT_UPSCALER）\n");
+            return 1;
+        }
         if (preset_out.non_gold)
-            fprintf(stderr, "h3: preset=turbo4 非金线（MAE 金线不适用）\n");
+            fprintf(stderr,
+                    "h3: preset=%s 非金线（MAE 金线不适用）\n",
+                    preset_name && preset_name[0] ? preset_name : "fast");
     }
     if (ulysses < 1)
         ulysses = 1;
+    if (lift_on) {
+        if (!latent_upscaler_path || !latent_upscaler_path[0]) {
+            const char *e = getenv("H3_LATENT_UPSCALER");
+            if (e && e[0])
+                latent_upscaler_path = e;
+        }
+        if (!latent_upscaler_path || !latent_upscaler_path[0]) {
+            fprintf(stderr,
+                    "h3: lift/taomate-lift 必须 --latent-upscaler FILE "
+                    "（或 H3_LATENT_UPSCALER）；禁止 nearest-only\n");
+            return 1;
+        }
+        if (ulysses > 1) {
+            fprintf(stderr, "h3: preset=lift 尚未接 Ulysses>1\n");
+            return 1;
+        }
+        if (first_frame_path || last_frame_path || n_ref_images ||
+            ref_video_path) {
+            fprintf(stderr,
+                    "h3: preset=lift 尚未接视觉条件缩格子（FL2VA/ref）；"
+                    "本轮只接 T2VA\n");
+            return 1;
+        }
+        if (init_latent_path || lock_first_frame || init_first_frame) {
+            fprintf(stderr,
+                    "h3: preset=lift 与 --init-latent / lock-first-frame 互斥\n");
+            return 1;
+        }
+    }
     ulysses_cfg.tp_size = 1;
     ulysses_cfg.ulysses = ulysses;
     ulysses_cfg.ring = 1;
@@ -1444,26 +2567,17 @@ int main(int argc, char **argv) {
         if (e && e[0])
             te_cache_dir = e;
     }
-    if (strcmp(vae_decode, "official") != 0 && strcmp(vae_decode, "tae") != 0) {
-        fprintf(stderr, "h3: --vae-decode must be official|tae\n");
+    if (tae_path && tae_path[0] && !strcmp(vae_decode, "official"))
+        vae_decode = "tae";
+    if (!h3_tae_allow_opt_in(preset_out.non_gold, vae_decode, tae_path, error,
+                             sizeof(error))) {
+        fprintf(stderr, "h3: %s\n", error);
         return 1;
     }
     if (!strcmp(vae_decode, "tae")) {
-        if (!preset_out.non_gold) {
-            fprintf(stderr, "h3: TAE 不是金线成片（仅 --preset turbo4）\n");
+        if (!h3_tae_open(tae_path, &tae_keep, error, sizeof(error))) {
+            fprintf(stderr, "h3: %s\n", error);
             return 1;
-        }
-        if (!tae_path || !tae_path[0]) {
-            fprintf(stderr, "h3: --vae-decode tae 需要 --tae 权（不静默 official）\n");
-            return 1;
-        }
-        {
-            void *tae_ctx = NULL;
-            if (!h3_tae_open(tae_path, &tae_ctx, error, sizeof(error))) {
-                fprintf(stderr, "h3: %s\n", error);
-                return 1;
-            }
-            h3_tae_close(tae_ctx);
         }
     }
 
@@ -1472,11 +2586,43 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (!probe_vae_load && !dit_path) {
-        fprintf(stderr, "need --dit\n");
+        if (preset_out.id == H3_PRESET_NVFP4)
+            fprintf(stderr,
+                    "need --dit <pruned_nvfp4.safetensors>（preset=nvfp4 非金线；"
+                    "不回退 INT8）\n");
+        else
+            fprintf(stderr, "need --dit\n");
         return 2;
     }
+    if (replay_latent) {
+        /* P0 A/B verification: replay a dumped final latent straight into
+         * VAE decode (skip TE+DiT). One clip, fixed input; async D2H off/on
+         * must produce bit-identical rgb on this path. */
+        int lt = 0, lh = 0, lw = 0;
+        skip_dit = 1;
+        clip_repeat = 1;
+        frames_override = -1;
+        if (!load_latent_file(replay_latent_path, NULL, 0, &lt, &lh, &lw,
+                              error, sizeof(error)))
+            return 2;
+        frames_req = ((lt - 2) / 5) * 17 + 5;
+        if (frames_req < 5) frames_req = 5;
+        frames_aligned = align_frame_count(frames_req);
+        if (video_latent_t_from_frames(frames_aligned) != lt) {
+            fprintf(stderr,
+                    "replay_latent: t=%d not on the 5+17k aligned grid\n", lt);
+            return 2;
+        }
+        seconds = frames_req / 24;
+        if (seconds < 1) seconds = 1;
+        width = lw * 16;
+        height = lh * 16;
+        printf("replay_latent: %s → %dx%dx%d (W=%d H=%d frames=%d; "
+               "VAE-only A/B, not generation)\n",
+               replay_latent_path, lt, lh, lw, width, height, frames_req);
+    }
     if (skip_dit && !init_latent_path && !first_frame_path &&
-        !last_frame_path) {
+        !last_frame_path && !replay_latent) {
         fprintf(stderr,
                 "--skip-dit requires --init-latent or --first-frame / "
                 "--last-frame (VAE encode→decode roundtrip)\n");
@@ -1635,6 +2781,77 @@ int main(int argc, char **argv) {
             fprintf(stderr, "latent H/W must be even (pixel %% 32 == 0)\n");
             return 2;
         }
+        hi_lh = latent_h;
+        hi_lw = latent_w;
+        if (lift_on) {
+            int lo_h = 0, lo_w = 0;
+            if (lift_transition_cli > 0)
+                lift_k = lift_transition_cli;
+            else if (preset_out.id == H3_PRESET_TAOMATE) {
+                lift_k = h3_selflift_taomate_low_nfe(steps);
+                if (lift_k < 1)
+                    lift_k = steps > 1 ? steps - 1 : 1;
+            } else if (steps == 8)
+                lift_k = 6;
+            else if (steps == 4)
+                lift_k = 3;
+            else
+                lift_k = steps > 1 ? steps - 1 : 1;
+            {
+                int all_low = (lift_k == steps);
+                if (lift_k < 1 || lift_k > steps ||
+                    (all_low && preset_out.id != H3_PRESET_TAOMATE)) {
+                    fprintf(stderr,
+                            "h3: lift transition_step=%d illegal for steps=%d\n",
+                            lift_k, steps);
+                    return 1;
+                }
+            }
+            if (!h3_selflift_lowres_latent(hi_lh, hi_lw, 0.5f, &lo_h, &lo_w)) {
+                fprintf(stderr, "h3: selflift lowres geometry failed\n");
+                return 1;
+            }
+            if (preset_out.id == H3_PRESET_TAOMATE) {
+                const char *sw = getenv("H3_TAOMATE_STAGE1_W");
+                const char *sh = getenv("H3_TAOMATE_STAGE1_H");
+                int stage1_w = 0, stage1_h = 0;
+                if (sw && sw[0])
+                    stage1_w = (int)strtol(sw, NULL, 10);
+                if (sh && sh[0])
+                    stage1_h = (int)strtol(sh, NULL, 10);
+                /* Comfy 2-stage: first_stage 864×480, not 0.5×1344. */
+                if (stage1_w >= 32 && stage1_h >= 32 && (stage1_w % 32) == 0 &&
+                    (stage1_h % 32) == 0) {
+                    lo_w = stage1_w / 16;
+                    lo_h = stage1_h / 16;
+                    if ((lo_w & 1) || (lo_h & 1) || lo_w < 2 || lo_h < 2) {
+                        fprintf(stderr,
+                                "h3: H3_TAOMATE_STAGE1 %dx%d not VAE/patch aligned\n",
+                                stage1_w, stage1_h);
+                        return 1;
+                    }
+                    printf("selflift: Comfy stage1 %dx%d → latent %dx%d "
+                           "(not 0.5×%dx%d)\n",
+                           stage1_w, stage1_h, lo_w, lo_h, width, height);
+                }
+            }
+            if (lo_h == hi_lh && lo_w == hi_lw) {
+                fprintf(stderr,
+                        "h3: lift lowres == hires (%dx%d); refusing identity/"
+                        "nearest-only\n",
+                        lo_h, lo_w);
+                return 1;
+            }
+            latent_h = lo_h;
+            latent_w = lo_w;
+            printf("selflift: target_pix=%dx%d latent %dx%d → low %dx%d "
+                   "transition_step=%d (NFE low=%d high=%d) upscaler=%s\n",
+                   width, height, hi_lh, hi_lw, latent_h, latent_w, lift_k,
+                   lift_k, steps - lift_k, latent_upscaler_path);
+            if (preset_out.id == H3_PRESET_TAOMATE && lift_k == steps)
+                printf("selflift: taomate Z0_ONLY (3 low NFE + LBH, 0 high DiT)\n");
+            fflush(stdout);
+        }
         /* Metal/Comfy: (T-2)/5*17+5 when T>=7 and (T-2)%5==0; else legacy T*4. */
         if (latent_t >= 7 && (latent_t - 2) % 5 == 0)
             vae_out_frames = ((latent_t - 2) / 5) * 17 + 5;
@@ -1655,6 +2872,93 @@ int main(int argc, char **argv) {
                     "(pass --seconds without --frames for product 5s/10s; "
                     "--frames 17 is a 0.92s dev clip)\n",
                     (double)mux_n / 24.0, seconds);
+        }
+        if (preset_out.id == H3_PRESET_TAOMATE) {
+            const char *ck = getenv("H3_TAOMATE_CLEAN_KV");
+            const char *hov = getenv("H3_TAOMATE_CHUNK_OVERLAP");
+            const char *hsn = getenv("H3_TAOMATE_SINK_T");
+            const char *lkv = getenv("H3_TAOMATE_LAYER_KV");
+            if (vae_decode && !strcmp(vae_decode, "official") &&
+                !getenv("H3_VAE_WEIGHT_CACHE"))
+                setenv("H3_VAE_WEIGHT_CACHE", "1", 1);
+            memset(&tm_plan, 0, sizeof(tm_plan));
+            if (lkv && lkv[0] == '1')
+                tm_layer_kv = 1;
+            if (ck && ck[0] == '1')
+                tm_clean_kv = 1;
+            else if (ck && ck[0] == '0')
+                tm_clean_kv = 0;
+            if (hov && hov[0])
+                tm_hist_t = taomate_clamp_ov_t(strtol(hov, NULL, 10));
+            if (hsn && hsn[0])
+                tm_sink_t = taomate_clamp_ov_t(strtol(hsn, NULL, 10));
+            if (tm_layer_kv) {
+                tm_clean_kv = 0;
+                if (tm_sink_t <= 0)
+                    tm_sink_t = 2;
+                fprintf(stderr,
+                        "taomate: layer-wise KV on (Q=chunk, K/V hist; "
+                        "not packed-Q CLEAN_KV). hist_t=%d sink_t=%d\n",
+                        tm_hist_t, tm_sink_t);
+            } else if (tm_clean_kv) {
+                fprintf(stderr,
+                        "warning: H3_TAOMATE_CLEAN_KV=1 concatenates whole prior "
+                        "chunks into Q (768P OOM risk). Prefer "
+                        "H3_TAOMATE_LAYER_KV=1 or bounded overlap.\n");
+            }
+            if (!h3_taomate_plan_build(frames_aligned, &tm_plan, error,
+                                       sizeof(error))) {
+                fprintf(stderr, "h3: taomate plan: %s\n", error);
+                return 1;
+            }
+            {
+                const char *force_chunks = getenv("H3_TAOMATE_FORCE_CHUNKS");
+                int want_oneshot = (frames_aligned == 124);
+                if (force_chunks && force_chunks[0] == '1')
+                    want_oneshot = 0;
+                if (want_oneshot) {
+                    if (!h3_taomate_plan_build_oneshot(frames_aligned, &tm_plan,
+                                                       error, sizeof(error))) {
+                        fprintf(stderr, "h3: taomate oneshot: %s\n", error);
+                        return 1;
+                    }
+                    tm_layer_kv = 0;
+                    tm_clean_kv = 0;
+                    tm_hist_t = 0;
+                    tm_sink_t = 0;
+                    /* Full-clip Q ≈37k. sage3 packed 14344 gemm-acc OOM'd;
+                     * gold 5s dense uses cuDNN. Keep explicit --sdpa. */
+                    if (!sdpa_explicit) {
+                        sdpa = "cudnn";
+                        printf("taomate_oneshot: SDPA cudnn (full 5s Q; not "
+                               "sage3 pad, not 4 codec chunks)\n");
+                    }
+                }
+            }
+            tm_plan_ok = 1;
+            printf("taomate_plan: frames=%d video_t=%d audio_t=%d phases=%d "
+                   "clean_kv=%d layer_kv=%d hist_t=%d sink_t=%d canvas=%dx%d "
+                   "(Comfy 2-stage target 1376x768; CUDA generate allows it)\n",
+                   tm_plan.native_frames, tm_plan.video_t, tm_plan.audio_t,
+                   tm_plan.n_phases, tm_clean_kv, tm_layer_kv, tm_hist_t,
+                   tm_sink_t, width, height);
+            {
+                int pi;
+                for (pi = 0; pi < tm_plan.n_phases; pi++) {
+                    const h3_taomate_phase *ph = &tm_plan.phases[pi];
+                    printf("  chunk%d groups=%d frames=%d..%d video_t=%d..%d "
+                           "audio_t=%d..%d\n",
+                           pi, ph->group_count, ph->frame_start, ph->frame_stop,
+                           ph->video_t0, ph->video_t1, ph->audio_t0,
+                           ph->audio_t1);
+                }
+            }
+            if (tm_plan.video_t != latent_t) {
+                fprintf(stderr,
+                        "h3: taomate video_t %d != latent_t %d\n",
+                        tm_plan.video_t, latent_t);
+                return 1;
+            }
         }
     }
     /* Quality default: global SDPA. Local --window W (e.g. 18) only attends
@@ -1760,7 +3064,7 @@ int main(int argc, char **argv) {
         }
         printf("probe_vae_load: path=%s repeats=%d blocks=%u cache=%s resident=%s\n",
                vae_path, vae_repeats, vae_blocks,
-               getenv("H3_VAE_WEIGHT_CACHE") ? getenv("H3_VAE_WEIGHT_CACHE") : "0",
+               h3_vae_int8_weight_cache_wanted() ? "1" : "0",
                getenv("H3_VAE_CUDA_W_RESIDENT")
                    ? getenv("H3_VAE_CUDA_W_RESIDENT")
                    : "1");
@@ -1782,8 +3086,39 @@ int main(int argc, char **argv) {
     }
 
     t_all0 = now_ms();
-    /* Prefer Comfy INT8 ConvRot DiT (theme-follow path); else W4A8. */
-    dit_int8 = h3_dit_int8_store_open(dit_path, error, sizeof(error));
+    /* NVFP4 accel SKU: probe first, hard-fail, never silent INT8. */
+    {
+        int want_nvfp4 = (preset_out.id == H3_PRESET_NVFP4) ||
+                         h3_dit_nvfp4_path_hints(dit_path);
+        if (want_nvfp4) {
+            if (!h3_nvfp4_store_open(dit_path, &dit_nvfp4, error,
+                                     sizeof(error))) {
+                fprintf(stderr,
+                        "h3: NVFP4 DiT 探测失败（不是金线；不回退 INT8）: %s\n",
+                        error);
+                return 1;
+            }
+            dit_nvfp4_opened = 1;
+            if (!h3_dit_nvfp4_probe(&dit_nvfp4, error, sizeof(error))) {
+                fprintf(stderr, "h3: %s\n", error);
+                h3_nvfp4_store_free(&dit_nvfp4);
+                dit_nvfp4_opened = 0;
+                return 1;
+            }
+            dit_is_nvfp4 = 1;
+            printf("dit_format: NVFP4 (非金线；dequant→INT8 GEMM)\n");
+            if (n_ref_images || ref_video_path)
+                printf("dit_tree: Ref2VA %s (not FL2VA)\n", dit_path);
+            if (!h3_dit_w4a8_load_core_nvfp4(&dit_nvfp4, &core, error,
+                                             sizeof(error))) {
+                fprintf(stderr, "load_core_nvfp4: %s\n", error);
+                goto cleanup;
+            }
+        }
+    }
+    /* Prefer Comfy INT8 ConvRot DiT (theme-follow / gold); else W4A8. */
+    if (!dit_is_nvfp4)
+        dit_int8 = h3_dit_int8_store_open(dit_path, error, sizeof(error));
     if (dit_int8) {
         dit_is_int8 = 1;
         printf("dit_format: INT8 ConvRot (theme-follow path)\n");
@@ -1794,7 +3129,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "load_core_int8: %s\n", error);
             goto cleanup;
         }
-    } else {
+    } else if (!dit_is_nvfp4) {
         dit_store = h3_w4a8_store_open(dit_path, error, sizeof(error));
         if (!dit_store) {
             if (n_ref_images || ref_video_path)
@@ -1847,6 +3182,43 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cuda: %s\n", error);
         goto cleanup;
     }
+    if (lift_on) {
+        int in_ch = 0, hid = 0;
+        h3_vae_int8_store vs;
+        memset(&vs, 0, sizeof(vs));
+        memset(lift_mean, 0, sizeof(lift_mean));
+        memset(lift_std, 0, sizeof(lift_std));
+        if (!h3_latent_upscaler_open(latent_upscaler_path, &lat_up, error,
+                                     sizeof(error))) {
+            fprintf(stderr, "h3: latent-upscaler open: %s\n", error);
+            goto cleanup;
+        }
+        if (!h3_latent_upscaler_probe(lat_up, &in_ch, &hid, error,
+                                      sizeof(error))) {
+            fprintf(stderr, "h3: latent-upscaler probe: %s\n", error);
+            goto cleanup;
+        }
+        if (!vae_path) {
+            fprintf(stderr, "h3: preset=lift 需要 --vae 以加载 latents_mean/std\n");
+            goto cleanup;
+        }
+        if (!h3_vae_int8_store_open(vae_path, &vs, error, sizeof(error)) ||
+            !h3_vae_int8_load_latent_stats(&vs, lift_mean, lift_std, error,
+                                           sizeof(error))) {
+            fprintf(stderr, "h3: lift latent stats: %s\n", error);
+            h3_vae_int8_store_free(&vs);
+            goto cleanup;
+        }
+        h3_vae_int8_store_free(&vs);
+        lift_stats_ok = 1;
+        printf("selflift: LBH 24→%d loaded (%s); VAE mean/std ok\n", hid,
+               latent_upscaler_path);
+        fflush(stdout);
+    }
+    if (tae_keep && !h3_tae_bind_cuda(tae_keep, cuda, error, sizeof(error))) {
+        fprintf(stderr, "h3: %s\n", error);
+        goto cleanup;
+    }
     if (ulysses > 1) {
         int ids[8];
         int ui;
@@ -1875,7 +3247,10 @@ int main(int argc, char **argv) {
     }
     h3_dit_w4a8_config_init(&cfg);
     if (!skip_dit) {
-        if (dit_is_int8)
+        if (dit_is_nvfp4)
+            dit = h3_dit_w4a8_open_nvfp4(cuda, &dit_nvfp4, &cfg, error,
+                                         sizeof(error));
+        else if (dit_is_int8)
             dit = h3_dit_w4a8_open_int8(cuda, dit_int8, &cfg, error,
                                         sizeof(error));
         else
@@ -1892,19 +3267,55 @@ int main(int argc, char **argv) {
         if (lora_path && lora_path[0]) {
             if (!(lora_scale > 0.0f) || !isfinite(lora_scale))
                 lora_scale = 1.0f;
-            if (!h3_lora_load(lora_path, lora_scale, &lora_set, error,
-                              sizeof(error))) {
-                fprintf(stderr, "h3: lora 非金线: %s\n", error);
-                goto cleanup;
+            {
+                unsigned lora_flags = 0;
+                if (preset_out.id == H3_PRESET_TAOMATE)
+                    lora_flags = H3_LORA_REQUIRE_REFINER;
+                if (!h3_lora_load_flags(lora_path, lora_scale, lora_flags,
+                                        &lora_set, error, sizeof(error))) {
+                    fprintf(stderr, "h3: lora 非金线: %s\n", error);
+                    goto cleanup;
+                }
             }
             lora_loaded = 1;
             if (!h3_dit_w4a8_set_lora(dit, &lora_set, error, sizeof(error))) {
                 fprintf(stderr, "h3: lora attach: %s\n", error);
                 goto cleanup;
             }
-            printf("lora: path=%s scale=%.3g pairs=%d ignored_vsa=%d (非金线)\n",
+            printf("lora: path=%s scale=%.3g pairs=%d refiner_pairs=%d "
+                   "ignored_vsa=%d (非金线)\n",
                    lora_set.path, (double)lora_set.scale, lora_set.n_pairs,
-                   lora_set.ignored_vsa_tensors);
+                   lora_set.n_refiner_pairs, lora_set.ignored_vsa_tensors);
+        }
+        {
+            const char *rl = getenv("H3_REFINER_LORA");
+            const char *rn = getenv("H3_REFINER_LORA_STEPS");
+            const char *rs = getenv("H3_REFINER_LORA_SCALE");
+            if (rl && *rl && lora_loaded) {
+                float rscale = 1.0f;
+                int rsteps = 1;
+                if (rs && *rs) {
+                    rscale = (float)strtod(rs, NULL);
+                    if (!(rscale > 0.0f) || !isfinite(rscale))
+                        rscale = 1.0f;
+                }
+                if (rn && *rn) {
+                    rsteps = (int)strtol(rn, NULL, 10);
+                    if (rsteps < 1)
+                        rsteps = 1;
+                }
+                if (!h3_lora_load_flags(rl, rscale, 0, &refiner_lora_set, error,
+                                        sizeof(error))) {
+                    fprintf(stderr, "h3: refiner lora: %s\n", error);
+                    goto cleanup;
+                }
+                refiner_lora_loaded = 1;
+                refiner_lora_steps = rsteps;
+                printf("refiner_lora: path=%s scale=%.3g tail_steps=%d "
+                       "pairs=%d (opt-in; 主体 %s 保持)\n",
+                       rl, (double)rscale, rsteps, refiner_lora_set.n_pairs,
+                       lora_path);
+            }
         }
         if (ulysses > 1 && dit) {
             h3_dit_w4a8_sp_comm comm;
@@ -1928,7 +3339,11 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "h3: ulysses rank %d cuda: %s\n", ui, error);
                     goto cleanup;
                 }
-                if (dit_is_int8)
+                if (dit_is_nvfp4)
+                    uly_dit[ui] = h3_dit_w4a8_open_nvfp4(uly_cuda[ui],
+                                                         &dit_nvfp4, &cfg,
+                                                         error, sizeof(error));
+                else if (dit_is_int8)
                     uly_dit[ui] = h3_dit_w4a8_open_int8(uly_cuda[ui], dit_int8,
                                                         &cfg, error,
                                                         sizeof(error));
@@ -2569,6 +3984,10 @@ int main(int argc, char **argv) {
 
     video_seq = (size_t)latent_t * (size_t)(latent_h / 2) * (size_t)(latent_w / 2);
     n_lat = video_seq * H3_DIT_W4A8_VIDEO_PATCH;
+    orig_lh = latent_h;
+    orig_lw = latent_w;
+    orig_n_lat = n_lat;
+    orig_vseq = video_seq;
     latent = (float *)malloc(n_lat * sizeof(float));
     velocity = (float *)malloc(n_lat * sizeof(float));
     sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
@@ -2669,6 +4088,17 @@ int main(int argc, char **argv) {
         printf("init_latent: loaded %zu f32 from %s (full T; standing-pose "
                "risk if the dump is a still encode)\n",
                n_lat, init_latent_path);
+    }
+    if (replay_latent) {
+        if (!load_latent_file(replay_latent_path, latent, n_lat, NULL, NULL,
+                              NULL, error, sizeof(error))) {
+            fprintf(stderr, "replay_latent: %s\n", error);
+            goto cleanup;
+        }
+        printf("replay_latent: loaded %zu f32 checksum=0x%016llx "
+               "(bit-fixed VAE input; async off/on must match)\n",
+               n_lat,
+               (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat));
     }
     if (lock_first_frame) {
         frame0_lock = (float *)malloc(frame0_elems * sizeof(float));
@@ -3225,13 +4655,49 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
-    build_serving_sigmas(steps, H3_CUDA_VIDEO_SIGMA_SHIFT, sigmas);
+    if (preset_out.id == H3_PRESET_TAOMATE) {
+        if (steps == 5) {
+            /* Comfy BasicScheduler simple + MiniMax shift. Not distilled 3. */
+            if (!build_serving_sigmas(steps, H3_CUDA_VIDEO_SIGMA_SHIFT, sigmas)) {
+                fprintf(stderr, "taomate Comfy simple-5 video schedule failed\n");
+                goto cleanup;
+            }
+        } else if (!h3_taomate_nfe_sigmas(steps, H3_CUDA_VIDEO_SIGMA_SHIFT,
+                                          sigmas)) {
+            fprintf(stderr, "taomate video schedule failed nfe=%d\n", steps);
+            goto cleanup;
+        }
+    } else {
+        build_serving_sigmas(steps, H3_CUDA_VIDEO_SIGMA_SHIFT, sigmas);
+    }
     audio_sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
     if (!audio_sigmas) {
         fprintf(stderr, "OOM audio sigmas\n");
         goto cleanup;
     }
-    build_serving_sigmas(steps, H3_CUDA_AUDIO_SIGMA_SHIFT, audio_sigmas);
+    if (preset_out.id == H3_PRESET_TAOMATE) {
+        if (steps == 5) {
+            if (!build_serving_sigmas(steps, H3_CUDA_AUDIO_SIGMA_SHIFT,
+                                      audio_sigmas)) {
+                fprintf(stderr, "taomate Comfy simple-5 audio schedule failed\n");
+                goto cleanup;
+            }
+            printf("taomate_schedule: nfe=5 simple+shift "
+                   "(Comfy BasicScheduler/SplitSigmas 3+2; 非 distilled-3)\n");
+            printf("taomate_sampler: Euler CONST (Comfy KSamplerSelect=er_sde "
+                   "VP ER-SDE-3; needs x0+stage history, not ported)\n");
+        } else if (!h3_taomate_nfe_sigmas(steps, H3_CUDA_AUDIO_SIGMA_SHIFT,
+                                         audio_sigmas)) {
+            fprintf(stderr, "taomate audio schedule failed nfe=%d\n", steps);
+            goto cleanup;
+        } else {
+            printf("taomate_schedule: nfe=%d %s (非 serving-3)\n", steps,
+                   steps == 6 ? "anchors=0,8,16,24,33,41,49"
+                              : "anchors=0,16,33,49");
+        }
+    } else {
+        build_serving_sigmas(steps, audio_sigma_shift_effective(), audio_sigmas);
+    }
     printf("sigma[0..%d] video:", steps);
     for (step = 0; step <= steps; step++)
         printf(" %.4g", (double)sigmas[step]);
@@ -3303,7 +4769,7 @@ int main(int argc, char **argv) {
         printf("adaln_dual_sigma: video_shift=%.3g audio_shift=%.3g "
                "(Metal/vLLM schedule_row_map)\n",
                (double)H3_CUDA_VIDEO_SIGMA_SHIFT,
-               (double)H3_CUDA_AUDIO_SIGMA_SHIFT);
+               (double)audio_sigma_shift_effective());
 
     /* cafe 5s: do not unpack DiT weights or JIT DiT SDPA during TE.
      * Cross-thread cuDNN graphs (p5a) made step1 slower; GPU prefetch
@@ -3323,7 +4789,7 @@ int main(int argc, char **argv) {
         }
         /* After TE packed H2D, disk is free: stage INT8 host while TE
          * layers run. Starting at te_open contended the 12.8GiB TE upload. */
-        if (dit_is_int8 && dit) {
+        if ((dit_is_int8 || dit_is_nvfp4) && dit) {
             const char *hs = getenv("H3_DIT_HOST_STAGE_TE");
             int want_hs = !(hs && hs[0] == '0');
             if (want_hs) {
@@ -3391,6 +4857,24 @@ int main(int argc, char **argv) {
                     te_st.all_finite = 1;
                     printf("te_prompt_cache: HIT dir=%s key=%s tokens=%zu\n",
                            te_cache_dir, te_pc_hex, context);
+                    /* Packed hook never fires on HIT — kick host_stage here. */
+                    if ((dit_is_int8 || dit_is_nvfp4) && dit &&
+                        !host_stage_th_ok) {
+                        const char *hs = getenv("H3_DIT_HOST_STAGE_TE");
+                        if (!(hs && hs[0] == '0')) {
+                            host_stage_job.dit = dit;
+                            host_stage_job.first = 0;
+                            host_stage_job.n = dit_layers;
+                            host_stage_job.ms = 0.0;
+                            host_stage_job.ok = 0;
+                            host_stage_job.err[0] = '\0';
+                            host_stage_kick_job.job = &host_stage_job;
+                            host_stage_kick_job.th = &host_stage_th;
+                            host_stage_kick_job.ok = &host_stage_th_ok;
+                            host_stage_kick_job.t0 = &host_stage_t0;
+                            kick_dit_host_stage(&host_stage_kick_job);
+                        }
+                    }
                     fflush(stdout);
                 } else if (error[0] && strstr(error, "header mismatch")) {
                     fprintf(stderr, "te_prompt_cache: %s (recompute)\n", error);
@@ -3627,16 +5111,36 @@ int main(int argc, char **argv) {
         printf("released TE after encode (before DiT; context=%zu)\n",
                context);
     }
-    if (host_stage_th_ok) {
+    if (host_stage_th_ok && dit_is_nvfp4) {
+        /* NVFP4 host dequant reallocs the same host slots the DiT upload
+         * reads. Overlap UAF'd (SIGSEGV) at first qkv GEMM. Join first.
+         * Gold INT8 aliases mmap and may overlap (want=2 below). */
         pthread_join(host_stage_th, NULL);
         host_stage_th_ok = 0;
-        printf("dit_host_stage: done ok=%d wall_ms=%.1f stage_ms=%.1f "
-               "blocks=%u%s%s\n",
-               host_stage_job.ok, now_ms() - host_stage_t0, host_stage_job.ms,
-               host_stage_job.n, host_stage_job.ok ? "" : " err=",
-               host_stage_job.ok
-                   ? ""
-                   : (host_stage_job.err[0] ? host_stage_job.err : "unknown"));
+        printf("dit_host_stage: NVFP4 joined before DiT (no overlap；非金线)\n");
+        fflush(stdout);
+    } else if (host_stage_th_ok) {
+        /* Do not join all 50 before DiT. Wait for the first 2 blocks so
+         * step1 can start; remaining disk→host overlaps compute. */
+        unsigned want = 2;
+        double tw0 = now_ms();
+        const char *we = getenv("H3_DIT_HOST_STAGE_WAIT_BLOCKS");
+        h3_w4a8_cache *hc = h3_dit_w4a8_cache(dit);
+        if (we && we[0]) {
+            long v = strtol(we, NULL, 10);
+            if (v >= 1 && v <= 50) want = (unsigned)v;
+        }
+        while (hc) {
+            unsigned ready = h3_w4a8_cache_host_ready_blocks(hc);
+            if (ready >= want || host_stage_job.done) break;
+            if (now_ms() - tw0 > 120000.0) break;
+            usleep(2000);
+        }
+        printf("dit_host_stage: wait_first want=%u ready=%u wait_ms=%.1f "
+               "(thread still running; join after DiT)\n",
+               want,
+               hc ? h3_w4a8_cache_host_ready_blocks(hc) : 0,
+               now_ms() - tw0);
         fflush(stdout);
     }
 
@@ -3650,6 +5154,14 @@ int main(int argc, char **argv) {
         prefetch_done = NULL;
     }
 
+    if (sdpa_th_ok) {
+        pthread_join(sdpa_th, NULL);
+        sdpa_th_ok = 0;
+        printf("sage3_warmup: join ok=%d seq=%zu err=%s\n", sdpa_job.ok,
+               sdpa_job.seq, sdpa_job.err[0] ? sdpa_job.err : "-");
+        fflush(stdout);
+    }
+
     /* After TE: JIT the DiT cuDNN plan on the owner handle so step1's
      * first SDPA is a hit. Worker-thread JIT (p5) bound the graph to the
      * wrong handle and slowed step1 — do not bring that back.
@@ -3661,6 +5173,26 @@ int main(int argc, char **argv) {
         if (want_reuse) {
             size_t packed_seq = context + cond_seq + audio_cond_seq +
                                 video_seq + (pack_audio ? audio_seq : 0);
+            if (preset_out.id == H3_PRESET_TAOMATE && tm_plan_ok &&
+                latent_t > 0) {
+                size_t spatial = video_seq / (size_t)latent_t;
+                int pi;
+                size_t max_c = context;
+                for (pi = 0; pi < tm_plan.n_phases; pi++) {
+                    size_t s = taomate_phase_packed_seq(
+                        &tm_plan, pi, context, spatial, pack_audio,
+                        tm_layer_kv ? 0 : tm_clean_kv,
+                        tm_layer_kv ? 0 : tm_hist_t,
+                        tm_layer_kv ? 0 : tm_sink_t);
+                    if (s > max_c)
+                        max_c = s;
+                }
+                packed_seq = max_c;
+                printf("taomate_pack: prebuild_seq=%zu (max chunk Q%s "
+                       "hist_t=%d sink_t=%d, not full video_seq=%zu)\n",
+                       packed_seq, tm_layer_kv ? ", layer-KV K/V extra" : "+overlap",
+                       tm_hist_t, tm_sink_t, video_seq);
+            }
             float attn_scale = 1.0f / sqrtf((float)H3_DIT_W4A8_HEAD_DIM);
             double t_prep = now_ms();
             char pb_err[256];
@@ -3683,6 +5215,26 @@ int main(int argc, char **argv) {
                 if (!pb_ok)
                     printf("dit_plan_reuse: prebuild_err=%s\n",
                            pb_err[0] ? pb_err : "unknown");
+                /* Extra chunk seqs (10/5 T) so later phases do not JIT. */
+                if (preset_out.id == H3_PRESET_TAOMATE && tm_plan_ok &&
+                    sdpa && !strcmp(sdpa, "sage3")) {
+                    size_t spatial = video_seq / (size_t)latent_t;
+                    int pj;
+                    for (pj = 0; pj < tm_plan.n_phases; pj++) {
+                        size_t s = taomate_phase_packed_seq(
+                            &tm_plan, pj, context, spatial, pack_audio,
+                            tm_layer_kv ? 0 : tm_clean_kv,
+                            tm_layer_kv ? 0 : tm_hist_t,
+                            tm_layer_kv ? 0 : tm_sink_t);
+                        if (s == packed_seq)
+                            continue;
+                        pb_err[0] = '\0';
+                        (void)h3_cuda_sage3_warmup(cuda, s, pb_heads,
+                                                   (size_t)H3_DIT_W4A8_HEAD_DIM,
+                                                   attn_scale, pb_err,
+                                                   sizeof(pb_err));
+                    }
+                }
                 for (pbi = 1; pbi < ulysses && pbi < 8; pbi++) {
                     if (!uly_cuda[pbi])
                         continue;
@@ -3697,13 +5249,678 @@ int main(int argc, char **argv) {
             }
             fflush(stdout);
         }
+        if (dit) {
+            h3_w4a8_cache *cw0 = h3_dit_w4a8_cache(dit);
+            if (cw0)
+                h3_w4a8_cache_log_window(cw0, "after_te");
+        }
+        gen_mem_trace(cuda, "after_te");
+    }
+
+clip_denoise:
+    gen_mem_trace(cuda, clip_i > 0 ? "clip_start_hot" : "clip_start");
+    mux_write = mux_path;
+    if (mux_path && clip_repeat > 1) {
+        mux_path_for_clip(mux_clip_path, sizeof(mux_clip_path), mux_path, clip_i,
+                          clip_repeat);
+        mux_write = mux_clip_path;
+    }
+    if (clip_i > 0) {
+        /* Restore pre-LBH geometry: Z0 grow_f32 mutates latent_h/n_lat. */
+        latent_h = orig_lh;
+        latent_w = orig_lw;
+        n_lat = orig_n_lat;
+        video_seq = orig_vseq;
+        fill_normal_f32(seed + (uint64_t)clip_i, latent, n_lat);
+        if (pack_audio && audio_c2t) {
+            fill_normal_f32(seed + 0xA11DULL + (uint64_t)clip_i, audio_c2t,
+                            (size_t)H3_DIT_W4A8_AUDIO_CH * 2 * (size_t)audio_t);
+            if (!h3_dit_w4a8_pack_audio_latent(audio_c2t, audio_t, audio_rows,
+                                               error, sizeof(error))) {
+                fprintf(stderr, "pack audio (repeat): %s\n", error);
+                goto cleanup;
+            }
+        }
+        /* LBH rewrote pt/ph/pw to hires RoPE. Clip 2 must denoise at
+         * stage-1 geometry with matching positions or VAE sees weave. */
+        if (!h3_dit_w4a8_fill_metal_video_pos(target_rope_t0, latent_t,
+                                              latent_h, latent_w, pt, ph, pw,
+                                              error, sizeof(error))) {
+            fprintf(stderr, "video pos (repeat): %s\n", error);
+            goto cleanup;
+        }
+        if (pack_audio && apt && aph && apw) {
+            if (!h3_dit_w4a8_fill_metal_audio_pos(
+                    target_rope_t0, audio_t, latent_h, latent_w, apt, aph, apw,
+                    error, sizeof(error))) {
+                fprintf(stderr, "audio pos (repeat): %s\n", error);
+                goto cleanup;
+            }
+        }
+        printf("repeat_clip: restored rope latent %dx%d video_seq=%zu\n",
+               latent_w, latent_h, video_seq);
+        t_all0 = now_ms();
+        t_te = 0;
+        t_dit = t_vae = t_audio = t_ppm = t_mux = 0;
+        t_lift_switch = 0;
+        audio_overlap = 0;
+        memset(&vae_prewarm_job, 0, sizeof(vae_prewarm_job));
+        dit_evals = dit_skips = 0;
+        last_eval = prev_eval = -1;
+        mag_accum = 0.0f;
+        mag_have_probe = 0;
+        mag_consec = 0;
+        mag_fresh = 0;
+        free(mux_rgb);
+        mux_rgb = NULL;
+        free(latent_chw);
+        latent_chw = NULL;
+        h3_vae_int8_frames_free(&frames);
+        h3_audio_vae_cuda_waveform_free(&awave);
+        printf("repeat_clip: i=%d/%d hot=1 (reuse LoRA/INT8 pin/sage3/DiT; "
+               "no re-pin) mux=%s\n",
+               clip_i + 1, clip_repeat, mux_write ? mux_write : "-");
+        fflush(stdout);
+    } else if (clip_repeat > 1) {
+        printf("repeat_clip: i=1/%d hot=0 mux=%s\n", clip_repeat,
+               mux_write ? mux_write : "-");
+        fflush(stdout);
     }
 
     t0 = now_ms();
+    if (preset_out.id == H3_PRESET_TAOMATE && tm_plan_ok) {
+        size_t spatial = video_seq / (size_t)latent_t;
+        size_t t_floats = n_lat / (size_t)latent_t;
+        int pi, st;
+        int max_vt = 0, max_at = 0;
+        float *v_chunk = NULL, *v_vel = NULL, *a_chunk = NULL, *a_vel = NULL;
+        float *kv_v = NULL, *kv_a = NULL;
+        float *kv_pt = NULL, *kv_ph = NULL, *kv_pw = NULL;
+        float *kv_apt = NULL, *kv_aph = NULL, *kv_apw = NULL;
+        float *a_ptc = NULL, *a_phc = NULL, *a_pwc = NULL;
+        float *tm_vel = NULL, *tm_a_vel = NULL;
+        float *lat_noise = NULL, *au_noise = NULL;
+        double tm_low_ms = 0.0, tm_high_ms = 0.0, tm_lbh_ms = 0.0;
+        int denoise_ov = tm_layer_kv ? 0 : (tm_clean_kv ? 0 : tm_hist_t);
+        int cond_hist = tm_layer_kv ? 0 : (tm_clean_kv ? tm_hist_t : 0);
+        int pack_sink = tm_layer_kv ? 0 : tm_sink_t;
+        int use_kv = !tm_layer_kv && (tm_clean_kv || (tm_sink_t > 0));
+        int layer_kv_on = 0;
+        uint32_t tm_sidx[16384];
+        int st_hi;
+        int lbh_rc = 1;
+        if (cond_seq || audio_cond_seq) {
+            fprintf(stderr, "h3: taomate 拒绝与 F2VA/ref cond 叠用\n");
+            goto cleanup;
+        }
+        for (pi = 0; pi < tm_plan.n_phases; pi++) {
+            int t0w = h3_taomate_denoise_t0(&tm_plan, pi, denoise_ov);
+            int a0w = h3_taomate_denoise_a0(&tm_plan, pi, denoise_ov);
+            int vt = tm_plan.phases[pi].video_t1 - t0w;
+            int at = tm_plan.phases[pi].audio_t1 - a0w;
+            if (vt > max_vt) max_vt = vt;
+            if (at > max_at) max_at = at;
+        }
+        lat_noise = (float *)malloc(n_lat * sizeof(float));
+        if (lat_noise)
+            memcpy(lat_noise, latent, n_lat * sizeof(float));
+        if (pack_audio && audio_rows && n_audio) {
+            au_noise = (float *)malloc(n_audio * sizeof(float));
+            if (au_noise)
+                memcpy(au_noise, audio_rows, n_audio * sizeof(float));
+        }
+        v_chunk = (float *)malloc((size_t)max_vt * t_floats * sizeof(float));
+        v_vel = (float *)malloc((size_t)max_vt * t_floats * sizeof(float));
+        if (pack_audio && max_at > 0) {
+            a_chunk = (float *)calloc((size_t)max_at * 2u *
+                                          (size_t)H3_DIT_W4A8_AUDIO_CH,
+                                      sizeof(float));
+            a_vel = (float *)calloc((size_t)max_at * 2u *
+                                        (size_t)H3_DIT_W4A8_AUDIO_CH,
+                                    sizeof(float));
+            a_ptc = (float *)malloc((size_t)max_at * 2u * sizeof(float));
+            a_phc = (float *)malloc((size_t)max_at * 2u * sizeof(float));
+            a_pwc = (float *)malloc((size_t)max_at * 2u * sizeof(float));
+        }
+        if (use_kv) {
+            kv_v = (float *)malloc(n_lat * sizeof(float));
+            kv_pt = (float *)malloc(video_seq * sizeof(float));
+            kv_ph = (float *)malloc(video_seq * sizeof(float));
+            kv_pw = (float *)malloc(video_seq * sizeof(float));
+            if (pack_audio) {
+                kv_a = (float *)malloc(n_audio * sizeof(float));
+                kv_apt = (float *)malloc(audio_seq * sizeof(float));
+                kv_aph = (float *)malloc(audio_seq * sizeof(float));
+                kv_apw = (float *)malloc(audio_seq * sizeof(float));
+            }
+        }
+        if (lift_on) {
+            tm_vel = (float *)malloc(n_lat * sizeof(float));
+            if (pack_audio && n_audio)
+                tm_a_vel = (float *)calloc(n_audio, sizeof(float));
+        }
+        if (!v_chunk || !v_vel || !lat_noise ||
+            (pack_audio && max_at > 0 && (!a_chunk || !a_vel)) ||
+            (pack_audio && n_audio && !au_noise) ||
+            (use_kv && (!kv_v || !kv_pt || !kv_ph || !kv_pw)) ||
+            (lift_on && !tm_vel) || (lift_on && pack_audio && n_audio && !tm_a_vel)) {
+            fprintf(stderr, "OOM taomate chunk buffers\n");
+            free(v_chunk);
+            free(v_vel);
+            free(a_chunk);
+            free(a_vel);
+            free(kv_v);
+            free(kv_a);
+            free(kv_pt);
+            free(kv_ph);
+            free(kv_pw);
+            free(kv_apt);
+            free(kv_aph);
+            free(kv_apw);
+            free(tm_vel);
+            free(tm_a_vel);
+            free(lat_noise);
+            free(au_noise);
+            goto cleanup;
+        }
+        st_hi = (lift_on && lift_k > 0 && lift_k < steps) ? lift_k : steps;
+        printf("taomate_stream: phases=%d max_vt=%d spatial=%zu clean_kv=%d "
+               "layer_kv=%d denoise_ov=%d sink_t=%d lift=%d low_nfe=%d high_nfe=%d "
+               "pix_latent=%dx%d%s\n",
+               tm_plan.n_phases, max_vt, spatial, tm_clean_kv, tm_layer_kv,
+               denoise_ov, tm_sink_t, lift_on, lift_on ? st_hi : steps,
+               lift_on ? (steps - st_hi) : 0, latent_h, latent_w,
+               tm_plan.n_phases == 1 ? " (Comfy oneshot 5s; full-clip Q)"
+                                     : " (codec chunks)");
+        if (tm_layer_kv && dit && !lift_on && ulysses <= 1) {
+            int try_hist = tm_hist_t, try_sink = tm_sink_t;
+            char kv_err[256];
+            while (try_hist > 0 || try_sink > 0) {
+                size_t budget = h3_taomate_layer_kv_budget(
+                    spatial, try_hist, try_sink, pack_audio);
+                h3_w4a8_cache *cw = h3_dit_w4a8_cache(dit);
+                size_t kv_b =
+                    budget * (size_t)H3_DIT_W4A8_HEADS *
+                    (size_t)H3_DIT_W4A8_HEAD_DIM * sizeof(uint16_t) *
+                    (size_t)H3_DIT_W4A8_N_BLOCKS * 2u;
+                kv_err[0] = '\0';
+                if (cw)
+                    (void)h3_w4a8_cache_make_room(
+                        cw, kv_b + ((size_t)3ULL << 30), kv_err,
+                        sizeof(kv_err));
+                kv_err[0] = '\0';
+                if (h3_dit_w4a8_clean_kv_enable(dit, budget, kv_err,
+                                                sizeof(kv_err))) {
+                    tm_hist_t = try_hist;
+                    tm_sink_t = try_sink;
+                    layer_kv_on = 1;
+                    printf("taomate_layer_kv: enabled max_tokens=%zu hist_t=%d "
+                           "sink_t=%d (Q=chunk; hist via rect flash, not sage3 pad)\n",
+                           budget, try_hist, try_sink);
+                    break;
+                }
+                printf("taomate_layer_kv: OOM max_tokens=%zu hist_t=%d sink_t=%d: %s\n",
+                       budget, try_hist, try_sink,
+                       kv_err[0] ? kv_err : "cudaMalloc");
+                fflush(stdout);
+                if (try_sink > 0) {
+                    try_sink = 0;
+                    continue;
+                }
+                if (try_hist <= 1)
+                    break;
+                try_hist--;
+            }
+            if (!layer_kv_on) {
+                fprintf(stderr, "taomate_layer_kv: gave up, running without KV\n");
+                tm_layer_kv = 0;
+            }
+        }
+        for (pi = 0; pi < tm_plan.n_phases; pi++) {
+            const h3_taomate_phase *tch = &tm_plan.phases[pi];
+            int t0_ov = h3_taomate_denoise_t0(&tm_plan, pi, denoise_ov);
+            int a0_ov = h3_taomate_denoise_a0(&tm_plan, pi, denoise_ov);
+            int t0 = tch->video_t0, t1 = tch->video_t1;
+            int a0 = tch->audio_t0, a1 = tch->audio_t1;
+            int vt_ex = t1 - t0;
+            int at_ex = a1 - a0;
+            int vt = t1 - t0_ov;
+            int at = a1 - a0_ov;
+            size_t vseq = (size_t)vt * spatial;
+            size_t aseq = pack_audio ? (size_t)at * 2u : 0;
+            size_t vn = (size_t)vt * t_floats;
+            size_t an = aseq * (size_t)H3_DIT_W4A8_AUDIO_CH;
+            size_t kv_vseq = 0, kv_aseq = 0;
+            const float *vpos_t = pt + (size_t)t0_ov * spatial;
+            const float *vpos_h = ph + (size_t)t0_ov * spatial;
+            const float *vpos_w = pw + (size_t)t0_ov * spatial;
+            const float *apos_t = NULL, *apos_h = NULL, *apos_w = NULL;
+            if (layer_kv_on && dit) {
+                h3_w4a8_cache *cw = h3_dit_w4a8_cache(dit);
+                if (cw)
+                    h3_w4a8_cache_unfreeze_window(cw);
+            }
+            if (pack_audio && apt && aph && apw && a_ptc && at > 0) {
+                taomate_copy_audio_pos(apt, a_ptc, audio_t, a0_ov, a1);
+                taomate_copy_audio_pos(aph, a_phc, audio_t, a0_ov, a1);
+                taomate_copy_audio_pos(apw, a_pwc, audio_t, a0_ov, a1);
+                apos_t = a_ptc;
+                apos_h = a_phc;
+                apos_w = a_pwc;
+            }
+            taomate_copy_video_t(lat_noise, v_chunk, t0_ov, t1, t_floats);
+            if (pack_audio && a_chunk && at > 0)
+                taomate_copy_audio_t(au_noise ? au_noise : audio_rows, a_chunk,
+                                     audio_t, a0_ov, a1);
+            if (use_kv)
+                taomate_pack_history(
+                    &tm_plan, pi, tm_clean_kv, cond_hist, pack_sink, latent, pt,
+                    ph, pw, audio_rows, apt, aph, apw, pack_audio, audio_t,
+                    spatial, t_floats, kv_v, kv_pt, kv_ph, kv_pw, kv_a, kv_apt,
+                    kv_aph, kv_apw, &kv_vseq, &kv_aseq);
+            printf("taomate_chunk: i=%d video_t=%d..%d win=%d..%d seq=%zu "
+                   "kv_vseq=%zu audio_t=%d..%d a_win=%d\n",
+                   pi, t0, t1, t0_ov, t1, vseq, kv_vseq, a0, a1, a0_ov);
+            fflush(stdout);
+            for (st = 0; st < st_hi; st++) {
+                h3_dit_w4a8_forward_stats tmfst;
+                int is_lift_step = lift_on && lift_k < steps &&
+                                   (st == lift_k - 1);
+                memset(&tmfst, 0, sizeof(tmfst));
+                h3_dit_w4a8_set_denoise_step(dit, st);
+                if (layer_kv_on &&
+                    !h3_dit_w4a8_clean_kv_begin(dit, 1, NULL, 0, 0, error,
+                                                sizeof(error))) {
+                    fprintf(stderr, "dit taomate layer-kv noisy: %s\n", error);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                    free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                    goto cleanup;
+                }
+                if (pack_audio) {
+                    if (!h3_dit_w4a8_forward_avc_f32(
+                            dit, &core, 0, dit_layers, sigmas[st],
+                            audio_sigmas[st], v_chunk, vseq, a_chunk, aseq,
+                            kv_vseq ? kv_v : NULL, kv_vseq,
+                            kv_aseq ? kv_a : NULL, kv_aseq, text_h, context,
+                            vpos_t, vpos_h, vpos_w, apos_t, apos_h, apos_w,
+                            kv_vseq ? kv_pt : NULL, kv_vseq ? kv_ph : NULL,
+                            kv_vseq ? kv_pw : NULL,
+                            kv_aseq ? kv_apt : NULL, kv_aseq ? kv_aph : NULL,
+                            kv_aseq ? kv_apw : NULL, 1.0f, v_vel, a_vel, 1,
+                            &tmfst, error, sizeof(error))) {
+                        if (layer_kv_on)
+                            h3_dit_w4a8_clean_kv_finish(dit, h3_dit_w4a8_clean_kv_hist_tokens(dit));
+                        fprintf(stderr, "dit taomate chunk %d step %d: %s\n",
+                                pi, st, error);
+                        free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                        free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                        free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                        goto cleanup;
+                    }
+                } else if (!h3_dit_w4a8_forward_video_f32(
+                               dit, &core, 0, dit_layers, sigmas[st], v_chunk,
+                               vseq, text_h, context, vpos_t, vpos_h, vpos_w,
+                               1.0f, v_vel, 1, &tmfst, error, sizeof(error))) {
+                    if (layer_kv_on)
+                        h3_dit_w4a8_clean_kv_finish(dit, h3_dit_w4a8_clean_kv_hist_tokens(dit));
+                    fprintf(stderr, "dit taomate chunk %d step %d: %s\n", pi, st,
+                            error);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                    free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                    goto cleanup;
+                }
+                if (layer_kv_on)
+                    h3_dit_w4a8_clean_kv_finish(
+                        dit, h3_dit_w4a8_clean_kv_hist_tokens(dit));
+                dit_evals++;
+                if (is_lift_step && tm_vel) {
+                    memcpy(tm_vel + (size_t)t0 * t_floats,
+                           v_vel + (size_t)(t0 - t0_ov) * t_floats,
+                           (size_t)vt_ex * t_floats * sizeof(float));
+                    if (pack_audio && a_vel && tm_a_vel && at_ex > 0 &&
+                        a0_ov == a0)
+                        taomate_write_audio_t(tm_a_vel, a_vel, audio_t, a0, a1);
+                    tm_low_ms += tmfst.total_ms;
+                    printf("taomate_step: chunk=%d step=%d/%d sigma=%.4g "
+                           "dit_ms=%.1f packed=%zu (hold for LBH x0)\n",
+                           pi, st + 1, steps, (double)sigmas[st],
+                           tmfst.total_ms,
+                           context + vseq + aseq + kv_vseq + kv_aseq);
+                    fflush(stdout);
+                    continue;
+                }
+                if (pack_audio && a_chunk && an) {
+                    if (!h3_dit_w4a8_euler_step_f32(
+                            a_chunk, a_vel, an, audio_sigmas[st],
+                            audio_sigmas[st + 1], error, sizeof(error))) {
+                        fprintf(stderr, "taomate audio euler: %s\n", error);
+                        free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                        free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                        free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                        goto cleanup;
+                    }
+                }
+                if (!h3_dit_w4a8_euler_step_f32(v_chunk, v_vel, vn, sigmas[st],
+                                                sigmas[st + 1], error,
+                                                sizeof(error))) {
+                    fprintf(stderr, "taomate euler chunk %d step %d: %s\n", pi,
+                            st, error);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                    free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                    goto cleanup;
+                }
+                printf("taomate_step: chunk=%d step=%d/%d sigma=%.4g->%.4g "
+                       "dit_ms=%.1f packed=%zu%s\n",
+                       pi, st + 1, steps, (double)sigmas[st],
+                       (double)sigmas[st + 1], tmfst.total_ms,
+                       context + vseq + aseq + kv_vseq + kv_aseq,
+                       lift_on ? " low" : "");
+                fflush(stdout);
+                if (lift_on)
+                    tm_low_ms += tmfst.total_ms;
+            }
+            taomate_blend_video_overlap(latent, v_chunk, t0_ov, t0, t1,
+                                        t_floats);
+            if (pack_audio && a_chunk && at > 0)
+                taomate_blend_audio_overlap(audio_rows, a_chunk, audio_t, a0_ov,
+                                            a0, a1);
+            if (layer_kv_on && pi + 1 < tm_plan.n_phases) {
+                size_t n_sink_part = 0, n_save, save_dst;
+                h3_dit_w4a8_forward_stats cfst;
+                size_t audio_off = context;
+                size_t video_off = context + aseq;
+                taomate_copy_video_t(latent, v_chunk, t0, t1, t_floats);
+                if (pack_audio && a_chunk && at_ex > 0)
+                    taomate_copy_audio_t(audio_rows, a_chunk, audio_t, a0, a1);
+                n_save = h3_taomate_layer_kv_save_idx(
+                    &tm_plan, pi, tm_hist_t, tm_sink_t, audio_off, video_off,
+                    spatial, pack_audio, at_ex, tm_sidx,
+                    sizeof(tm_sidx) / sizeof(tm_sidx[0]), &n_sink_part);
+                if (n_save == 0) {
+                    fprintf(stderr, "taomate_layer_kv: commit idx empty chunk %d\n",
+                            pi);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    free(kv_v); free(kv_a); free(kv_pt); free(kv_ph);
+                    free(kv_pw); free(kv_apt); free(kv_aph); free(kv_apw);
+                    goto cleanup;
+                }
+                save_dst = (pi == 0) ? 0 : tm_kv_sink_n;
+                if (pi == 0)
+                    tm_kv_sink_n = n_sink_part;
+                memset(&cfst, 0, sizeof(cfst));
+                if (!h3_dit_w4a8_clean_kv_begin(dit, 2, tm_sidx, n_save, save_dst,
+                                                error, sizeof(error))) {
+                    fprintf(stderr, "taomate_layer_kv commit begin: %s\n", error);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    goto cleanup;
+                }
+                h3_dit_w4a8_set_denoise_step(dit, st_hi);
+                if (pack_audio) {
+                    if (!h3_dit_w4a8_forward_avc_f32(
+                            dit, &core, 0, dit_layers, 0.0f, 0.0f, v_chunk,
+                            vseq, a_chunk, aseq, NULL, 0, NULL, 0, text_h,
+                            context, vpos_t, vpos_h, vpos_w, apos_t, apos_h,
+                            apos_w, NULL, NULL, NULL, NULL, NULL, NULL, 1.0f,
+                            v_vel, a_vel, 1, &cfst, error, sizeof(error))) {
+                        h3_dit_w4a8_clean_kv_finish(dit, save_dst);
+                        fprintf(stderr, "taomate_layer_kv clean fwd chunk %d: %s\n",
+                                pi, error);
+                        free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                        goto cleanup;
+                    }
+                } else if (!h3_dit_w4a8_forward_video_f32(
+                               dit, &core, 0, dit_layers, 0.0f, v_chunk, vseq,
+                               text_h, context, vpos_t, vpos_h, vpos_w, 1.0f,
+                               v_vel, 1, &cfst, error, sizeof(error))) {
+                    h3_dit_w4a8_clean_kv_finish(dit, save_dst);
+                    fprintf(stderr, "taomate_layer_kv clean fwd chunk %d: %s\n",
+                            pi, error);
+                    free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                    goto cleanup;
+                }
+                h3_dit_w4a8_clean_kv_finish(dit, save_dst + n_save);
+                dit_evals++;
+                printf("taomate_layer_kv: commit chunk=%d save=%zu sink=%zu "
+                       "hist_now=%zu dit_ms=%.1f\n",
+                       pi, n_save, tm_kv_sink_n,
+                       h3_dit_w4a8_clean_kv_hist_tokens(dit), cfst.total_ms);
+                fflush(stdout);
+            }
+        }
+        if (lift_on && tm_vel && lat_up) {
+            int hi_st;
+            {
+                int already_x0 = (lift_k >= steps);
+                float sk = already_x0 ? 0.0f : sigmas[lift_k - 1];
+                float sn = already_x0 ? 0.0f : sigmas[lift_k];
+                float ask = already_x0 ? 0.0f : audio_sigmas[lift_k - 1];
+                float asn = already_x0 ? 0.0f : audio_sigmas[lift_k];
+                lbh_rc = generate_lbh_transition(
+                    &latent, &tm_vel, &pt, &ph, &pw, &apt, &aph, &apw, &n_lat,
+                    &video_seq, &latent_h, &latent_w, latent_t, hi_lh, hi_lw,
+                    (int)target_rope_t0, sk, sn, pack_audio, audio_t, n_audio,
+                    audio_rows, tm_a_vel, ask, asn, seed, lift_mean, lift_std,
+                    lat_up, cuda, dit, context, audio_seq, already_x0,
+                    &tm_lbh_ms, error, sizeof(error));
+            }
+            if (!lbh_rc) {
+                fprintf(stderr, "h3: taomate LBH: %s\n", error);
+                free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                free(kv_v); free(kv_a); free(kv_pt); free(kv_ph); free(kv_pw);
+                free(kv_apt); free(kv_aph); free(kv_apw);
+                free(a_ptc); free(a_phc); free(a_pwc);
+                free(tm_vel); free(tm_a_vel);
+                goto cleanup;
+            }
+            /* Comfy MinimaxH3LatentUpscaler3D force_unload=true before stage2. */
+            if (lat_up)
+                h3_latent_upscaler_release_device(lat_up);
+            spatial = video_seq / (size_t)latent_t;
+            t_floats = n_lat / (size_t)latent_t;
+            if (lbh_rc == 1) {
+            free(lat_noise);
+            lat_noise = (float *)malloc(n_lat * sizeof(float));
+            if (lat_noise)
+                memcpy(lat_noise, latent, n_lat * sizeof(float));
+            if (pack_audio && audio_rows && n_audio) {
+                free(au_noise);
+                au_noise = (float *)malloc(n_audio * sizeof(float));
+                if (au_noise)
+                    memcpy(au_noise, audio_rows, n_audio * sizeof(float));
+            }
+            free(v_chunk);
+            free(v_vel);
+            v_chunk = (float *)malloc((size_t)max_vt * t_floats * sizeof(float));
+            v_vel = (float *)malloc((size_t)max_vt * t_floats * sizeof(float));
+            if (!v_chunk || !v_vel || !lat_noise) {
+                fprintf(stderr, "OOM taomate hires chunk buffers\n");
+                free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                free(tm_vel); free(tm_a_vel); free(lat_noise); free(au_noise);
+                goto cleanup;
+            }
+            }
+            if (lbh_rc == 1 && cuda) {
+                int pii;
+                size_t max_c = context;
+                for (pii = 0; pii < tm_plan.n_phases; pii++) {
+                    size_t s = taomate_phase_packed_seq(
+                        &tm_plan, pii, context, spatial, pack_audio,
+                        0, denoise_ov, 0);
+                    if (s > max_c)
+                        max_c = s;
+                }
+                printf("taomate_lift: hires prebuild_seq=%zu\n", max_c);
+                {
+                    double sw_ms = 0.0;
+                    if (!lift_prepare_hires_vram(dit, cuda, max_c, &sw_ms,
+                                                 error, sizeof(error))) {
+                        fprintf(stderr, "h3: taomate hires vram: %s\n", error);
+                        free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
+                        free(tm_vel); free(tm_a_vel);
+                        goto cleanup;
+                    }
+                    t_lift_switch += sw_ms;
+                }
+            }
+            if (lbh_rc == 1) {
+                printf("taomate_lift: high-res tail steps=%d..%d latent %dx%d "
+                       "spatial=%zu\n",
+                       lift_k + 1, steps, latent_h, latent_w, spatial);
+                for (pi = 0; pi < tm_plan.n_phases; pi++) {
+                    const h3_taomate_phase *tch = &tm_plan.phases[pi];
+                    int t0_ov = h3_taomate_denoise_t0(&tm_plan, pi, denoise_ov);
+                    int a0_ov = h3_taomate_denoise_a0(&tm_plan, pi, denoise_ov);
+                    int t0 = tch->video_t0, t1 = tch->video_t1;
+                    int a0 = tch->audio_t0, a1 = tch->audio_t1;
+                    int vt = t1 - t0_ov;
+                    int at = a1 - a0_ov;
+                    size_t vseq = (size_t)vt * spatial;
+                    size_t aseq = pack_audio ? (size_t)at * 2u : 0;
+                    size_t vn = (size_t)vt * t_floats;
+                    size_t an = aseq * (size_t)H3_DIT_W4A8_AUDIO_CH;
+                    const float *vpos_t = pt + (size_t)t0_ov * spatial;
+                    const float *vpos_h = ph + (size_t)t0_ov * spatial;
+                    const float *vpos_w = pw + (size_t)t0_ov * spatial;
+                    const float *apos_t = NULL, *apos_h = NULL, *apos_w = NULL;
+                    if (pack_audio && apt && aph && apw && a_ptc && at > 0) {
+                        taomate_copy_audio_pos(apt, a_ptc, audio_t, a0_ov, a1);
+                        taomate_copy_audio_pos(aph, a_phc, audio_t, a0_ov, a1);
+                        taomate_copy_audio_pos(apw, a_pwc, audio_t, a0_ov, a1);
+                        apos_t = a_ptc;
+                        apos_h = a_phc;
+                        apos_w = a_pwc;
+                    }
+                    taomate_copy_video_t(lat_noise, v_chunk, t0_ov, t1,
+                                         t_floats);
+                    if (pack_audio && a_chunk && at > 0)
+                        taomate_copy_audio_t(au_noise ? au_noise : audio_rows,
+                                             a_chunk, audio_t, a0_ov, a1);
+                    printf("taomate_chunk: i=%d video_t=%d..%d win=%d..%d "
+                           "seq=%zu (hires no sink)\n",
+                           pi, t0, t1, t0_ov, t1, vseq);
+                    for (hi_st = lift_k; hi_st < steps; hi_st++) {
+                        if (!vae_th_ok && !skip_vae && vae_path &&
+                            hi_st == steps - 2) {
+                            vae_prewarm_t0 = now_ms();
+                            if (kick_vae_prewarm(&vae_th, &vae_prewarm_job,
+                                                 vae_path, &vae_store,
+                                                 &vae_opened, device,
+                                                 hi_st + 1,
+                                                 vae_prewarm_want_dev(device),
+                                                 vae_blocks))
+                                vae_th_ok = 1;
+                        }
+                        h3_dit_w4a8_forward_stats tmfst;
+                        int nsys_hi = 0;
+                        memset(&tmfst, 0, sizeof(tmfst));
+                        nsys_hi = h3_nsys_hires_begin(clip_i, hi_st == lift_k);
+                        h3_dit_w4a8_set_denoise_step(dit, hi_st);
+                        if (pack_audio) {
+                            if (!h3_dit_w4a8_forward_avc_f32(
+                                    dit, &core, 0, dit_layers, sigmas[hi_st],
+                                    audio_sigmas[hi_st], v_chunk, vseq, a_chunk,
+                                    aseq, NULL, 0, NULL, 0, text_h, context,
+                                    vpos_t, vpos_h, vpos_w, apos_t, apos_h,
+                                    apos_w, NULL, NULL, NULL, NULL, NULL, NULL,
+                                    1.0f, v_vel, a_vel, 1, &tmfst, error,
+                                    sizeof(error))) {
+                                h3_nsys_hires_end(nsys_hi, 0.0);
+                                fprintf(stderr,
+                                        "dit taomate hires chunk %d step %d: %s\n",
+                                        pi, hi_st, error);
+                                free(v_chunk); free(v_vel); free(a_chunk);
+                                free(a_vel); free(tm_vel); free(tm_a_vel);
+                                goto cleanup;
+                            }
+                        } else if (!h3_dit_w4a8_forward_video_f32(
+                                       dit, &core, 0, dit_layers, sigmas[hi_st],
+                                       v_chunk, vseq, text_h, context, vpos_t,
+                                       vpos_h, vpos_w, 1.0f, v_vel, 1, &tmfst,
+                                       error, sizeof(error))) {
+                            h3_nsys_hires_end(nsys_hi, 0.0);
+                            fprintf(stderr,
+                                    "dit taomate hires chunk %d step %d: %s\n",
+                                    pi, hi_st, error);
+                            free(v_chunk); free(v_vel); free(tm_vel);
+                            goto cleanup;
+                        }
+                        h3_nsys_hires_end(nsys_hi, tmfst.total_ms);
+                        dit_evals++;
+                        if (pack_audio && a_chunk && an) {
+                            if (!h3_dit_w4a8_euler_step_f32(
+                                    a_chunk, a_vel, an, audio_sigmas[hi_st],
+                                    audio_sigmas[hi_st + 1], error,
+                                    sizeof(error))) {
+                                fprintf(stderr, "taomate hires audio euler: %s\n",
+                                        error);
+                                free(v_chunk); free(v_vel); free(tm_vel);
+                                goto cleanup;
+                            }
+                        }
+                        if (!h3_dit_w4a8_euler_step_f32(
+                                v_chunk, v_vel, vn, sigmas[hi_st],
+                                sigmas[hi_st + 1], error, sizeof(error))) {
+                            fprintf(stderr, "taomate hires euler: %s\n", error);
+                            free(v_chunk); free(v_vel); free(tm_vel);
+                            goto cleanup;
+                        }
+                        tm_high_ms += tmfst.total_ms;
+                        printf("taomate_step: chunk=%d step=%d/%d sigma=%.4g->%.4g "
+                               "dit_ms=%.1f packed=%zu high\n",
+                               pi, hi_st + 1, steps, (double)sigmas[hi_st],
+                               (double)sigmas[hi_st + 1], tmfst.total_ms,
+                               context + vseq + aseq);
+                        fflush(stdout);
+                    }
+                    taomate_blend_video_overlap(latent, v_chunk, t0_ov, t0, t1,
+                                                t_floats);
+                    if (pack_audio && a_chunk && at > 0)
+                        taomate_blend_audio_overlap(audio_rows, a_chunk, audio_t,
+                                                    a0_ov, a0, a1);
+                }
+            }
+            printf("taomate_lift: low_dit_ms=%.1f lbh_ms=%.1f high_dit_ms=%.1f "
+                   "nfe_low=%d nfe_high=%d z0_only=%d\n",
+                   tm_low_ms, tm_lbh_ms, tm_high_ms, st_hi,
+                   lbh_rc == 1 ? (steps - st_hi) : 0, lbh_rc == 2);
+            fflush(stdout);
+        }
+        free(v_chunk);
+        free(v_vel);
+        free(a_chunk);
+        free(a_vel);
+        free(kv_v);
+        free(kv_a);
+        free(kv_pt);
+        free(kv_ph);
+        free(kv_pw);
+        free(kv_apt);
+        free(kv_aph);
+        free(kv_apw);
+        free(a_ptc);
+        free(a_phc);
+        free(a_pwc);
+        free(tm_vel);
+        free(tm_a_vel);
+        free(lat_noise);
+        free(au_noise);
+    } else
     for (step = 0; step < steps; step++) {
         h3_dit_w4a8_forward_stats fst;
         int evaluate = reuse_sel[step] ? 1 : 0;
         memset(&fst, 0, sizeof(fst));
+        if (!vae_th_ok && !skip_vae && vae_path &&
+            step == (steps >= 2 ? steps - 2 : 0)) {
+            vae_prewarm_t0 = now_ms();
+            if (kick_vae_prewarm(&vae_th, &vae_prewarm_job, vae_path,
+                                 &vae_store, &vae_opened, device,
+                                 step + 1, vae_prewarm_want_dev(device),
+                                 vae_blocks))
+                vae_th_ok = 1;
+        }
 
         /* MagCache (reuse==1 only): skip middle while accum < thresh AND
          * consecutive skips < mag_max_consec (H3 Safe default 2). First/last
@@ -3719,6 +5936,29 @@ int main(int argc, char **argv) {
         if (step == 0 || step == steps - 1) evaluate = 1;
 
         h3_dit_w4a8_set_denoise_step(dit, step);
+
+        /* Opt-in refiner 切换：末 N 步前把 LoRA 换为 refiner set，其余步换回主体。 */
+        if (refiner_lora_loaded) {
+            int want_refiner = (step >= steps - refiner_lora_steps);
+            if (want_refiner && !refiner_lora_attached) {
+                double tsw = now_ms();
+                if (!h3_dit_w4a8_set_lora(dit, &refiner_lora_set, error,
+                                          sizeof(error))) {
+                    fprintf(stderr, "h3: refiner lora attach: %s\n", error);
+                    goto cleanup;
+                }
+                refiner_lora_attached = 1;
+                printf("refiner_lora: attach at step %d/%d (switch_ms=%.1f)\n",
+                       step + 1, steps, now_ms() - tsw);
+            } else if (!want_refiner && refiner_lora_attached) {
+                if (!h3_dit_w4a8_set_lora(dit, &lora_set, error,
+                                          sizeof(error))) {
+                    fprintf(stderr, "h3: main lora re-attach: %s\n", error);
+                    goto cleanup;
+                }
+                refiner_lora_attached = 0;
+            }
+        }
 
         if (evaluate) {
             if (pack_audio) {
@@ -3904,6 +6144,12 @@ int main(int argc, char **argv) {
                    "total=%.1f\n",
                    step + 1, steps, fst.patch_ms, fst.layers_ms, fst.final_ms,
                    fst.total_ms);
+            if (step == 0)
+                printf("dit_step0_layers: prefetch=%.1f h2d=%.1f compute=%.1f "
+                       "d2h=%.1f wait=%.1f\n",
+                       fst.layers_prefetch_ms, fst.layers_h2d_ms,
+                       fst.layers_compute_ms, fst.layers_d2h_ms,
+                       fst.layers_prefetch_wait_ms);
             h3_cuda_sol_profile_finish_step(step, fst.total_ms);
         } else {
             if (effective_reuse == 1 && magcache_thresh > 0.0f &&
@@ -3946,6 +6192,249 @@ int main(int argc, char **argv) {
          * denoised=X+σ·v; ODE dX/dσ=-v ⇒ X += (σ-σ')·v. A prior bug treated
          * -v as x0 directly (black/olive). Always use velocity euler here;
          * dual audio_sigmas already encode the audio shift (no extra slope). */
+        if (lift_on && step == lift_k - 1) {
+            float *x0_pack = NULL, *z_low = NULL, *z_high = NULL, *z0_pack = NULL;
+            float *noise_hi = NULL;
+            float sigma_k = sigmas[step];
+            float sigma_next = sigmas[step + 1];
+            int lo_h = latent_h, lo_w = latent_w;
+            size_t n_hi, video_seq_hi, n_tok_hi;
+            double t_lift = now_ms();
+            size_t ii;
+            if (pack_audio) {
+                if (!h3_dit_w4a8_euler_step_f32(
+                        audio_rows, audio_vel, n_audio, audio_sigmas[step],
+                        audio_sigmas[step + 1], error, sizeof(error))) {
+                    fprintf(stderr, "audio euler (lift aux): %s\n", error);
+                    goto cleanup;
+                }
+            }
+            if (!(sigma_k > 1e-8f) || !lift_stats_ok || !lat_up) {
+                fprintf(stderr, "h3: lift transition rejected (sigma/stats)\n");
+                goto cleanup;
+            }
+            x0_pack = (float *)malloc(n_lat * sizeof(float));
+            if (!x0_pack) {
+                fprintf(stderr, "OOM lift x0\n");
+                goto cleanup;
+            }
+            for (ii = 0; ii < n_lat; ii++)
+                x0_pack[ii] = latent[ii] + sigma_k * velocity[ii];
+            z_low = h3_vae_int8_unpack_dit_latent_f32(x0_pack, latent_t, lo_h,
+                                                      lo_w, error, sizeof(error));
+            free(x0_pack);
+            x0_pack = NULL;
+            if (!z_low) {
+                fprintf(stderr, "lift unpack: %s\n", error);
+                goto cleanup;
+            }
+            /* Comfy MiniMaxH3Video.process_out is identity (scale=1). LBH
+             * learned_latent_lift still does (x-mean)/std internally on that
+             * DiT-normalized CHW. Do NOT *std+mean here — that was the P0
+             * magenta-grid (network saw VAE-native as if it were DiT-space). */
+            z_high = (float *)malloc((size_t)H3_VAE_INT8_LATENT_CH *
+                                     (size_t)latent_t * (size_t)hi_lh *
+                                     (size_t)hi_lw * sizeof(float));
+            if (!z_high) {
+                free(z_low);
+                fprintf(stderr, "OOM lift z_high\n");
+                goto cleanup;
+            }
+            {
+                size_t nlo = (size_t)H3_VAE_INT8_LATENT_CH * (size_t)latent_t *
+                             (size_t)lo_h * (size_t)lo_w;
+                dump_chw_channel_stats("z_low", z_low, latent_t, lo_h, lo_w);
+                dump_f32_bin("/tmp/h3_lift_z_low.f32", z_low, nlo);
+                dump_chw_pgm("/tmp/h3_lift_z_low.pgm", z_low, lo_h, lo_w);
+                dump_chw_pgm("/tmp/h3_lift_z_low_ch1.pgm",
+                             z_low + nlo / 24u, lo_h, lo_w);
+                dump_chw_pgm("/tmp/h3_lift_z_low_ch2.pgm",
+                             z_low + 2u * nlo / 24u, lo_h, lo_w);
+            }
+            {
+                const char *zlow_only = getenv("H3_LIFT_ZLOW_ONLY");
+                if (zlow_only && zlow_only[0] == '1') {
+                    size_t n_tok_lo = (size_t)latent_t * (size_t)(lo_h / 2) *
+                                      (size_t)(lo_w / 2) *
+                                      (size_t)H3_DIT_W4A8_VIDEO_PATCH;
+                    float *z0_lo = (float *)malloc(n_tok_lo * sizeof(float));
+                    if (!z0_lo ||
+                        !h3_vae_patchify_video_96(z_low, latent_t, lo_h, lo_w,
+                                                  z0_lo, n_tok_lo)) {
+                        fprintf(stderr, "lift zlow-only pack failed\n");
+                        free(z_low);
+                        free(z_high);
+                        free(z0_lo);
+                        goto cleanup;
+                    }
+                    memcpy(latent, z0_lo, n_tok_lo * sizeof(float));
+                    n_lat = n_tok_lo;
+                    free(z0_lo);
+                    free(z_low);
+                    free(z_high);
+                    printf("selflift: ZLOW_ONLY decode low-res endpoint "
+                           "(skip LBH / no remaining DiT) %dx%d\n",
+                           lo_h, lo_w);
+                    fflush(stdout);
+                    break;
+                }
+            }
+            if (!h3_latent_upscaler_forward(lat_up, cuda, z_low, latent_t, lo_h,
+                                            lo_w, hi_lh, hi_lw, lift_mean,
+                                            lift_std, z_high, error,
+                                            sizeof(error))) {
+                fprintf(stderr, "h3: LBH forward: %s\n", error);
+                free(z_low);
+                free(z_high);
+                goto cleanup;
+            }
+            {
+                size_t nhi = (size_t)H3_VAE_INT8_LATENT_CH * (size_t)latent_t *
+                             (size_t)hi_lh * (size_t)hi_lw;
+                float r_lo = chw_adj_ratio(z_low, latent_t, lo_h, lo_w);
+                float r_hi = chw_adj_ratio(z_high, latent_t, hi_lh, hi_lw);
+                printf("selflift: chw_adj ch0/t0 low=%.4g high=%.4g "
+                       "(~1=checkerboard, ~0.1=smooth)\n",
+                       (double)r_lo, (double)r_hi);
+                dump_chw_channel_stats("z_high", z_high, latent_t, hi_lh, hi_lw);
+                dump_f32_bin("/tmp/h3_lift_z_high.f32", z_high, nhi);
+                dump_chw_pgm("/tmp/h3_lift_z_high.pgm", z_high, hi_lh, hi_lw);
+                dump_chw_pgm("/tmp/h3_lift_z_high_ch1.pgm",
+                             z_high + nhi / 24u, hi_lh, hi_lw);
+                dump_chw_pgm("/tmp/h3_lift_z_high_ch2.pgm",
+                             z_high + 2u * nhi / 24u, hi_lh, hi_lw);
+                fflush(stdout);
+            }
+            free(z_low);
+            z_low = NULL;
+            /* process_in is also identity for MiniMaxH3Video; LBH already
+             * returned DiT-normalized CHW (*std+mean of its internal space). */
+            video_seq_hi = (size_t)latent_t * (size_t)(hi_lh / 2) *
+                           (size_t)(hi_lw / 2);
+            n_tok_hi = video_seq_hi * (size_t)H3_DIT_W4A8_VIDEO_PATCH;
+            z0_pack = (float *)malloc(n_tok_hi * sizeof(float));
+            if (!z0_pack ||
+                !h3_vae_patchify_video_96(z_high, latent_t, hi_lh, hi_lw, z0_pack,
+                                          n_tok_hi)) {
+                fprintf(stderr, "lift pack failed\n");
+                free(z_high);
+                free(z0_pack);
+                goto cleanup;
+            }
+            {
+                float *rt = h3_vae_int8_unpack_dit_latent_f32(
+                    z0_pack, latent_t, hi_lh, hi_lw, error, sizeof(error));
+                double mx = 0.0;
+                size_t nchw = (size_t)H3_VAE_INT8_LATENT_CH * (size_t)latent_t *
+                              (size_t)hi_lh * (size_t)hi_lw;
+                size_t k;
+                if (!rt) {
+                    fprintf(stderr, "lift pack-unpack: %s\n", error);
+                    free(z_high);
+                    free(z0_pack);
+                    goto cleanup;
+                }
+                for (k = 0; k < nchw; k++) {
+                    double d = fabs((double)rt[k] - (double)z_high[k]);
+                    if (d > mx)
+                        mx = d;
+                }
+                printf("selflift: pack↔unpack maxabs=%.6g\n", mx);
+                free(rt);
+            }
+            free(z_high);
+            z_high = NULL;
+            n_hi = n_tok_hi;
+            if (!grow_f32(&latent, n_hi, error, sizeof(error)) ||
+                !grow_f32(&velocity, n_hi, error, sizeof(error)) ||
+                !grow_f32(&vel_last, n_hi, error, sizeof(error)) ||
+                !grow_f32(&vel_prev, n_hi, error, sizeof(error)) ||
+                !grow_f32(&pt, video_seq_hi, error, sizeof(error)) ||
+                !grow_f32(&ph, video_seq_hi, error, sizeof(error)) ||
+                !grow_f32(&pw, video_seq_hi, error, sizeof(error))) {
+                fprintf(stderr, "h3: lift realloc: %s\n", error);
+                free(z0_pack);
+                goto cleanup;
+            }
+            if (velocity_uncond &&
+                !grow_f32(&velocity_uncond, n_hi, error, sizeof(error))) {
+                fprintf(stderr, "h3: lift realloc uncond: %s\n", error);
+                free(z0_pack);
+                goto cleanup;
+            }
+            {
+                const char *z0only = getenv("H3_LIFT_Z0_ONLY");
+                if (z0only && z0only[0] == '1') {
+                    memcpy(latent, z0_pack, n_hi * sizeof(float));
+                    latent_h = hi_lh;
+                    latent_w = hi_lw;
+                    video_seq = video_seq_hi;
+                    n_lat = n_hi;
+                    free(z0_pack);
+                    printf("selflift: Z0_ONLY decode lifted endpoint (no "
+                           "re-noise / no remaining DiT)\n");
+                    fflush(stdout);
+                    break;
+                }
+            }
+            noise_hi = (float *)malloc(n_hi * sizeof(float));
+            if (!noise_hi) {
+                free(z0_pack);
+                fprintf(stderr, "OOM lift noise\n");
+                goto cleanup;
+            }
+            fill_normal_f32(seed + 1ULL, noise_hi, n_hi);
+            for (ii = 0; ii < n_hi; ii++) {
+                float z0 = z0_pack[ii];
+                latent[ii] = sigma_k * noise_hi[ii] + (1.0f - sigma_k) * z0;
+                velocity[ii] = (z0 - latent[ii]) / sigma_k;
+            }
+            free(noise_hi);
+            free(z0_pack);
+            if (!h3_dit_w4a8_euler_step_f32(latent, velocity, n_hi, sigma_k,
+                                            sigma_next, error, sizeof(error))) {
+                fprintf(stderr, "lift euler: %s\n", error);
+                goto cleanup;
+            }
+            latent_h = hi_lh;
+            latent_w = hi_lw;
+            video_seq = video_seq_hi;
+            n_lat = n_hi;
+            memcpy(vel_last, velocity, n_lat * sizeof(float));
+            if (!h3_dit_w4a8_fill_metal_video_pos(target_rope_t0, latent_t,
+                                                  latent_h, latent_w, pt, ph, pw,
+                                                  error, sizeof(error))) {
+                fprintf(stderr, "lift video pos: %s\n", error);
+                goto cleanup;
+            }
+            if (pack_audio) {
+                if (!h3_dit_w4a8_fill_metal_audio_pos(
+                        target_rope_t0, audio_t, latent_h, latent_w, apt, aph,
+                        apw, error, sizeof(error))) {
+                    fprintf(stderr, "lift audio pos: %s\n", error);
+                    goto cleanup;
+                }
+            }
+            if (dit && cuda) {
+                size_t packed_seq = context + cond_seq + audio_cond_seq +
+                                    video_seq + (pack_audio ? audio_seq : 0);
+                {
+                    double sw_ms = 0.0;
+                    if (!lift_prepare_hires_vram(dit, cuda, packed_seq, &sw_ms,
+                                                 error, sizeof(error))) {
+                        fprintf(stderr, "h3: lift hires vram: %s\n", error);
+                        goto cleanup;
+                    }
+                    t_lift_switch += sw_ms;
+                }
+            }
+            printf("selflift: transition step=%d σ=%.4g→%.4g latent %dx%d→%dx%d "
+                   "tokens %zu lift_ms=%.1f (no extra DiT NFE)\n",
+                   step + 1, (double)sigma_k, (double)sigma_next, lo_h, lo_w,
+                   hi_lh, hi_lw, n_lat, now_ms() - t_lift);
+            fflush(stdout);
+            continue;
+        }
         {
             if (pack_audio) {
                 if (!h3_dit_w4a8_euler_step_f32(
@@ -3965,6 +6454,38 @@ int main(int argc, char **argv) {
                 printf("sampler: velocity_euler (X += (σ-σ')·v; "
                        "Comfy CONST-equivalent)\n");
         }
+        if (getenv("H3_STEP_LATENT_STATS")) {
+            double ss = 0.0, ss2 = 0.0;
+            size_t si;
+            for (si = 0; si < n_lat; si++) {
+                double v = latent[si];
+                ss += v;
+                ss2 += v * v;
+            }
+            double sm = ss / (double)n_lat;
+            double sv = ss2 / (double)n_lat - sm * sm;
+            printf("step_latent_stats: step=%d/%d mean=%.6g std=%.6g "
+                   "checksum=0x%016llx\n",
+                   step + 1, steps, sm, sv > 0.0 ? sqrt(sv) : 0.0,
+                   (unsigned long long)h3_dit_w4a8_checksum_f32(latent,
+                                                                n_lat));
+            if (step == 0) {
+                const char *s1 = getenv("H3_STEP1_LATENT_DUMP");
+                if (s1 && s1[0]) {
+                    FILE *sfp = fopen(s1, "wb");
+                    if (sfp) {
+                        fwrite(latent, sizeof(float), n_lat, sfp);
+                        fclose(sfp);
+                        printf("step_latent_stats: wrote step1 raw → %s\n",
+                               s1);
+                    } else {
+                        fprintf(stderr,
+                                "step_latent_stats: cannot open %s\n", s1);
+                    }
+                }
+            }
+            fflush(stdout);
+        }
         if (frame0_img && frame0_elems) {
             float img_w = apply_t0_img2img(latent, frame0_img, frame0_elems,
                                            step + 1, steps);
@@ -3980,8 +6501,90 @@ int main(int argc, char **argv) {
     t_dit = now_ms() - t0;
     printf("dit_schedule: evals=%d skips=%d dit_ms=%.1f\n", dit_evals,
            dit_skips, t_dit);
+    {
+        double rope_ms = 0.0;
+        unsigned long rope_calls = 0;
+        h3_dit_w4a8_rope_profile_get(&rope_ms, &rope_calls);
+        if (rope_calls > 0)
+            printf("dit_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f\n",
+                   rope_calls, rope_ms, rope_ms / (double)rope_calls);
+    }
+    if (host_stage_th_ok) {
+        pthread_join(host_stage_th, NULL);
+        host_stage_th_ok = 0;
+        printf("dit_host_stage: done ok=%d wall_ms=%.1f stage_ms=%.1f "
+               "blocks=%u ready=%u%s%s\n",
+               host_stage_job.ok, now_ms() - host_stage_t0, host_stage_job.ms,
+               host_stage_job.n,
+               h3_dit_w4a8_cache(dit)
+                   ? h3_w4a8_cache_host_ready_blocks(h3_dit_w4a8_cache(dit))
+                   : 0,
+               host_stage_job.ok ? "" : " err=",
+               host_stage_job.ok
+                   ? ""
+                   : (host_stage_job.err[0] ? host_stage_job.err : "unknown"));
+        fflush(stdout);
+    }
     h3_cuda_sol_cute_dump_stats();
     h3_cuda_sage3_dump_stats();
+    {
+        h3_cuda_sdpa_counters ctr;
+        unsigned long long w = 0, h = 0, f = 0, dskip = 0;
+        char effective[64];
+        char why[128];
+        int plugin = 0;
+        memset(&ctr, 0, sizeof(ctr));
+        h3_cuda_sdpa_counters_get(&ctr);
+        if (sdpa && (!strcmp(sdpa, "sage3") || !strcmp(sdpa, "sageattn3"))) {
+            w = ctr.sage3_want;
+            h = ctr.sage3_hits;
+            f = ctr.sage3_fallback;
+            plugin = 1;
+        } else if (sdpa && (strstr(sdpa, "sol") || strstr(sdpa, "cute"))) {
+            w = ctr.sol_cute_want;
+            h = ctr.sol_cute_hits;
+            f = ctr.sol_cute_fallback;
+            dskip = ctr.sol_cute_dense_skip;
+            plugin = 1;
+        } else {
+            w = ctr.cudnn_want;
+            h = ctr.cudnn_hits;
+            f = ctr.cudnn_fallback;
+        }
+        h3_kpi_guard_sdpa_effective(sdpa, w, h, f, dskip,
+                                    h3_cuda_sdpa_last_backend_name(),
+                                    effective, sizeof(effective));
+        snprintf(sdpa_effective, sizeof(sdpa_effective), "%s", effective);
+        printf("sdpa_backend=%s want=%llu hits=%llu fallback=%llu "
+               "dense_skip=%llu request=%s\n",
+               effective, w, h, f, dskip, sdpa ? sdpa : "auto");
+        if (!plugin)
+            printf("dit_graph: eager reason=cudnn_uncapturable\n");
+        printf("sdpa_actual: request=%s last=%s sage3 want=%llu hits=%llu "
+               "fallback=%llu cudnn want=%llu hits=%llu fallback=%llu\n",
+               sdpa, h3_cuda_sdpa_last_backend_name(), ctr.sage3_want,
+               ctr.sage3_hits, ctr.sage3_fallback, ctr.cudnn_want,
+               ctr.cudnn_hits, ctr.cudnn_fallback);
+        fflush(stdout);
+        if (plugin && !h3_kpi_guard_sdpa_verdict(w, h, dskip,
+                                                 h3_sdpa_strict(), why,
+                                                 sizeof(why))) {
+            fprintf(stderr,
+                    "sdpa_strict: FAIL want=%llu hits=%llu fallback=%llu "
+                    "dense_skip=%llu backend=%s reason=%s\n",
+                    w, h, f, dskip, effective, why);
+            goto cleanup;
+        }
+        if (h3_sdpa_sage3_require_hit(ctr.sage3_want, ctr.sage3_hits)) {
+            fprintf(stderr,
+                    "error: sage3 want=%llu hits=%llu fallback=%llu "
+                    "(假 hit；H3_SAGE3_REQUIRE_HIT=0 才允许 fallback 续跑)\n",
+                    ctr.sage3_want, ctr.sage3_hits, ctr.sage3_fallback);
+            goto cleanup;
+        }
+        if (!plugin && w > 0ull && h == w)
+            printf("sdpa_strict: PASS hits==want backend=%s\n", effective);
+    }
     } else {
         printf("dit_schedule: skipped (decode-only)\n");
     }
@@ -4005,6 +6608,28 @@ int main(int argc, char **argv) {
                    (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat));
         }
     }
+    if (dump_latent_path && dump_latent_path[0]) {
+        if (!dump_latent_file(dump_latent_path, latent, n_lat, latent_t,
+                              latent_h, latent_w, error, sizeof(error))) {
+            fprintf(stderr, "dump_latent: %s\n", error);
+            goto cleanup;
+        }
+        printf("dump_latent: clip=%d wrote %zu f32 (%dx%dx%d) checksum=0x%016llx → %s\n",
+               clip_i + 1, n_lat, latent_t, latent_h, latent_w,
+               (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat),
+               dump_latent_path);
+        fflush(stdout);
+        /* Exit right after this clip's final latent is dumped, before VAE.
+         * A pre-existing clip2 crash (silent exit_group(1), no stderr —
+         * reproducible on the untouched baseline too) would otherwise kill
+         * the run before the latent reaches the replay A/B. The dump is the
+         * only product of this mode, so rc=0 here. Replay with
+         * H3_REPLAY_LATENT for the VAE async off/on bit-exact A/B. */
+        printf("dump_latent: done; exiting before clip %d VAE\n", clip_i + 1);
+        fflush(stdout);
+        rc = 0;
+        goto cleanup;
+    }
 
     snprintf(pathbuf, sizeof(pathbuf), "%s/latent.raw", out_dir);
     {
@@ -4016,26 +6641,97 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Drop DiT/TE resident weights before VAE so 50L + decode fits in 24GB. */
-    h3_dit_w4a8_core_free(&core);
-    gen_uly_free_ranks(dit, uly_dit, uly_cuda);
-    h3_dit_w4a8_free(dit);
-    dit = NULL;
-    if (lora_loaded) {
-        h3_lora_free(&lora_set);
-        lora_loaded = 0;
+    /* Drop DiT/TE resident weights before VAE so 50L + decode fits in 24GB.
+     * In-process --repeat keeps them until the last clip so INT8 pin / LoRA /
+     * sage3 plans are not rebuilt. TAE on 5090 32GB fits beside DiT. */
+    if (clip_i + 1 >= clip_repeat) {
+        h3_dit_w4a8_core_free(&core);
+        gen_uly_free_ranks(dit, uly_dit, uly_cuda);
+        h3_dit_w4a8_free(dit);
+        dit = NULL;
+        if (lora_loaded) {
+            h3_lora_free(&lora_set);
+            lora_loaded = 0;
+        }
+        if (refiner_lora_loaded) {
+            h3_lora_free(&refiner_lora_set);
+            refiner_lora_loaded = 0;
+            refiner_lora_attached = 0;
+        }
+        h3_nvfp4_store_free(&te_store);
+        h3_nvfp4_cuda_disable();
+        h3_w4a8_store_free(dit_store);
+        dit_store = NULL;
+        h3_dit_int8_store_free(dit_int8);
+        dit_int8 = NULL;
+        if (dit_nvfp4_opened) {
+            h3_nvfp4_store_free(&dit_nvfp4);
+            dit_nvfp4_opened = 0;
+        }
+        /* Keep the CUDA ctx (cuDNN handle / NVRTC / plans). Trim DiT-sized
+         * scratch so 50L decode fits; do not rebuild the device. */
+        h3_cuda_release_heavy_workspace(cuda);
+        h3_cuda_sage3_drop_pool();
+        h3_cuda_sol_cute_drop_pool();
+        printf("released DiT/TE before VAE (kept CUDA ctx; trimmed DiT scratch; "
+               "dropped sage3/sol_cute pools)\n");
+        fflush(stdout);
+        if (preset_out.id == H3_PRESET_TAOMATE && vae_decode &&
+            !strcmp(vae_decode, "official")) {
+            /* Last clip: DiT gone. Resident W helps GEMM; keep 256–320
+             * tiles — 512px waffle (16px patch) on clip2. */
+            if (!getenv("H3_VAE_CUDA_W_RESIDENT"))
+                setenv("H3_VAE_CUDA_W_RESIDENT", "1", 1);
+            if (!getenv("H3_VAE_WEIGHT_CACHE"))
+                setenv("H3_VAE_WEIGHT_CACHE", "1", 1);
+            printf("vae: last-clip official w_resident=%s cache=%s "
+                   "(tiles stay 256–320; 512 waffle)\n",
+                   getenv("H3_VAE_CUDA_W_RESIDENT"),
+                   getenv("H3_VAE_WEIGHT_CACHE"));
+            fflush(stdout);
+        }
+    } else {
+        if (lat_up)
+            h3_latent_upscaler_release_device(lat_up);
+        if (dit)
+            h3_dit_w4a8_release_block_workspace(dit);
+        h3_cuda_release_heavy_workspace(cuda);
+        if (dit) {
+            h3_w4a8_cache *cw = h3_dit_w4a8_cache(dit);
+            if (cw) {
+                /* Official VAE tiles need a few GiB, not 24. 24GiB keep
+                 * dropped window to 4 and the next clip streamed wrong
+                 * LRU layers into LBH (mosaic). TAE still wants 24. */
+                int tae_keep = vae_decode && !strcmp(vae_decode, "tae");
+                size_t keep_free = tae_keep ? ((size_t)24ULL << 30)
+                                           : ((size_t)10ULL << 30);
+                h3_w4a8_cache_unfreeze_window(cw);
+                if (!h3_w4a8_cache_make_room(cw, keep_free, error,
+                                             sizeof(error)))
+                    fprintf(stderr, "repeat_keep make_room: %s\n", error);
+                else
+                    printf("repeat_keep: INT8 make_room keep=%.1fGiB "
+                           "window=%u (%s)\n",
+                           (double)keep_free / (1024.0 * 1024.0 * 1024.0),
+                           h3_w4a8_cache_window_size(cw),
+                           tae_keep ? "TAE" : "official VAE");
+            }
+        }
+        if (dit && vae_decode && !strcmp(vae_decode, "official")) {
+            h3_w4a8_cache *cw2 = h3_dit_w4a8_cache(dit);
+            if (cw2) {
+                h3_w4a8_cache_drop_device_weights(cw2);
+                printf("repeat_keep: dropped INT8 device before official VAE "
+                       "(host pin kept; clip2 H2D from pin)\n");
+            }
+            /* Do not cudaFree sage3 QKVO here: Python _STATE still holds
+             * those pointers. Clip 2 DiT would IMA. Last-clip branch
+             * drops after DiT is gone. */
+        }
+        printf("repeat_keep: DiT/LoRA/INT8 host-pin live for clip %d/%d\n",
+               clip_i + 2, clip_repeat);
+        fflush(stdout);
     }
-    h3_nvfp4_store_free(&te_store);
-    h3_nvfp4_cuda_disable();
-    h3_w4a8_store_free(dit_store);
-    dit_store = NULL;
-    h3_dit_int8_store_free(dit_int8);
-    dit_int8 = NULL;
-    /* Keep the CUDA ctx (cuDNN handle / NVRTC / plans). Trim DiT-sized
-     * scratch so 50L decode fits; do not rebuild the device. */
-    h3_cuda_release_heavy_workspace(cuda);
-    printf("released DiT/TE before VAE (kept CUDA ctx; trimmed DiT scratch)\n");
-    fflush(stdout);
     /* Full-frame decode is faster but leaves a 16px VAE-patch waffle
      * (b16≈2.6 vs ≈1.04 with 256px tiles + deblock16). Default back to
      * Metal-style tiles now that weights are loaded once. Opt in to the
@@ -4049,12 +6745,28 @@ int main(int argc, char **argv) {
     if (vae_th_ok) {
         pthread_join(vae_th, NULL);
         vae_th_ok = 0;
+        printf("vae_th: joined_ms=%.1f ok=%d hostreg=%d device=%d "
+               "opened=%d work_ms=%.1f load_ms=%.1f%s%s\n",
+               now_ms() - vae_prewarm_t0, vae_prewarm_job.ok,
+               vae_prewarm_job.hostreg_ok, vae_prewarm_job.device_ok,
+               vae_opened, vae_prewarm_job.ms, vae_prewarm_job.load_ms,
+               vae_prewarm_job.ok || !vae_prewarm_job.err[0] ? "" : " err=",
+               vae_prewarm_job.ok || !vae_prewarm_job.err[0]
+                   ? ""
+                   : vae_prewarm_job.err);
+        fflush(stdout);
+        if (vae_prewarm_job.ms > 0.0)
+            printf("phase_sum: overlap_ms=%.1f overlap(dit_tail,vae_load)\n",
+                   vae_prewarm_job.ms);
     }
     if (!skip_vae) {
-        if (!h3_vae_int8_store_open(vae_path, &vae_store, error,
-                                    sizeof(error))) {
-            fprintf(stderr, "vae open: %s\n", error);
-            goto cleanup;
+        if (!vae_opened) {
+            if (!h3_vae_int8_store_open(vae_path, &vae_store, error,
+                                        sizeof(error))) {
+                fprintf(stderr, "vae open: %s\n", error);
+                goto cleanup;
+            }
+            vae_opened = 1;
         }
         {
             const h3_st_tensor *vw = h3_st_find(
@@ -4080,6 +6792,37 @@ int main(int argc, char **argv) {
             fprintf(stderr, "unpack: %s\n", error);
             goto cleanup;
         }
+        audio_overlap = audio_vae_overlap_mode();
+        if (decode_audio && audio_overlap == 2) {
+            t0 = now_ms();
+            if (!h3_dit_w4a8_unpack_audio_latent(audio_rows, audio_t, audio_c2t,
+                                                 error, sizeof(error))) {
+                fprintf(stderr, "unpack audio: %s\n", error);
+                goto cleanup;
+            }
+            audio_job.cuda = cuda;
+            audio_job.audio_vae_path = audio_vae_path;
+            audio_job.audio_c2t = audio_c2t;
+            audio_job.audio_t = audio_t;
+            audio_job.awave = &awave;
+            audio_job.ast = &ast;
+            audio_job.ok = 0;
+            audio_job.err[0] = '\0';
+            if (pthread_create(&audio_th, NULL, audio_decode_th, &audio_job) ==
+                0) {
+                audio_th_ok = 1;
+                printf("audio_vae: overlap=decode\n");
+                fflush(stdout);
+            } else {
+                if (!h3_audio_vae_cuda_decode(cuda, audio_vae_path, audio_c2t,
+                                              audio_t, NULL, NULL, &awave, &ast,
+                                              error, sizeof(error))) {
+                    fprintf(stderr, "audio vae decode: %s\n", error);
+                    goto cleanup;
+                }
+                t_audio = now_ms() - t0;
+            }
+        }
         t0 = now_ms();
         for (i = 0; i < (size_t)vae_repeats; i++) {
             h3_vae_int8_frames run_frames;
@@ -4087,10 +6830,48 @@ int main(int argc, char **argv) {
             double repeat_ms;
             memset(&run_frames, 0, sizeof(run_frames));
             memset(&run_vst, 0, sizeof(run_vst));
-            if (!h3_vae_int8_decode_cuda(cuda, &vae_store, latent_chw, latent_t,
-                                         latent_h, latent_w, vae_blocks,
-                                         &run_frames, &run_vst, error,
-                                         sizeof(error))) {
+            if (!strcmp(vae_decode, "tae")) {
+                float mean[H3_VAE_INT8_LATENT_CH], stdv[H3_VAE_INT8_LATENT_CH];
+                int c, tt, hh, ww;
+                if (!tae_keep) {
+                    fprintf(stderr, "vae decode: TAE ctx missing\n");
+                    goto cleanup;
+                }
+                if (h3_vae_int8_load_latent_stats(&vae_store, mean, stdv, error,
+                                                  sizeof(error))) {
+                    size_t plane = (size_t)latent_t * (size_t)latent_h *
+                                   (size_t)latent_w;
+                    for (c = 0; c < H3_VAE_INT8_LATENT_CH; c++)
+                        for (tt = 0; tt < latent_t; tt++)
+                            for (hh = 0; hh < latent_h; hh++)
+                                for (ww = 0; ww < latent_w; ww++) {
+                                    size_t ix =
+                                        (((size_t)c * (size_t)latent_t +
+                                          (size_t)tt) *
+                                             (size_t)latent_h +
+                                         (size_t)hh) *
+                                            (size_t)latent_w +
+                                        (size_t)ww;
+                                    (void)plane;
+                                    latent_chw[ix] =
+                                        latent_chw[ix] * stdv[c] + mean[c];
+                                }
+                }
+                if (!h3_tae_decode_frames(tae_keep, latent_chw, latent_t,
+                                          latent_h, latent_w, frames_req,
+                                          &run_frames, error, sizeof(error))) {
+                    fprintf(stderr, "tae decode: %s\n", error);
+                    h3_vae_int8_frames_free(&run_frames);
+                    goto cleanup;
+                }
+                run_vst.total_ms = now_ms() - t0;
+                run_vst.blocks_ms = run_vst.total_ms;
+                printf("vae_decode: tae (非金线 TAEHV taeh3；画质有损)\n");
+            } else if (!h3_vae_int8_decode_cuda(cuda, &vae_store, latent_chw,
+                                                latent_t, latent_h, latent_w,
+                                                vae_blocks, &run_frames,
+                                                &run_vst, error,
+                                                sizeof(error))) {
                 fprintf(stderr, "vae decode: %s\n", error);
                 h3_vae_int8_frames_free(&run_frames);
                 goto cleanup;
@@ -4111,12 +6892,18 @@ int main(int argc, char **argv) {
                "total=%.1f frames=%d %dx%d\n",
                vst.load_ms, vst.canvas_h2d_ms, vst.blocks_ms, vst.unpatch_d2h_ms,
                vst.total_ms, frames.frames, frames.width, frames.height);
+        {
+            double rope_ms = 0.0;
+            unsigned long rope_calls = 0;
+            h3_vae_int8_rope_profile_get(&rope_ms, &rope_calls);
+            if (rope_calls > 0)
+                printf("vae_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f\n",
+                       rope_calls, rope_ms, rope_ms / (double)rope_calls);
+        }
 
-        /* A3: audio VAE decode overlaps PPM dump (GPU idle). Default on;
-         * H3_AUDIO_VAE_OVERLAP=0 forces sequential. */
-        if (decode_audio) {
-            const char *ov = getenv("H3_AUDIO_VAE_OVERLAP");
-            int want_ov = !(ov && ov[0] == '0');
+        /* R20: overlap=decode already kicked before video VAE. ppm|0 here. */
+        if (decode_audio && !audio_th_ok && !awave.pcm) {
+            int want_ov = (audio_overlap == 1);
             t0 = now_ms();
             if (!h3_dit_w4a8_unpack_audio_latent(audio_rows, audio_t, audio_c2t,
                                                  error, sizeof(error))) {
@@ -4130,12 +6917,13 @@ int main(int argc, char **argv) {
             audio_job.awave = &awave;
             audio_job.ast = &ast;
             audio_job.ok = 0;
+            audio_job.err[0] = '\0';
             if (want_ov &&
                 pthread_create(&audio_th, NULL, audio_decode_th, &audio_job) ==
                     0) {
                 audio_th_ok = 1;
-                printf("audio_vae: overlap=ppm (H3_AUDIO_VAE_OVERLAP=0 "
-                       "disables)\n");
+                printf("audio_vae: overlap=ppm "
+                       "(H3_AUDIO_VAE_OVERLAP=decode|0)\n");
                 fflush(stdout);
             } else {
                 if (!h3_audio_vae_cuda_decode(cuda, audio_vae_path, audio_c2t,
@@ -4149,8 +6937,13 @@ int main(int argc, char **argv) {
         }
         {
             const char *skip_ppm_e = getenv("H3_SKIP_PPM");
-            int skip_ppm = skip_ppm_e && skip_ppm_e[0] == '1';
+            int skip_ppm = (skip_ppm_e && skip_ppm_e[0] == '1') ? 1 : 0;
             int f;
+            if (skip_ppm_e && skip_ppm_e[0] == '0')
+                skip_ppm = 0;
+            else if (!skip_ppm_e && preset_out.id == H3_PRESET_TAOMATE &&
+                     mux_path)
+                skip_ppm = 1;
             int nwrite = frames.frames < 120 ? frames.frames : 120;
             size_t nbytes = 0;
             double t_io0 = now_ms();
@@ -4174,9 +6967,86 @@ int main(int argc, char **argv) {
                 }
                 printf("wrote %d PPM frames under %s/\n", nwrite, out_dir);
             } else {
-                printf("ppm: skipped (H3_SKIP_PPM=1)\n");
+                printf("ppm: skipped (mux-only taomate; H3_SKIP_PPM=0 restores)\n");
             }
             t_ppm = now_ms() - t_io0;
+            if (mux_rgb && replay_latent) {
+                /* Checksum the RAW f32 VAE output (frames.rgb), not the
+                 * uint8-quantized mux buffer: quantization can mask a real
+                 * f32 difference. This is the bit-exact verdict for the
+                 * async off/on A/B. */
+                size_t fn = (size_t)frames.frames * (size_t)frames.width *
+                            (size_t)frames.height * 3;
+                size_t fb = (size_t)frames.width * (size_t)frames.height * 3;
+                int nf = frames.frames, fi;
+                const char *av = getenv("H3_VAE_UNPATCH_ASYNC");
+                printf("replay_rgb: frames=%d %dx%d f32_total=%zu "
+                       "checksum=0x%016llx unpatch_async=%s\n",
+                       nf, frames.width, frames.height, fn,
+                       (unsigned long long)fnv1a64_bytes(
+                           (const uint8_t *)frames.rgb, fn * sizeof(float)),
+                       (av && av[0] == '1' && av[1] == '\0') ? "on" : "off");
+                for (fi = 0; fi < nf; fi++)
+                    printf("replay_rgb_frame[%d]: 0x%016llx\n", fi,
+                           (unsigned long long)fnv1a64_bytes(
+                               (const uint8_t *)(frames.rgb +
+                                                 (size_t)fi * fb),
+                               fb * sizeof(float)));
+                fflush(stdout);
+            }
+            if (mux_rgb)
+                h3_waffle_log_rgb24(mux_rgb, frames.frames, frames.width,
+                                    frames.height);
+            /* Cold gate (observational, WARN-only): clip1 b16 stats are
+             * aggregated separately from the hot golden line with an
+             * independent, looser threshold (cold clip1 is naturally
+             * noisier). The waffle: lines above stay untouched so the hot
+             * golden regex keeps working. */
+            if (clip_i == 0 && mux_rgb) {
+                static const int wf_idx[] = {0, 24, 48, 90, 119};
+                double b16[5];
+                double max_b16 = 0.0, mean_b16 = 0.0;
+                int wf, nf = frames.frames;
+                int n_low = 0, n_valid = 0;
+                size_t fb = (size_t)frames.width * (size_t)frames.height * 3;
+                for (wf = 0; wf < 5; wf++) {
+                    int f = wf_idx[wf];
+                    int low = 0;
+                    if (f >= nf) f = nf - 1;
+                    if (f < 0) f = 0;
+                    b16[wf] = h3_waffle_b16_gated_rgb24(mux_rgb + (size_t)f * fb,
+                                                        frames.width,
+                                                        frames.height,
+                                                        NULL, &low);
+                    if (low) {
+                        n_low++;
+                        b16[wf] = 0.0;
+                    } else {
+                        n_valid++;
+                        if (b16[wf] > max_b16) max_b16 = b16[wf];
+                        mean_b16 += b16[wf];
+                    }
+                }
+                if (n_valid > 0)
+                    mean_b16 /= (double)n_valid;
+                printf("waffle_cold_clip1: max_b16=%.3f mean_b16=%.3f "
+                       "threshold=%.3f low_energy_frames=%d/5\n",
+                       max_b16, mean_b16, waffle_cold_max_b16, n_low);
+                if (n_low == 5)
+                    printf("waffle_guard: WARN cold clip1 all 5 frames "
+                           "INVALID_LOWENERGY (no semantic energy; b16 "
+                           "meaningless — likely pure-noise output)\n");
+                else if (!h3_kpi_guard_waffle_cold_verdict(
+                        max_b16, waffle_cold_max_b16, NULL, 0)) {
+                    printf("waffle_guard: WARN cold clip1 max_b16=%.3f > "
+                           "threshold=%.3f (observational; H3_WAFFLE_COLD_MAX "
+                           "to tune; no FAIL — hot golden line unchanged)\n",
+                           max_b16, waffle_cold_max_b16);
+                    if (waffle_cold_guard)
+                        goto waffle_cold_retry;
+                }
+                fflush(stdout);
+            }
         }
     }
 
@@ -4189,9 +7059,9 @@ int main(int argc, char **argv) {
         }
         t_audio = ast.total_ms;
         printf("audio_vae: load=%.1f decode=%.1f total=%.1f samples=%d "
-               "audio_ms=%.1f overlap=ppm\n",
+               "audio_ms=%.1f overlap=%s\n",
                ast.load_ms, ast.decode_ms, ast.total_ms, awave.samples,
-               t_audio);
+               t_audio, audio_overlap == 2 ? "decode" : "ppm");
     } else if (decode_audio && awave.pcm) {
         printf("audio_vae: load=%.1f decode=%.1f total=%.1f samples=%d "
                "audio_ms=%.1f\n",
@@ -4235,7 +7105,40 @@ int main(int argc, char **argv) {
             fprintf(stderr, "mux requires VAE decode frames\n");
             goto cleanup;
         }
+waffle_cold_retry:
+        if (waffle_cold_guard && clip_i == 0 && latent_chw && frames.rgb &&
+            waffle_cold_max_b16 > 0.0 &&
+            strcmp(vae_decode, "official") == 0) {
+            /* Re-decode clip1 (official VAE, same latent): bit-identical
+             * when the flaky high-noise decode did not fire. The WARN above
+             * already logged the pre-retry stats. */
+            h3_vae_int8_frames retry_frames;
+            h3_vae_int8_decode_stats retry_vst;
+            double rt0 = now_ms();
+            memset(&retry_frames, 0, sizeof(retry_frames));
+            memset(&retry_vst, 0, sizeof(retry_vst));
+            if (!h3_vae_int8_decode_cuda(cuda, &vae_store, latent_chw,
+                                         latent_t, latent_h, latent_w,
+                                         vae_blocks, &retry_frames,
+                                         &retry_vst, error, sizeof(error))) {
+                fprintf(stderr, "waffle_guard: cold retry decode: %s\n",
+                        error);
+                h3_vae_int8_frames_free(&retry_frames);
+                goto cleanup;
+            }
+            printf("waffle_guard: cold clip1 retry decode total=%.1f "
+                   "(H3_WAFFLE_COLD_GUARD=1)\n",
+                   now_ms() - rt0);
+            h3_vae_int8_frames_free(&frames);
+            frames = retry_frames;
+            vst = retry_vst;
+            free(mux_rgb);
+            mux_rgb = NULL;
+            waffle_cold_guard = 0; /* one retry per cold clip */
+        }
         {
+            /* Waffle-cold retry rewrites frames; the label target sits in
+             * the guarded block above. */
             size_t nbytes = 0;
             int mux_frames = frames_req;
             double t_mux0 = now_ms();
@@ -4264,27 +7167,44 @@ int main(int argc, char **argv) {
                             (double)peak);
                     goto cleanup;
                 }
-                if (!h3_ffmpeg_write_av_rgb24_f32(
-                        mux_path, mux_rgb, mux_frames, frames.width,
-                        frames.height, 24, awave.pcm, awave.samples,
-                        awave.channels, awave.sample_rate, error,
-                        sizeof(error))) {
-                    fprintf(stderr, "mux: %s\n", error);
-                    goto cleanup;
+                {
+                    h3_ffmpeg_av_stats mux_st;
+                    const char *mux_out = mux_write ? mux_write : mux_path;
+                    memset(&mux_st, 0, sizeof(mux_st));
+                    if (!h3_ffmpeg_write_av_rgb24_f32_ex(
+                            mux_out, mux_rgb, mux_frames, frames.width,
+                            frames.height, 24, awave.pcm, awave.samples,
+                            awave.channels, awave.sample_rate, &mux_st, error,
+                            sizeof(error))) {
+                        fprintf(stderr, "mux: %s\n", error);
+                        goto cleanup;
+                    }
+                    printf("wrote mux %s (%d/%d frames + %d samples)\n",
+                           mux_out, mux_frames, frames.frames, awave.samples);
+                    printf("mux: pipe_wait_ms=%.1f encode_ms=%.1f "
+                           "frames_pushed=%d venc=%s threads=%d\n",
+                           mux_st.pipe_wait_ms, mux_st.encode_ms,
+                           mux_st.frames_pushed, h3_ffmpeg_venc(),
+                           h3_ffmpeg_threads());
+                    if (!h3_av_sync_log_file(mux_out, (double)seconds, 0.05,
+                                             error, sizeof(error))) {
+                        fprintf(stderr, "av_sync_strict: FAIL reason=%s\n",
+                                error);
+                        rc = 5;
+                    }
                 }
-                printf("wrote mux %s (%d/%d frames + %d samples)\n", mux_path,
-                       mux_frames, frames.frames, awave.samples);
             } else {
-                if (!h3_ffmpeg_write_rgb24(mux_path, mux_rgb, mux_frames,
-                                           frames.width, frames.height, 24,
-                                           error, sizeof(error))) {
+                if (!h3_ffmpeg_write_rgb24(mux_write ? mux_write : mux_path,
+                                           mux_rgb, mux_frames, frames.width,
+                                           frames.height, 24, error,
+                                           sizeof(error))) {
                     fprintf(stderr, "mux video-only: %s\n", error);
                     goto cleanup;
                 }
                 printf("wrote mux %s (%d/%d frames @24fps = %.4fs wall, "
                        "video-only%s)\n",
-                       mux_path, mux_frames, frames.frames,
-                       (double)mux_frames / 24.0,
+                       mux_write ? mux_write : mux_path, mux_frames,
+                       frames.frames, (double)mux_frames / 24.0,
                        skip_audio ? "; --skip-audio" : "; no audio VAE");
             }
             {
@@ -4306,17 +7226,78 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("phase_ms: te=%.1f dit=%.1f vae=%.1f audio=%.1f ppm=%.1f mux=%.1f "
-           "total=%.1f dit_evals=%d dit_skips=%d\n",
-           t_te, t_dit, t_vae, t_audio, t_ppm, t_mux, now_ms() - t_all0,
-           dit_evals, dit_skips);
+    printf("phase_ms: te=%.1f dit=%.1f lift_switch=%.1f vae=%.1f vae_load=%.1f "
+           "vae_blocks=%.1f "
+           "audio=%.1f ppm=%.1f mux=%.1f "
+           "total=%.1f dit_evals=%d dit_skips=%d hot=%d clip=%d/%d\n",
+           t_te, t_dit, t_lift_switch, t_vae, vst.load_ms, vst.blocks_ms,
+           t_audio, t_ppm, t_mux, now_ms() - t_all0, dit_evals, dit_skips,
+           clip_i > 0 ? 1 : 0, clip_i + 1, clip_repeat);
+    gen_mem_trace(cuda, clip_i > 0 ? "vae_done_hot" : "vae_done");
+    if (report_path) {
+        h3_run_report_in rin;
+        char rpath[1024];
+        memset(&rin, 0, sizeof(rin));
+        if (clip_repeat > 1)
+            snprintf(rpath, sizeof(rpath), "%s.clip%d.json", report_path,
+                     clip_i + 1);
+        else
+            snprintf(rpath, sizeof(rpath), "%s", report_path);
+        rin.path = rpath;
+        rin.preset = sdpa;
+        rin.sdpa_backend = sdpa_effective[0] ? sdpa_effective : sdpa;
+        rin.vae_attn_backend =
+            vst.attn_backend[0] ? vst.attn_backend : NULL;
+        rin.mode = pack_audio ? "t2va" : "t2v";
+        rin.quant = "int8_convrot";
+        rin.width = width;
+        rin.height = height;
+        rin.seconds = seconds;
+        rin.hot = clip_i > 0 ? 1 : 0;
+        rin.clip = clip_i + 1;
+        rin.clip_n = clip_repeat;
+        rin.te_ms = t_te;
+        rin.dit_ms = t_dit;
+        rin.vae_load_ms = vst.load_ms;
+        rin.vae_blocks_ms = vst.blocks_ms;
+        rin.audio_ms = t_audio;
+        rin.mux_ms = t_mux;
+        rin.total_ms = now_ms() - t_all0;
+        if (!h3_run_report_write(&rin, error, sizeof(error)))
+            fprintf(stderr, "report: %s\n", error);
+        else
+            printf("report: wrote %s\n", rpath);
+    }
+    printf("repeat_core: dit+vae+mux=%.1f vs_kpi=27s (clip=%d hot=%d)\n",
+           t_dit + t_vae + t_mux, clip_i + 1, clip_i > 0 ? 1 : 0);
     if (pack_audio)
         printf("summary: %s pack PASS (audio_pack=on decode=%s)\n",
                (n_ref_images || ref_video_path) ? "ref2va" : "fl2va",
                decode_audio ? "on" : "off");
     else
         printf("summary: text|video PASS (audio_pack=off; theme may fail)\n");
-    rc = 0;
+    if (clip_i + 1 < clip_repeat) {
+        int rel = h3_vae_int8_repeat_release_mode();
+        if (rel == H3_VAE_REPEAT_FULL) {
+            h3_vae_int8_cuda_release_full();
+            printf("repeat_keep: VAE pack+device dropped before clip %d DiT "
+                   "(H3_VAE_REPEAT_RELEASE=full)\n",
+                   clip_i + 2);
+        } else if (rel == H3_VAE_REPEAT_DEVICE) {
+            h3_vae_int8_cuda_release_device();
+            printf("repeat_keep: dropped VAE GPU W/scratch before clip %d DiT "
+                   "(host pack+mmap pin kept)\n",
+                   clip_i + 2);
+        } else {
+            printf("repeat_keep: VAE device W resident for clip %d "
+                   "(vae_load≈0; H3_VAE_REPEAT_RELEASE=device|full to drop)\n",
+                   clip_i + 2);
+        }
+        fflush(stdout);
+        clip_i++;
+        goto clip_denoise;
+    }
+    if (rc != 5) rc = 0;
 
 cleanup:
     if (audio_th_ok) pthread_join(audio_th, NULL);
@@ -4353,6 +7334,8 @@ cleanup:
     free(frame0_img);
     free(ff_rgb);
     free(lf_rgb);
+    h3_latent_upscaler_close(lat_up);
+    lat_up = NULL;
     free(ref_video_rgb);
     {
         int ri;
@@ -4375,6 +7358,7 @@ cleanup:
     free(mux_rgb);
     h3_audio_vae_cuda_waveform_free(&awave);
     h3_vae_int8_frames_free(&frames);
+    h3_vae_int8_cuda_hostreg_release();
     h3_vae_int8_store_free(&vae_store);
     h3_nvfp4_store_free(&te_store);
     h3_dit_w4a8_core_free(&core);
@@ -4384,6 +7368,11 @@ cleanup:
     if (lora_loaded) {
         h3_lora_free(&lora_set);
         lora_loaded = 0;
+    }
+    if (refiner_lora_loaded) {
+        h3_lora_free(&refiner_lora_set);
+        refiner_lora_loaded = 0;
+        refiner_lora_attached = 0;
     }
     h3_ulysses_comm_destroy(&ulysses_cfg);
     h3_nvfp4_cuda_disable();
@@ -4399,5 +7388,13 @@ cleanup:
     h3_cuda_free(cuda);
     h3_w4a8_store_free(dit_store);
     h3_dit_int8_store_free(dit_int8);
+    if (dit_nvfp4_opened) {
+        h3_nvfp4_store_free(&dit_nvfp4);
+        dit_nvfp4_opened = 0;
+    }
+    if (tae_keep) {
+        h3_tae_close(tae_keep);
+        tae_keep = NULL;
+    }
     return rc;
 }

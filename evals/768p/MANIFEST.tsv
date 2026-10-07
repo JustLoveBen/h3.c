@@ -1,0 +1,9 @@
+id	index	seed	zh	cover
+p01_sprint	1	0x76800001	雨后跑道冲镜短跑，测主体高速运动	motion
+p02_talking_head	2	0x76800002	演播室女主播特写说话，测脸/口型	face
+p03_corridor	3	0x76800003	博物馆长廊手持前进，测空间纵深	space
+p04_volumetric	4	0x76800004	木屋金色体积光，尘埃与灯亮起	light
+p05_neon_sign	5	0x76800005	东京夜店招牌「OPEN 24 / 深夜食堂」+ 字幕	text
+p06_orbit	6	0x76800006	铜马雕像 180° 环绕，测镜头运动	camera
+p07_market_track	7	0x76800007	湿货市场 steadicam 穿过人群	motion+face
+p08_ballroom_dolly	8	0x76800008	双人舞由近拉到大厅全景	camera+face

@@ -1,3 +1,6 @@
+#include "h3_dit_act_f16.h"
+#include "h3_dit_fused_epi.h"
+#include "h3_dit_int8_opt.h"
 #include "h3_gpu_cuda.h"
 #include "h3_sdpa.h"
 
@@ -13,9 +16,11 @@
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #if defined(H3_HAVE_CUDNN)
@@ -30,6 +35,15 @@ extern "C" {
 float *h3_w4a8_hadamard_normalized(int size, char *error, size_t error_size);
 float *h3_w4a8_hadamard_sylvester_normalized(int size, char *error,
                                              size_t error_size);
+int h3_cuda_vae_launch_qkv_rope_f16_in(
+    const void *d_qkv_half, const float *d_q_norm, const float *d_k_norm,
+    const float *d_rope_cos, const float *d_rope_sin, void *d_q, void *d_k,
+    void *d_v, size_t seq, size_t seq_padded, size_t heads, size_t head_dim,
+    size_t rope_half, float epsilon, int grouped, int split_half, void *stream,
+    char *error, size_t error_size);
+int h3_cuda_vae_launch_f16_unpad(const void *d_src, void *d_dst, size_t n_batch,
+                                 size_t seq, size_t padded, size_t inner,
+                                 void *stream, char *error, size_t error_size);
 #ifdef __cplusplus
 }
 #endif
@@ -117,9 +131,13 @@ struct h3_cuda {
     int device_index;
     h3_cuda_device_info info;
     cublasHandle_t cublas;
+    cublasHandle_t cublas_side; /* LoRA overlap; never share with ConvRot. */
+    cublasHandle_t cublas_saved;
     cublasLtHandle_t cublasLt;
     float *d_hadamard; /* cached ConvRot H[gs*gs], gs==hadamard_gs */
     int hadamard_gs;
+    void *d_hadamard_f16;
+    int hadamard_f16_gs;
     float *d_hadamard_fwht; /* Sylvester/FWHT H for Comfy VAE */
     int hadamard_fwht_gs;
     /* Reused SDPA scratch (bytes) to avoid per-call cudaMalloc. */
@@ -135,13 +153,19 @@ struct h3_cuda {
     /* Reused act ConvRot/quant scratch (separate from SDPA). */
     void *d_act_scratch;
     size_t act_scratch_bytes;
+    /* Dedicated E2 requant output scratch. Must NOT alias d_act_scratch: a
+     * pre_q GEMM reads its act input from d_act_scratch while the fused
+     * epilogue writes the next GEMM's act here; aliasing corrupts the read. */
+    void *d_rq_scratch;
+    size_t rq_scratch_bytes;
     /* Persistent INT8 GEMM acc + cuBLASLt workspace (CUDA Graph friendly). */
     void *d_gemm_acc;
     size_t gemm_acc_bytes;
     void *d_lt_workspace;
     size_t lt_workspace_bytes;
     int device_bound;
-    /* Reuse cuBLASLt INT8 descriptors + heuristic across 50L×4 GEMMs. */
+    /* Reuse cuBLASLt INT8 descriptors + heuristic across 50L×4 GEMMs.
+     * Tiled-M adds a remainder shape, so 8 slots filled up on 768P. */
     struct {
         size_t m, n, k;
         int state; /* 0 empty, 1 ready, -1 no-algo */
@@ -149,9 +173,22 @@ struct h3_cuda {
         cublasLtMatrixLayout_t a, b, c;
         cublasLtMatmulPreference_t pref;
         cublasLtMatmulHeuristicResult_t heur;
-    } lt_i8[8];
+    } lt_i8[24];
     int lt_i8_n;
     int lt_i8_logged;
+    /* Reused cuBLASLt NVFP4 (block-scaled FP4) descriptors + heuristic.
+     * A/B = CUDA_R_4F_E2M1 packed, VEC16_UE4M3 SF, out BF16 (P1.5 widens to
+     * FP32 for epilogue fusion). Distinct cache from lt_i8 (different dtype). */
+    struct {
+        size_t m, n, k;
+        int state; /* 0 empty, 1 ready, -1 no-algo */
+        cublasLtMatmulDesc_t desc;
+        cublasLtMatrixLayout_t a, b, c;
+        cublasLtMatmulPreference_t pref;
+        cublasLtMatmulHeuristicResult_t heur;
+    } lt_fp4[24];
+    int lt_fp4_n;
+    void *d_fp4_ab; /* persistent device [alpha,beta] f32 for DEVICE pointer mode */
     /* When set: skip cudaEventSynchronize / avoid fresh cudaMalloc.
      * quiet: skip event timing syncs but still allow buffer growth.
      * graph_capture: also forbid realloc (CUDA Graph capture safety). */
@@ -174,6 +211,9 @@ struct h3_cuda {
     size_t conv3d_w_bytes;
     size_t conv3d_y_bytes;
     size_t conv3d_bias_bytes;
+    /* Grow-only workspace for device NCDHW cuDNN Conv3d (LBH). */
+    void *d_ncdhw_ws;
+    size_t ncdhw_ws_bytes;
     /* Set by h3_cuda_pregrow_dit_scratch. Refit must not subtract another
      * 8GiB from remaining free (cafe_p2 window=19). */
     int dit_scratch_pregrown;
@@ -204,6 +244,22 @@ extern "C" int h3_cuda_sdpa_cudnn_f16_run_ex(
     const void *d_v_half, void *d_o_half_out, float *d_o_f32, size_t seq,
     size_t heads, size_t head_dim, float scale, int causal, size_t logical_seq,
     int use_mask, double *sdpa_ms, char *error, size_t error_size);
+extern "C" int h3_cuda_sdpa_cudnn_f16_run_batched(
+    void *cudnn_handle, const void *d_q_half, const void *d_k_half,
+    const void *d_v_half, void *d_o_half_out, float *d_o_f32, size_t seq,
+    size_t heads, size_t head_dim, float scale, int causal, size_t logical_seq,
+    int use_mask, size_t batch, double *sdpa_ms, char *error,
+    size_t error_size);
+extern "C" int h3_cuda_sdpa_cudnn_f16_run_rect(
+    void *cudnn_handle, const void *d_q_half, const void *d_k_half,
+    const void *d_v_half, void *d_o_half_out, float *d_o_f32, size_t seq_q,
+    size_t seq_k, size_t heads, size_t head_dim, float scale, double *sdpa_ms,
+    char *error, size_t error_size);
+extern "C" int h3_cuda_sdpa_cudnn_f32_run_ex(
+    void *cudnn_handle, const float *d_q, const float *d_k, const float *d_v,
+    float *d_o, size_t seq, size_t heads, size_t head_dim, float scale,
+    int causal, size_t logical_seq, int use_mask, double *sdpa_ms, char *error,
+    size_t error_size);
 extern "C" size_t h3_cuda_sdpa_cudnn_align_seq(size_t seq);
 extern "C" int h3_cuda_sdpa_cudnn_shape_blocked(size_t seq, size_t heads,
                                                 size_t head_dim, int causal);
@@ -249,6 +305,24 @@ struct h3_cuda_w4a8_weight {
     float *h_s_owned;
 };
 
+/* NVFP4 P1.4: device-resident FP4 weight (packed E2M1 [N,K/2] + swizzled
+ * UE4M3 SF [rb*ncb*512] + per-tensor F32 scale2). cuBLASLt block-scaled
+ * GEMM applies the per-16 SF in-kernel; scale2 (and the act-side global
+ * scale, when present) are applied by the BF16 epilogues — scale semantics
+ * differ from the INT8 path's per-row act_scale / per-channel s_channel. */
+struct h3_cuda_nvfp4_weight {
+    h3_cuda *cuda;
+    size_t n;
+    size_t k; /* logical K (= 2 * packed cols) */
+    uint8_t *d_w_fp4;
+    uint8_t *d_sf_w;
+    float scale2;
+    cudaEvent_t ready_event;
+    int ready_event_valid;
+    uint8_t *h_w_owned;
+    uint8_t *h_sf_owned;
+};
+
 /* INT8×INT8 → INT32 accumulate (row-major Y[m,n] = X[m,k] @ W[n,k]^T). */
 __global__ void h3_cuda_gemm_i8_kernel(const int8_t *x, const int8_t *w,
                                        int32_t *y, size_t m, size_t n,
@@ -277,6 +351,384 @@ __global__ void h3_cuda_dequant_i32_kernel(const int32_t *acc,
     size_t idx = row * n + col;
     float a_scale = per_tensor ? act_scales[0] : act_scales[row];
     y[idx] = a_scale * s_channel[col] * (float)acc[idx];
+}
+
+/* Same math, 4-wide loads/stores when n%4==0 (DiT QKV/FC/out). */
+__global__ void h3_cuda_dequant_i32_vec4_kernel(const int32_t *acc,
+                                               const float *act_scales,
+                                               int per_tensor,
+                                               const float *s_channel,
+                                               float *y, size_t m, size_t n) {
+    size_t col4 = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t n4 = n >> 2;
+    if (row >= m || col4 >= n4) return;
+    float a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    const int4 *acc4 = (const int4 *)(acc + row * n);
+    const float4 *sc4 = (const float4 *)s_channel;
+    float4 *y4 = (float4 *)(y + row * n);
+    int4 a = acc4[col4];
+    float4 s = sc4[col4];
+    float4 o;
+    o.x = a_scale * s.x * (float)a.x;
+    o.y = a_scale * s.y * (float)a.y;
+    o.z = a_scale * s.z * (float)a.z;
+    o.w = a_scale * s.w * (float)a.w;
+    y4[col4] = o;
+}
+
+/* R31: dequant INT32 acc[m, 2*width] + optional LoRA delta → SwiGLU. */
+__global__ void h3_cuda_dequant_i32_swiglu_kernel(
+    const int32_t *acc, const float *act_scales, int per_tensor,
+    const float *s_channel, const float *lora, float *out, size_t m,
+    size_t width) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t n;
+    float a_scale, gate, up;
+    if (row >= m || col >= width)
+        return;
+    n = width * 2u;
+    a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    gate = a_scale * s_channel[col] * (float)acc[row * n + col];
+    up = a_scale * s_channel[width + col] * (float)acc[row * n + width + col];
+    if (lora) {
+        gate += lora[row * n + col];
+        up += lora[row * n + width + col];
+    }
+    out[row * width + col] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+/* R31: y = residual + (dequant(acc)+lora) * gate_mod. */
+__global__ void h3_cuda_dequant_i32_gate_kernel(
+    const int32_t *acc, const float *act_scales, int per_tensor,
+    const float *s_channel, const float *residual, const float *modulation,
+    const uint32_t *row_map, const float *lora, float *out, size_t m, size_t n,
+    size_t row0, size_t slots, size_t gate_slot) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t grow;
+    uint32_t mrow;
+    float a_scale, br, g;
+    if (row >= m || col >= n)
+        return;
+    grow = row0 + row;
+    mrow = row_map ? row_map[grow] : (uint32_t)grow;
+    a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    br = a_scale * s_channel[col] * (float)acc[row * n + col];
+    if (lora)
+        br += lora[row * n + col];
+    g = modulation[(size_t)mrow * slots * n + gate_slot * n + col];
+    out[row * n + col] = residual[row * n + col] + br * g;
+}
+
+/* E2 fused kernels (H3_DIT_EPI_FUSE=1): the dequant epilogue and the NEXT
+ * GEMM's act quantization in one launch — the FP32 act source never round-
+ * trips HBM between them. Bit-exactness vs the unfused chain is kept by
+ * replicating the exact same reduction order (thread-strided absmax → shared
+ * tree) and scale/round semantics of h3_cuda_quantize_act_per_row_kernel /
+ * _f16_kernel; scalar loads only (no pointer-alignment assumptions). */
+
+/* FC1: dequant INT32 acc[m,2*width] (+lora) → SwiGLU → d_y[m,width], then
+ * per-row absmax requant of d_y into x_i8[m,width] + act_scale[m].
+ * One block per row; grid.y tiles. Same math + order as
+ * h3_cuda_dequant_i32_swiglu_kernel + h3_cuda_quantize_act_per_row_kernel. */
+__global__ void h3_cuda_dequant_swiglu_requant_kernel(
+    const int32_t *__restrict__ acc, const float *__restrict__ act_scales,
+    int per_tensor, const float *__restrict__ s_channel,
+    const float *__restrict__ lora, float *__restrict__ out, size_t m,
+    size_t width, int8_t *__restrict__ x_i8, float *__restrict__ rq_scale) {
+    const size_t row = (size_t)blockIdx.x + (size_t)blockIdx.y * (size_t)gridDim.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    int8_t *dst = x_i8 + row * width;
+    if (row >= m) {
+        for (size_t col = (size_t)tid; col < width; col += (size_t)nthreads)
+            dst[col] = 0;
+        return;
+    }
+    const size_t n = width * 2u;
+    const int32_t *ar = acc + row * n;
+    const float *lr = lora ? (lora + row * n) : NULL;
+    float *yr = out + row * width;
+    const float a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (size_t col = (size_t)tid; col < width; col += (size_t)nthreads) {
+        float gate = a_scale * s_channel[col] * (float)ar[col];
+        float up = a_scale * s_channel[width + col] * (float)ar[width + col];
+        if (lr) {
+            gate += lr[col];
+            up += lr[width + col];
+        }
+        float v = (gate / (1.0f + expf(-gate))) * up;
+        yr[col] = v;
+        float a = fabsf(v);
+        if (a > local) local = a;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && red[tid + stride] > red[tid])
+            red[tid] = red[tid + stride];
+        __syncthreads();
+    }
+    const float absmax = red[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    if (tid == 0) rq_scale[row] = scale;
+    __syncthreads();
+    const float inv = 1.0f / scale;
+    for (size_t col = (size_t)tid; col < width; col += (size_t)nthreads) {
+        float q = roundf(yr[col] * inv);
+        if (q > 127.0f) q = 127.0f;
+        if (q < -127.0f) q = -127.0f;
+        dst[col] = (int8_t)q;
+    }
+}
+
+/* OUT-proj gate: y = residual + (dequant(acc)+lora)*gate_mod; the act source
+ * for the FC1 GEMM is d_residual (x), so requantize x per-row absmax in the
+ * same launch (ConvRot is linear; gemm-side ConvRot identical). Same order as
+ * h3_cuda_dequant_i32_gate_kernel + h3_cuda_quantize_act_per_row_kernel. */
+__global__ void h3_cuda_dequant_gate_requant_res_kernel(
+    const int32_t *__restrict__ acc, const float *__restrict__ act_scales,
+    int per_tensor, const float *__restrict__ s_channel,
+    const float *__restrict__ residual, const float *__restrict__ modulation,
+    const uint32_t *__restrict__ row_map, const float *__restrict__ lora,
+    float *__restrict__ out, size_t m, size_t n, size_t row0, size_t slots,
+    size_t gate_slot, int8_t *__restrict__ x_i8,
+    float *__restrict__ rq_scale) {
+    const size_t row = (size_t)blockIdx.x + (size_t)blockIdx.y * (size_t)gridDim.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    int8_t *dst = x_i8 + row * n;
+    if (row >= m) {
+        for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads)
+            dst[col] = 0;
+        return;
+    }
+    const size_t grow = row0 + row;
+    const uint32_t mrow = row_map ? row_map[grow] : (uint32_t)grow;
+    const float a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    const float *sr = residual + row * n;
+    float *yr = out + row * n;
+    extern __shared__ float red[];
+    float local = 0.0f;
+    for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads) {
+        float br = a_scale * s_channel[col] * (float)acc[row * n + col];
+        if (lora) br += lora[row * n + col];
+        float g = modulation[(size_t)mrow * slots * n + gate_slot * n + col];
+        float v = sr[col] + br * g;
+        yr[col] = v;
+        float a = fabsf(sr[col]);
+        if (a > local) local = a;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && red[tid + stride] > red[tid])
+            red[tid] = red[tid + stride];
+        __syncthreads();
+    }
+    const float absmax = red[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    if (tid == 0) rq_scale[row] = scale;
+    __syncthreads();
+    const float inv = 1.0f / scale;
+    for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads) {
+        float q = roundf(sr[col] * inv);
+        if (q > 127.0f) q = 127.0f;
+        if (q < -127.0f) q = -127.0f;
+        dst[col] = (int8_t)q;
+    }
+}
+
+/* FC2 gate + f32-prescale requant of d_residual(=d_b): replaces the FC2-side
+ * ConvRot path (f32 sgemm + per-row quant) with per-group absmax prescale.
+ * prescale: S_g = pre_scale(absmax_g, gs); act_g = absmax_g/127/S_g;
+ * x_i8 = round(clamp((v*S_g)/act_g)) — matches the f16 prescale math chain
+ * without the f16 intermediate. Same gate math as
+ * h3_cuda_dequant_i32_gate_kernel. */
+__global__ void h3_cuda_dequant_gate_requant_pre_kernel(
+    const int32_t *__restrict__ acc, const float *__restrict__ act_scales,
+    int per_tensor, const float *__restrict__ s_channel,
+    const float *__restrict__ residual, const float *__restrict__ modulation,
+    const uint32_t *__restrict__ row_map, const float *__restrict__ lora,
+    float *__restrict__ out, size_t m, size_t n, size_t row0, size_t slots,
+    size_t gate_slot, int gs, int8_t *__restrict__ x_i8,
+    float *__restrict__ rq_act, float *__restrict__ rq_pre) {
+    const size_t row = (size_t)blockIdx.x + (size_t)blockIdx.y * (size_t)gridDim.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    int8_t *dst = x_i8 + row * n;
+    const size_t ngroups = n / (size_t)gs;
+    if (row >= m) {
+        for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads)
+            dst[col] = 0;
+        for (size_t g = (size_t)tid; g < ngroups; g += (size_t)nthreads)
+            rq_act[row * ngroups + g] = 1.0f;
+        if (tid == 0) rq_pre[row] = 1.0f;
+        return;
+    }
+    const size_t grow = row0 + row;
+    const uint32_t mrow = row_map ? row_map[grow] : (uint32_t)grow;
+    const float a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    const float *sr = residual + row * n;
+    float *yr = out + row * n;
+    extern __shared__ float gmax[]; /* [ngroups] per-group absmax */
+    for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads) {
+        float br = a_scale * s_channel[col] * (float)acc[row * n + col];
+        if (lora) br += lora[row * n + col];
+        float g = modulation[(size_t)mrow * slots * n + gate_slot * n + col];
+        yr[col] = sr[col] + br * g;
+    }
+    __syncthreads();
+    /* Per-group absmax: one warp per group (gs == row width > 32, groups
+     * split across the warp in 32-lane chunks). */
+    {
+        int gidx = warp;
+        if (gidx < (int)ngroups) {
+            float local = 0.0f;
+            const float *gp = yr + (size_t)gidx * (size_t)gs;
+            for (int c = lane; c < gs; c += 32) {
+                float a = fabsf(gp[c]);
+                if (a == a && a > local) local = a;
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, off));
+            if (lane == 0) gmax[gidx] = local;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) rq_pre[row] = h3_dit_act_f16_pre_scale(gmax[0], gs);
+    for (size_t col = (size_t)tid; col < n; col += (size_t)nthreads) {
+        const size_t gidx = col / (size_t)gs;
+        const float absmax = gmax[gidx];
+        const float S = h3_dit_act_f16_pre_scale(absmax, gs);
+        float act = absmax / 127.0f / S;
+        if (!(act > 0.0f)) act = 1.0f;
+        float v = yr[col] * S;
+        float q = roundf(v / act);
+        if (q > 127.0f) q = 127.0f;
+        if (q < -127.0f) q = -127.0f;
+        dst[col] = (int8_t)q;
+        if (col % (size_t)gs == 0) rq_act[row * ngroups + gidx] = act;
+    }
+}
+
+/* ---- NVFP4 P1.5 BF16 epilogues ----
+ * Same sequential-fusion structure as the INT32-acc kernels above, but the
+ * GEMM acc is the cuBLASLt FP4 kernel's BF16 [m,n] output and the dequant
+ * scale is scalar (w_scale2 * act_global_scale) instead of
+ * act_scale[row] * s_channel[col]: NVFP4 per-16 micro-block SF is applied
+ * inside the FP4 MMA, so only the per-tensor second-level scales remain.
+ * acc_scale = 1.0 when the activation has no global scale (dynamic per-16
+ * SF only). */
+
+/* QKV / plain OUT-proj / FC2: plain BF16→F32 dequant. */
+__global__ void h3_cuda_fp4_dequant_bf16_kernel(const __nv_bfloat16 *acc,
+                                                float scale, float *y,
+                                                size_t m, size_t n) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    if (row >= m || col >= n)
+        return;
+    y[row * n + col] = scale * __bfloat162float(acc[row * n + col]);
+}
+
+/* FC1: BF16 acc[m,2*width] (+lora) → SwiGLU → out[m,width]. */
+__global__ void h3_cuda_fp4_swiglu_bf16_kernel(const __nv_bfloat16 *acc,
+                                               float scale,
+                                               const float *lora, float *out,
+                                               size_t m, size_t width) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t n;
+    float gate, up;
+    if (row >= m || col >= width)
+        return;
+    n = width * 2u;
+    gate = scale * __bfloat162float(acc[row * n + col]);
+    up = scale * __bfloat162float(acc[row * n + width + col]);
+    if (lora) {
+        gate += lora[row * n + col];
+        up += lora[row * n + width + col];
+    }
+    out[row * width + col] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+/* OUT-proj / FC2 gate: y = residual + (scale*acc + lora) * gate_mod. */
+__global__ void h3_cuda_fp4_gate_bf16_kernel(
+    const __nv_bfloat16 *acc, float scale, const float *residual,
+    const float *modulation, const uint32_t *row_map, const float *lora,
+    float *out, size_t m, size_t n, size_t row0, size_t slots,
+    size_t gate_slot) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t grow;
+    uint32_t mrow;
+    float br, g;
+    if (row >= m || col >= n)
+        return;
+    grow = row0 + row;
+    mrow = row_map ? row_map[grow] : (uint32_t)grow;
+    br = scale * __bfloat162float(acc[row * n + col]);
+    if (lora)
+        br += lora[row * n + col];
+    g = modulation[(size_t)mrow * slots * n + gate_slot * n + col];
+    out[row * n + col] = residual[row * n + col] + br * g;
+}
+
+/* Metal VAE unpack_frame_range: projected [T*H*W, 3072] → RGB [F,H,W,3]. */
+__global__ void h3_cuda_vae_unpatch_rgb_kernel(
+    const float *__restrict__ projected, float *__restrict__ rgb, int out_frames,
+    int pixel_h, int pixel_w, int latent_t, int latent_h, int latent_w,
+    int metal_22) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t n = (size_t)out_frames * (size_t)pixel_h * (size_t)pixel_w;
+    int x, y, frame, decoded_t, patch_t, within_t, patch_y, within_y, patch_x,
+        within_x, ch;
+    size_t tdiv, patch, component, dst;
+    if (i >= n)
+        return;
+    x = (int)(i % (size_t)pixel_w);
+    tdiv = i / (size_t)pixel_w;
+    y = (int)(tdiv % (size_t)pixel_h);
+    frame = (int)(tdiv / (size_t)pixel_h);
+    decoded_t = frame + 3;
+    if (metal_22 && frame >= 17)
+        decoded_t += 3;
+    patch_t = decoded_t / 4;
+    within_t = decoded_t - patch_t * 4;
+    if (patch_t >= latent_t)
+        patch_t = latent_t - 1;
+    patch_y = y >> 4;
+    within_y = y & 15;
+    patch_x = x >> 4;
+    within_x = x & 15;
+    patch = ((size_t)patch_t * (size_t)latent_h + (size_t)patch_y) *
+                (size_t)latent_w +
+            (size_t)patch_x;
+    {
+        const float mean_c[3] = {0.485f, 0.456f, 0.406f};
+        const float dev_c[3] = {0.229f, 0.224f, 0.225f};
+        dst = i * 3u;
+        for (ch = 0; ch < 3; ch++) {
+            float value;
+            component = ((((size_t)ch * 4u + (size_t)within_t) * 16u +
+                          (size_t)within_y) *
+                             16u +
+                         (size_t)within_x);
+            value = projected[patch * 3072u + component] * dev_c[ch] + mean_c[ch];
+            if (value < 0.0f)
+                value = 0.0f;
+            if (value > 1.0f)
+                value = 1.0f;
+            rgb[dst + (size_t)ch] = value;
+        }
+    }
 }
 
 /* IEEE float8_e4m3fn → float32 (matches host h3_f8e4m3fn_to_f32). */
@@ -579,6 +1031,8 @@ int h3_cuda_nvrtc_ok(void) {
 }
 
 static void h3_cuda_sol_cute_maybe_warmup(void);
+static int h3_sol_cute_should_skip_seq(size_t seq);
+static int h3_sol_err_is_oom(const char *e);
 
 h3_cuda *h3_cuda_create(int device_index, char *error, size_t error_size) {
     h3_cuda *cuda;
@@ -627,6 +1081,16 @@ h3_cuda *h3_cuda_create(int device_index, char *error, size_t error_size) {
                 cuda->streams[s] = NULL;
             }
         }
+    }
+    if (cublasCreate(&cuda->cublas_side) == CUBLAS_STATUS_SUCCESS) {
+        if (cuda->streams_ready && cuda->streams[1] &&
+            cublasSetStream(cuda->cublas_side, cuda->streams[1]) !=
+                CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(cuda->cublas_side);
+            cuda->cublas_side = NULL;
+        }
+    } else {
+        cuda->cublas_side = NULL;
     }
 #if defined(H3_HAVE_CUDNN)
     cuda->cudnn_ok = (cudnnCreate(&cuda->cudnn) == CUDNN_STATUS_SUCCESS);
@@ -682,18 +1146,22 @@ void h3_cuda_free(h3_cuda *cuda) {
     h3_cuda_sdpa_cudnn_reset();
 #endif
     if (cuda->d_hadamard) cudaFree(cuda->d_hadamard);
+    if (cuda->d_hadamard_f16) cudaFree(cuda->d_hadamard_f16);
     if (cuda->d_hadamard_fwht) cudaFree(cuda->d_hadamard_fwht);
     if (cuda->d_sdpa_scratch) cudaFree(cuda->d_sdpa_scratch);
     if (cuda->d_sdpa_expand) cudaFree(cuda->d_sdpa_expand);
     if (cuda->d_gqa_stage) cudaFree(cuda->d_gqa_stage);
     if (cuda->d_act_scratch) cudaFree(cuda->d_act_scratch);
+    if (cuda->d_rq_scratch) cudaFree(cuda->d_rq_scratch);
     if (cuda->d_gemm_acc) cudaFree(cuda->d_gemm_acc);
+    if (cuda->d_fp4_ab) cudaFree(cuda->d_fp4_ab);
     if (cuda->d_lt_workspace) cudaFree(cuda->d_lt_workspace);
     if (cuda->d_unpack_scratch) cudaFree(cuda->d_unpack_scratch);
     if (cuda->d_conv3d_in) cudaFree(cuda->d_conv3d_in);
     if (cuda->d_conv3d_w) cudaFree(cuda->d_conv3d_w);
     if (cuda->d_conv3d_y) cudaFree(cuda->d_conv3d_y);
     if (cuda->d_conv3d_bias) cudaFree(cuda->d_conv3d_bias);
+    if (cuda->d_ncdhw_ws) cudaFree(cuda->d_ncdhw_ws);
     for (s = 0; s < H3_CUDA_N_STREAMS; s++) {
         if (cuda->streams[s]) cudaStreamDestroy(cuda->streams[s]);
     }
@@ -701,6 +1169,7 @@ void h3_cuda_free(h3_cuda *cuda) {
     if (cuda->cudnn_ok) cudnnDestroy(cuda->cudnn);
 #endif
     if (cuda->cublasLt) cublasLtDestroy(cuda->cublasLt);
+    if (cuda->cublas_side) cublasDestroy(cuda->cublas_side);
     if (cuda->cublas) cublasDestroy(cuda->cublas);
     free(cuda);
 }
@@ -731,6 +1200,11 @@ void h3_cuda_release_heavy_workspace(h3_cuda *cuda) {
         cudaFree(cuda->d_act_scratch);
         cuda->d_act_scratch = NULL;
         cuda->act_scratch_bytes = 0;
+    }
+    if (cuda->d_rq_scratch) {
+        cudaFree(cuda->d_rq_scratch);
+        cuda->d_rq_scratch = NULL;
+        cuda->rq_scratch_bytes = 0;
     }
     if (cuda->d_gemm_acc) {
         cudaFree(cuda->d_gemm_acc);
@@ -766,6 +1240,11 @@ void h3_cuda_release_heavy_workspace(h3_cuda *cuda) {
         cudaFree(cuda->d_conv3d_bias);
         cuda->d_conv3d_bias = NULL;
         cuda->conv3d_bias_bytes = 0;
+    }
+    if (cuda->d_ncdhw_ws) {
+        cudaFree(cuda->d_ncdhw_ws);
+        cuda->d_ncdhw_ws = NULL;
+        cuda->ncdhw_ws_bytes = 0;
     }
     cuda->dit_scratch_pregrown = 0;
 }
@@ -833,6 +1312,11 @@ static int h3_cuda_ensure_scratch(h3_cuda *cuda, size_t bytes, char *error,
     }
     if (bytes == 0) return 1;
     if (cuda->d_sdpa_scratch && cuda->sdpa_scratch_bytes >= bytes) return 1;
+    if (cuda->graph_capture) {
+        h3_cuda_set_error(error, error_size,
+                          "sdpa scratch realloc during graph capture");
+        return 0;
+    }
     if (!h3_cuda_bind(cuda, error, error_size)) return 0;
     if (cuda->d_sdpa_scratch) {
         cudaFree(cuda->d_sdpa_scratch);
@@ -1031,6 +1515,31 @@ static int h3_cuda_ensure_act_scratch(h3_cuda *cuda, size_t bytes, char *error,
     return 1;
 }
 
+static int h3_cuda_ensure_rq_scratch(h3_cuda *cuda, size_t bytes, char *error,
+                                     size_t error_size) {
+    cudaError_t status;
+    if (!cuda) {
+        h3_cuda_set_error(error, error_size, "cuda handle is NULL");
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    if (cuda->d_rq_scratch && cuda->rq_scratch_bytes >= bytes) return 1;
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    if (cuda->d_rq_scratch) {
+        cudaFree(cuda->d_rq_scratch);
+        cuda->d_rq_scratch = NULL;
+        cuda->rq_scratch_bytes = 0;
+    }
+    status = cudaMalloc(&cuda->d_rq_scratch, bytes);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaMalloc rq scratch",
+                               status);
+        return 0;
+    }
+    cuda->rq_scratch_bytes = bytes;
+    return 1;
+}
+
 int h3_cuda_pregrow_dit_scratch(h3_cuda *cuda, size_t seq, size_t hidden,
                                 size_t heads, size_t head_dim, size_t ffn,
                                 char *error, size_t error_size) {
@@ -1044,16 +1553,39 @@ int h3_cuda_pregrow_dit_scratch(h3_cuda *cuda, size_t seq, size_t hidden,
     m_pad = (seq + 15u) & ~(size_t)15u;
     n_fc1 = ffn * 2u; /* SwiGLU fused */
     k_max = ffn;
-    acc_bytes = m_pad * n_fc1 * sizeof(int32_t);
-    act_bytes = seq * k_max * sizeof(float) + m_pad * k_max + m_pad * sizeof(float);
+    {
+        size_t tile = h3_dit_int8_gemm_tile_rows(m_pad, n_fc1);
+        acc_bytes = h3_dit_int8_gemm_acc_bytes(m_pad, n_fc1);
+        {
+            static int logged;
+            if (!logged) {
+                fprintf(stderr,
+                        "[h3] dit_scratch: seq=%zu gemm_acc=%.1fMiB tile_m=%zu "
+                        "(full would be %.1fMiB)\n",
+                        seq, (double)acc_bytes / (1024.0 * 1024.0),
+                        tile,
+                        (double)(m_pad * n_fc1 * sizeof(int32_t)) /
+                            (1024.0 * 1024.0));
+                logged = 1;
+            }
+        }
+    }
+    /* +2 rows of scales: INT8 act_scale and F16 ConvRot prescale (AdaLN). */
+    act_bytes = seq * k_max * sizeof(float) + m_pad * k_max +
+                2u * m_pad * sizeof(float);
     padded = (seq + 63u) & ~(size_t)63u;
     sdpa_bytes = padded * heads * head_dim * 4u * sizeof(__half);
+    /* sol_cute keeps its own BF16 QKVO. Don't also pin 4*padded F16 for
+     * cuDNN at lift — that double-QKVO is what blew w_i8 after hires embed. */
+    if (h3_sdpa_cached_id() == H3_SDPA_ID_SOL_CUTE &&
+        h3_sol_cute_seq_allowed(seq))
+        sdpa_bytes = h3_sol_cute_f16_qkv_scratch_bytes(seq, heads, head_dim);
     if (!h3_cuda_ensure_gemm_acc(cuda, acc_bytes, error, error_size)) return 0;
     if (!h3_cuda_ensure_act_scratch(cuda, act_bytes, error, error_size))
         return 0;
     if (!h3_cuda_ensure_scratch(cuda, sdpa_bytes, error, error_size)) return 0;
-    if (!h3_cuda_ensure_lt_workspace(cuda, (size_t)64u << 20, error,
-                                     error_size))
+    if (!h3_cuda_ensure_lt_workspace(cuda, h3_dit_int8_lt_workspace_bytes(),
+                                     error, error_size))
         return 0;
     cuda->dit_scratch_pregrown = 1;
     return 1;
@@ -1176,10 +1708,21 @@ int h3_cuda_recreate_blas(h3_cuda *cuda, char *error, size_t error_size) {
         cublasDestroy(cuda->cublas);
         cuda->cublas = NULL;
     }
+    if (cuda->cublas_side) {
+        cublasDestroy(cuda->cublas_side);
+        cuda->cublas_side = NULL;
+    }
+    cuda->cublas_saved = NULL;
     st = cublasCreate(&cuda->cublas);
     if (st != CUBLAS_STATUS_SUCCESS) {
         h3_cuda_set_error(error, error_size, "cublasCreate failed");
         return 0;
+    }
+    if (cublasCreate(&cuda->cublas_side) == CUBLAS_STATUS_SUCCESS) {
+        if (cuda->streams_ready && cuda->streams[1])
+            cublasSetStream(cuda->cublas_side, cuda->streams[1]);
+    } else {
+        cuda->cublas_side = NULL;
     }
     st = cublasLtCreate(&cuda->cublasLt);
     if (st != CUBLAS_STATUS_SUCCESS) {
@@ -1491,6 +2034,358 @@ int h3_cuda_conv3d_nhwc_bias_f32(
     return 1;
 }
 
+#if defined(H3_HAVE_CUDNN)
+#define H3_NCDHW_CACHE 24
+#define H3_NCDHW_WS_CAP ((size_t)1 << 30)
+
+typedef struct {
+    int used;
+    int n, ic, oc, t, h, w, kd, kh, kw, pt, ph, pw, groups;
+    cudnnConvolutionFwdAlgo_t algo;
+    size_t ws;
+} h3_ncdhw_cache_ent;
+
+static h3_ncdhw_cache_ent g_ncdhw_cache[H3_NCDHW_CACHE];
+static int g_ncdhw_logged;
+
+static int h3_ncdhw_algo_f32_ok(cudnnConvolutionFwdAlgo_t algo) {
+    /* Winograd/FFT drift the F32 oracle; keep GEMM-class only. */
+    return algo == CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM ||
+           algo == CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM ||
+           algo == CUDNN_CONVOLUTION_FWD_ALGO_GEMM;
+}
+
+static void h3_cuda_set_error_cudnn(char *error, size_t error_size,
+                                    const char *prefix, cudnnStatus_t st) {
+    if (!error || !error_size)
+        return;
+    snprintf(error, error_size, "%s: %s", prefix ? prefix : "cudnn",
+             cudnnGetErrorString(st));
+}
+
+static int h3_ncdhw_cache_find(int n, int ic, int oc, int t, int h, int w,
+                               int kd, int kh, int kw, int pt, int ph, int pw,
+                               int groups, cudnnConvolutionFwdAlgo_t *algo,
+                               size_t *ws) {
+    int i;
+    for (i = 0; i < H3_NCDHW_CACHE; i++) {
+        const h3_ncdhw_cache_ent *e = &g_ncdhw_cache[i];
+        if (!e->used)
+            continue;
+        if (e->n == n && e->ic == ic && e->oc == oc && e->t == t && e->h == h &&
+            e->w == w && e->kd == kd && e->kh == kh && e->kw == kw &&
+            e->pt == pt && e->ph == ph && e->pw == pw && e->groups == groups) {
+            *algo = e->algo;
+            *ws = e->ws;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void h3_ncdhw_cache_put(int n, int ic, int oc, int t, int h, int w,
+                               int kd, int kh, int kw, int pt, int ph, int pw,
+                               int groups, cudnnConvolutionFwdAlgo_t algo,
+                               size_t ws) {
+    int i;
+    for (i = 0; i < H3_NCDHW_CACHE; i++) {
+        if (g_ncdhw_cache[i].used)
+            continue;
+        g_ncdhw_cache[i].used = 1;
+        g_ncdhw_cache[i].n = n;
+        g_ncdhw_cache[i].ic = ic;
+        g_ncdhw_cache[i].oc = oc;
+        g_ncdhw_cache[i].t = t;
+        g_ncdhw_cache[i].h = h;
+        g_ncdhw_cache[i].w = w;
+        g_ncdhw_cache[i].kd = kd;
+        g_ncdhw_cache[i].kh = kh;
+        g_ncdhw_cache[i].kw = kw;
+        g_ncdhw_cache[i].pt = pt;
+        g_ncdhw_cache[i].ph = ph;
+        g_ncdhw_cache[i].pw = pw;
+        g_ncdhw_cache[i].groups = groups;
+        g_ncdhw_cache[i].algo = algo;
+        g_ncdhw_cache[i].ws = ws;
+        return;
+    }
+}
+#endif
+
+int h3_cuda_conv3d_ncdhw_bias_dd(
+    h3_cuda *cuda, const float *d_in, const float *d_w, const float *d_bias,
+    float *d_out, int n, int ic, int oc, int t, int h, int w, int kd, int kh,
+    int kw, int pad_t, int pad_h, int pad_w, int groups, char *error,
+    size_t error_size) {
+#if !defined(H3_HAVE_CUDNN)
+    (void)cuda;
+    (void)d_in;
+    (void)d_w;
+    (void)d_bias;
+    (void)d_out;
+    (void)n;
+    (void)ic;
+    (void)oc;
+    (void)t;
+    (void)h;
+    (void)w;
+    (void)kd;
+    (void)kh;
+    (void)kw;
+    (void)pad_t;
+    (void)pad_h;
+    (void)pad_w;
+    (void)groups;
+    h3_cuda_set_error(error, error_size, "cudnn conv3d not built");
+    return 0;
+#else
+    cudnnTensorDescriptor_t in_desc = NULL, out_desc = NULL, bias_desc = NULL;
+    cudnnFilterDescriptor_t filt_desc = NULL;
+    cudnnConvolutionDescriptor_t conv_desc = NULL;
+    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+    cudnnStatus_t st;
+    size_t ws = 0;
+    int ok = 0;
+    int in_dim[5], in_str[5], out_dim[5], out_str[5], filt_dim[5], bias_dim[5],
+        bias_str[5], padA[3], strideA[3], dilA[3], got_dim[5];
+    const float alpha = 1.0f, beta = 0.0f, beta1 = 1.0f;
+    cudaStream_t st_op;
+
+    if (!cuda || !cuda->cudnn_ok || !d_in || !d_w || !d_out || n < 1 || ic < 1 ||
+        oc < 1 || t < 1 || h < 1 || w < 1 || kd < 1 || kh < 1 || kw < 1 ||
+        groups < 1 || (ic % groups) || (oc % groups)) {
+        h3_cuda_set_error(error, error_size, "invalid ncdhw conv3d args");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size))
+        return 0;
+    st_op = h3_cuda_op_st(cuda);
+    if (cudnnSetStream(cuda->cudnn, st_op) != CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cudnnSetStream ncdhw");
+        return 0;
+    }
+
+    in_dim[0] = n;
+    in_dim[1] = ic;
+    in_dim[2] = t;
+    in_dim[3] = h;
+    in_dim[4] = w;
+    in_str[4] = 1;
+    in_str[3] = w;
+    in_str[2] = h * w;
+    in_str[1] = t * h * w;
+    in_str[0] = ic * t * h * w;
+    out_dim[0] = n;
+    out_dim[1] = oc;
+    out_dim[2] = t;
+    out_dim[3] = h;
+    out_dim[4] = w;
+    out_str[4] = 1;
+    out_str[3] = w;
+    out_str[2] = h * w;
+    out_str[1] = t * h * w;
+    out_str[0] = oc * t * h * w;
+    filt_dim[0] = oc;
+    filt_dim[1] = ic / groups;
+    filt_dim[2] = kd;
+    filt_dim[3] = kh;
+    filt_dim[4] = kw;
+    bias_dim[0] = 1;
+    bias_dim[1] = oc;
+    bias_dim[2] = 1;
+    bias_dim[3] = 1;
+    bias_dim[4] = 1;
+    bias_str[0] = oc;
+    bias_str[1] = 1;
+    bias_str[2] = 1;
+    bias_str[3] = 1;
+    bias_str[4] = 1;
+    padA[0] = pad_t;
+    padA[1] = pad_h;
+    padA[2] = pad_w;
+    strideA[0] = 1;
+    strideA[1] = 1;
+    strideA[2] = 1;
+    dilA[0] = 1;
+    dilA[1] = 1;
+    dilA[2] = 1;
+
+    if (cudnnCreateTensorDescriptor(&in_desc) != CUDNN_STATUS_SUCCESS ||
+        cudnnCreateTensorDescriptor(&out_desc) != CUDNN_STATUS_SUCCESS ||
+        cudnnCreateTensorDescriptor(&bias_desc) != CUDNN_STATUS_SUCCESS ||
+        cudnnCreateFilterDescriptor(&filt_desc) != CUDNN_STATUS_SUCCESS ||
+        cudnnCreateConvolutionDescriptor(&conv_desc) != CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cudnnCreate ncdhw desc");
+        goto done;
+    }
+    if (cudnnSetTensorNdDescriptor(in_desc, CUDNN_DATA_FLOAT, 5, in_dim,
+                                   in_str) != CUDNN_STATUS_SUCCESS ||
+        cudnnSetTensorNdDescriptor(out_desc, CUDNN_DATA_FLOAT, 5, out_dim,
+                                   out_str) != CUDNN_STATUS_SUCCESS ||
+        cudnnSetTensorNdDescriptor(bias_desc, CUDNN_DATA_FLOAT, 5, bias_dim,
+                                   bias_str) != CUDNN_STATUS_SUCCESS ||
+        cudnnSetFilterNdDescriptor(filt_desc, CUDNN_DATA_FLOAT,
+                                   CUDNN_TENSOR_NCHW, 5,
+                                   filt_dim) != CUDNN_STATUS_SUCCESS ||
+        cudnnSetConvolutionNdDescriptor(conv_desc, 3, padA, strideA, dilA,
+                                        CUDNN_CROSS_CORRELATION,
+                                        CUDNN_DATA_FLOAT) !=
+            CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cudnnSet ncdhw desc");
+        goto done;
+    }
+    if (cudnnSetConvolutionGroupCount(conv_desc, groups) !=
+        CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cudnnSetConvolutionGroupCount");
+        goto done;
+    }
+    /* DEFAULT_MATH allows TF32 on Ampere+; that blew the F32 oracle
+     * (tiny conv3d 5.7e-6 → 9.7e-3). FMA_MATH is true FP32, no tensor cores. */
+    if (cudnnSetConvolutionMathType(conv_desc, CUDNN_FMA_MATH) !=
+        CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cudnnSetConvolutionMathType");
+        goto done;
+    }
+    st = cudnnGetConvolutionNdForwardOutputDim(conv_desc, in_desc, filt_desc, 5,
+                                               got_dim);
+    if (st != CUDNN_STATUS_SUCCESS || got_dim[0] != n || got_dim[1] != oc ||
+        got_dim[2] != t || got_dim[3] != h || got_dim[4] != w) {
+        h3_cuda_set_error(error, error_size, "ncdhw output dim mismatch");
+        goto done;
+    }
+
+    {
+        const char *det_env = getenv("H3_VAE_DETERMINISTIC");
+        const int det = det_env && det_env[0] == '1' && det_env[1] == '\0';
+        /* H3_VAE_DETERMINISTIC=1: skip the v7 heuristic (which can pick a
+         * different conv algo per process → different reduction order →
+         * run-to-run bit drift, the observed VAE non-determinism root cause)
+         * and pin a deterministic implicit-GEMM algo. */
+        if (det) {
+            size_t need = 0;
+            algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+            if (cudnnGetConvolutionForwardWorkspaceSize(
+                    cuda->cudnn, in_desc, filt_desc, conv_desc, out_desc,
+                    algo, &need) == CUDNN_STATUS_SUCCESS &&
+                need <= H3_NCDHW_WS_CAP) {
+                ws = need;
+                h3_ncdhw_cache_put(n, ic, oc, t, h, w, kd, kh, kw, pad_t,
+                                   pad_h, pad_w, groups, algo, ws);
+            } else {
+                algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+                if (cudnnGetConvolutionForwardWorkspaceSize(
+                        cuda->cudnn, in_desc, filt_desc, conv_desc, out_desc,
+                        algo, &need) == CUDNN_STATUS_SUCCESS &&
+                    need <= H3_NCDHW_WS_CAP) {
+                    ws = need;
+                    h3_ncdhw_cache_put(n, ic, oc, t, h, w, kd, kh, kw, pad_t,
+                                       pad_h, pad_w, groups, algo, ws);
+                } else {
+                    h3_cuda_set_error(error, error_size,
+                                      "ncdhw deterministic conv algo");
+                    goto done;
+                }
+            }
+        }
+    }
+    if (!h3_ncdhw_cache_find(n, ic, oc, t, h, w, kd, kh, kw, pad_t, pad_h,
+                             pad_w, groups, &algo, &ws)) {
+        cudnnConvolutionFwdAlgoPerf_t perf[8];
+        int nperf = 0, i, picked = 0;
+        st = cudnnGetConvolutionForwardAlgorithm_v7(
+            cuda->cudnn, in_desc, filt_desc, conv_desc, out_desc, 8, &nperf,
+            perf);
+        if (st == CUDNN_STATUS_SUCCESS) {
+            for (i = 0; i < nperf; i++) {
+                if (perf[i].status != CUDNN_STATUS_SUCCESS)
+                    continue;
+                if (perf[i].memory > H3_NCDHW_WS_CAP)
+                    continue;
+                if (perf[i].mathType == CUDNN_TENSOR_OP_MATH ||
+                    perf[i].mathType == CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION)
+                    continue;
+                if (!h3_ncdhw_algo_f32_ok(perf[i].algo))
+                    continue;
+                algo = perf[i].algo;
+                ws = perf[i].memory;
+                picked = 1;
+                break;
+            }
+        }
+        if (!picked) {
+            static const cudnnConvolutionFwdAlgo_t fallbacks[] = {
+                CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
+                CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+                CUDNN_CONVOLUTION_FWD_ALGO_GEMM};
+            for (i = 0; i < 3; i++) {
+                size_t need = 0;
+                if (!h3_ncdhw_algo_f32_ok(fallbacks[i]))
+                    continue;
+                algo = fallbacks[i];
+                st = cudnnGetConvolutionForwardWorkspaceSize(
+                    cuda->cudnn, in_desc, filt_desc, conv_desc, out_desc, algo,
+                    &need);
+                if (st == CUDNN_STATUS_SUCCESS && need <= H3_NCDHW_WS_CAP) {
+                    ws = need;
+                    picked = 1;
+                    break;
+                }
+            }
+        }
+        if (!picked) {
+            h3_cuda_set_error(error, error_size, "ncdhw no conv algo");
+            goto done;
+        }
+        h3_ncdhw_cache_put(n, ic, oc, t, h, w, kd, kh, kw, pad_t, pad_h, pad_w,
+                           groups, algo, ws);
+    }
+
+    if (ws > 0 &&
+        !h3_cuda_grow_scratch(&cuda->d_ncdhw_ws, &cuda->ncdhw_ws_bytes, ws,
+                              error, error_size, "ncdhw conv ws"))
+        goto done;
+
+    st = cudnnConvolutionForward(cuda->cudnn, &alpha, in_desc, d_in, filt_desc,
+                                 d_w, conv_desc, algo, cuda->d_ncdhw_ws, ws,
+                                 &beta, out_desc, d_out);
+    if (st != CUDNN_STATUS_SUCCESS) {
+        h3_cuda_set_error_cudnn(error, error_size, "cudnnConvolutionForward",
+                                st);
+        goto done;
+    }
+    if (d_bias) {
+        st = cudnnAddTensor(cuda->cudnn, &alpha, bias_desc, d_bias, &beta1,
+                            out_desc, d_out);
+        if (st != CUDNN_STATUS_SUCCESS) {
+            h3_cuda_set_error_cudnn(error, error_size, "cudnnAddTensor bias",
+                                    st);
+            goto done;
+        }
+    }
+    if (!g_ncdhw_logged) {
+        fprintf(stderr,
+                "selflift: conv3d backend=cudnn algo=%d ws=%zu ic=%d oc=%d "
+                "t=%d %dx%d k=%dx%dx%d g=%d\n",
+                (int)algo, ws, ic, oc, t, h, w, kd, kh, kw, groups);
+        fflush(stderr);
+        g_ncdhw_logged = 1;
+    }
+    ok = 1;
+done:
+    if (conv_desc)
+        cudnnDestroyConvolutionDescriptor(conv_desc);
+    if (filt_desc)
+        cudnnDestroyFilterDescriptor(filt_desc);
+    if (bias_desc)
+        cudnnDestroyTensorDescriptor(bias_desc);
+    if (out_desc)
+        cudnnDestroyTensorDescriptor(out_desc);
+    if (in_desc)
+        cudnnDestroyTensorDescriptor(in_desc);
+    return ok;
+#endif
+}
+
 extern "C" int h3_cuda_gemm_f16_dd(h3_cuda *cuda, const void *d_x_half,
                                    const void *d_weight_half, size_t m,
                                    size_t n, size_t k, void *d_y_half,
@@ -1512,6 +2407,158 @@ extern "C" int h3_cuda_gemm_f16_dd(h3_cuda *cuda, const void *d_x_half,
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (st != CUBLAS_STATUS_SUCCESS) {
         h3_cuda_set_error(error, error_size, "cublasGemmEx f16 failed");
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int h3_cuda_gemm_f16_acc32_dd(h3_cuda *cuda, const void *d_x_half,
+                                         const void *d_weight_half, size_t m,
+                                         size_t n, size_t k, void *d_y_half,
+                                         char *error, size_t error_size) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st;
+    if (!cuda || !d_x_half || !d_weight_half || !d_y_half || m == 0 || n == 0 ||
+        k == 0) {
+        h3_cuda_set_error(error, error_size, "invalid gemm_f16_acc32");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    st = cublasGemmEx(cuda->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)m,
+                      (int)k, &alpha, d_weight_half, CUDA_R_16F, (int)k,
+                      d_x_half, CUDA_R_16F, (int)k, &beta, d_y_half, CUDA_R_16F,
+                      (int)n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 1;
+    return h3_cuda_gemm_f16_dd(cuda, d_x_half, d_weight_half, m, n, k, d_y_half,
+                               NULL, error, error_size);
+}
+
+extern "C" int h3_cuda_gemm_f32in_f16w_f32out_dd_ex(
+    h3_cuda *cuda, const float *d_x_f32, const void *d_w_h, size_t m, size_t n,
+    size_t k, float *d_y_f32, float alpha, float beta, char *error,
+    size_t error_size) {
+    cublasStatus_t st;
+    if (!cuda || !d_x_f32 || !d_w_h || !d_y_f32 || m == 0 || n == 0 || k == 0) {
+        h3_cuda_set_error(error, error_size, "invalid gemm_f32in_f16w");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    st = cublasGemmEx(cuda->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)m,
+                      (int)k, &alpha, d_w_h, CUDA_R_16F, (int)k, d_x_f32,
+                      CUDA_R_32F, (int)k, &beta, d_y_f32, CUDA_R_32F, (int)n,
+                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS) return 1;
+    {
+        static int logged_mix_fail;
+        if (!logged_mix_fail) {
+            fprintf(stderr, "dit_lora_mixed_gemm: gemmex=%d m=%zu n=%zu k=%zu\n",
+                    (int)st, m, n, k);
+            logged_mix_fail = 1;
+        }
+    }
+    if (cuda->cublasLt) {
+        cublasLtMatmulDesc_t desc = NULL;
+        cublasLtMatrixLayout_t a = NULL, b = NULL, c = NULL;
+        cublasLtMatmulPreference_t pref = NULL;
+        cublasLtMatmulHeuristicResult_t heur;
+        cublasOperation_t transa = CUBLAS_OP_T;
+        cublasOperation_t transb = CUBLAS_OP_N;
+        size_t workspace_bytes = 64 * 1024 * 1024;
+        void *workspace = NULL;
+        char ws_err[128];
+        int returned = 0;
+        int ok = 0;
+        if (!h3_cuda_ensure_lt_workspace(cuda, workspace_bytes, ws_err,
+                                         sizeof(ws_err))) {
+            h3_cuda_set_error(error, error_size,
+                              ws_err[0] ? ws_err : "lt workspace");
+            return 0;
+        }
+        workspace = cuda->d_lt_workspace;
+        if (cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                           &transa, sizeof(transa)) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                           &transb, sizeof(transb)) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, (uint64_t)k, (uint64_t)n,
+                                       (int64_t)k) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&b, CUDA_R_32F, (uint64_t)k, (uint64_t)m,
+                                       (int64_t)k) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, (uint64_t)n, (uint64_t)m,
+                                       (int64_t)n) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS)
+            goto lt_done;
+        if (cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace_bytes, sizeof(workspace_bytes)) !=
+            CUBLAS_STATUS_SUCCESS)
+            goto lt_done;
+        {
+            cublasLtMatmulHeuristicResult_t heurs[8];
+            int hi;
+            /* H3_VAE_DETERMINISTIC=1: restrict to algos that need no extra
+             * workspace (no split-k reduction variants), so the GEMM reduction
+             * order is fixed run-to-run. */
+            const char *det_env = getenv("H3_VAE_DETERMINISTIC");
+            const int det = det_env && det_env[0] == '1' && det_env[1] == '\0';
+            st = cublasLtMatmulAlgoGetHeuristic(cuda->cublasLt, desc, a, b, c,
+                                                c, pref, 8, heurs, &returned);
+            for (hi = 0; hi < returned && !ok; hi++) {
+                heur = heurs[hi];
+                if (det && heur.workspaceSize > 0)
+                    continue;
+                if (cublasLtMatmul(cuda->cublasLt, desc, &alpha, d_w_h, a,
+                                   d_x_f32, b, &beta, d_y_f32, c, d_y_f32, c,
+                                   &heur.algo, workspace, heur.workspaceSize,
+                                   h3_cuda_op_st(cuda)) == CUBLAS_STATUS_SUCCESS)
+                    ok = 1;
+            }
+        }
+    lt_done:
+        if (pref) cublasLtMatmulPreferenceDestroy(pref);
+        if (c) cublasLtMatrixLayoutDestroy(c);
+        if (b) cublasLtMatrixLayoutDestroy(b);
+        if (a) cublasLtMatrixLayoutDestroy(a);
+        if (desc) cublasLtMatmulDescDestroy(desc);
+        if (ok) return 1;
+    }
+    h3_cuda_set_error(error, error_size, "gemm_f32in_f16w no mixed algo");
+    return 0;
+}
+
+extern "C" int h3_cuda_gemm_f32in_f16w_f32out_dd(
+    h3_cuda *cuda, const float *d_x_f32, const void *d_w_h, size_t m, size_t n,
+    size_t k, float *d_y_f32, const h3_cuda_gemm_epilogue *epi, char *error,
+    size_t error_size) {
+    (void)epi;
+    return h3_cuda_gemm_f32in_f16w_f32out_dd_ex(cuda, d_x_f32, d_w_h, m, n, k,
+                                                d_y_f32, 1.0f, 0.0f, error,
+                                                error_size);
+}
+
+extern "C" int h3_cuda_gemm_f16_f32out_dd(h3_cuda *cuda, const void *d_x_half,
+                                          const void *d_w_h, size_t m, size_t n,
+                                          size_t k, float *d_y_f32, char *error,
+                                          size_t error_size) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st;
+    if (!cuda || !d_x_half || !d_w_h || !d_y_f32 || m == 0 || n == 0 ||
+        k == 0) {
+        h3_cuda_set_error(error, error_size, "invalid gemm_f16_f32out");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    st = cublasGemmEx(cuda->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)m,
+                      (int)k, &alpha, d_w_h, CUDA_R_16F, (int)k, d_x_half,
+                      CUDA_R_16F, (int)k, &beta, d_y_f32, CUDA_R_32F, (int)n,
+                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        h3_cuda_set_error(error, error_size, "cublasGemmEx f16→f32 failed");
         return 0;
     }
     return 1;
@@ -1562,6 +2609,27 @@ int h3_cuda_gemm_f32_dd_ex(h3_cuda *cuda, const float *d_x,
         cudaEventDestroy(ev_stop);
     }
     return 1;
+}
+
+int h3_cuda_gemm_f32_dd_tf32_ex(h3_cuda *cuda, const float *d_x,
+                                const float *d_weight, size_t m, size_t n,
+                                size_t k, float *d_y, float alpha, float beta,
+                                char *error, size_t error_size) {
+    cublasStatus_t st;
+    if (!cuda || !d_x || !d_weight || !d_y || m == 0 || n == 0 || k == 0) {
+        h3_cuda_set_error(error, error_size, "invalid gemm_f32_tf32 args");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    st = cublasGemmEx(cuda->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)m,
+                      (int)k, &alpha, d_weight, CUDA_R_32F, (int)k, d_x,
+                      CUDA_R_32F, (int)k, &beta, d_y, CUDA_R_32F, (int)n,
+                      CUBLAS_COMPUTE_32F_FAST_TF32,
+                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st == CUBLAS_STATUS_SUCCESS)
+        return 1;
+    return h3_cuda_gemm_f32_dd_ex(cuda, d_x, d_weight, m, n, k, d_y, alpha, beta,
+                                  NULL, error, error_size);
 }
 
 int h3_cuda_gemm_f32_dd(h3_cuda *cuda, const float *d_x, const float *d_weight,
@@ -1658,7 +2726,7 @@ static int h3_cuda_lt_gemm_i8_i32(h3_cuda *cuda, const int8_t *d_w,
                                   size_t n, size_t k, char *error,
                                   size_t error_size) {
     void *workspace = NULL;
-    size_t workspace_bytes = 64 * 1024 * 1024;
+    size_t workspace_bytes = h3_dit_int8_lt_workspace_bytes();
     const int32_t alpha = 1;
     const int32_t beta = 0;
     cublasOperation_t transa = CUBLAS_OP_T;
@@ -1689,7 +2757,7 @@ static int h3_cuda_lt_gemm_i8_i32(h3_cuda *cuda, const int8_t *d_w,
         return 0;
     }
     if (slot < 0) {
-        if (cuda->lt_i8_n >= 8) {
+        if (cuda->lt_i8_n >= (int)(sizeof(cuda->lt_i8) / sizeof(cuda->lt_i8[0]))) {
             h3_cuda_set_error(error, error_size, "cublasLt INT8 cache full");
             return 0;
         }
@@ -1770,18 +2838,117 @@ static int h3_cuda_lt_gemm_i8_i32(h3_cuda *cuda, const int8_t *d_w,
             }
             if (pick < 0) {
                 h3_cuda_set_error(error, error_size,
-                                  "cublasLt algo needs workspace > 64MiB");
+                                  "cublasLt algo needs more workspace");
                 goto fail_slot;
             }
             cuda->lt_i8[slot].heur = heurs[pick];
+            {
+                const char *at_env = getenv("H3_DIT_INT8_ALGO_BEST");
+                if (at_env && at_env[0] == '1') {
+                    /* C5a: autotune over all heuristic candidates that fit
+                     * the workspace, timed on the real d_w/d_x pointers.
+                     * Bit-identical: all candidates are CUBLAS_COMPUTE_32I
+                     * integer GEMMs (exact arithmetic); different
+                     * tiling/split-k of the same integer GEMM yields the
+                     * same INT32 result. Runs once per shape slot; d_acc is
+                     * rewritten by the final real matmul below. */
+                    cudaStream_t at_stream = h3_cuda_op_st(cuda);
+                    cudaEvent_t at_ev0 = NULL, at_ev1 = NULL;
+                    int at_best = pick;
+                    float at_best_ms = 1.0e30f;
+                    float at_first_ms = -1.0f;
+                    int at_n = 0;
+                    int at_ok = 0;
+                    if (cudaStreamSynchronize(at_stream) == cudaSuccess &&
+                        cudaEventCreate(&at_ev0) == cudaSuccess &&
+                        cudaEventCreate(&at_ev1) == cudaSuccess)
+                        at_ok = 1;
+                    if (at_ok) {
+                        (void)cudaGetLastError();
+                        for (hi = 0; hi < returned; hi++) {
+                            float times[5];
+                            int ti, tj, valid = 1;
+                            float med;
+                            if (heurs[hi].workspaceSize > workspace_bytes)
+                                continue;
+                            for (ti = 0; ti < 3; ti++) {
+                                if (cublasLtMatmul(
+                                        cuda->cublasLt,
+                                        cuda->lt_i8[slot].desc, &alpha, d_w,
+                                        cuda->lt_i8[slot].a, d_x,
+                                        cuda->lt_i8[slot].b, &beta, d_acc,
+                                        cuda->lt_i8[slot].c, d_acc,
+                                        cuda->lt_i8[slot].c,
+                                        &heurs[hi].algo, workspace,
+                                        heurs[hi].workspaceSize,
+                                        at_stream) != CUBLAS_STATUS_SUCCESS) {
+                                    valid = 0;
+                                    break;
+                                }
+                            }
+                            if (!valid) continue;
+                            if (cudaStreamSynchronize(at_stream) != cudaSuccess)
+                                continue;
+                            for (ti = 0; ti < 5; ti++) {
+                                cudaEventRecord(at_ev0, at_stream);
+                                if (cublasLtMatmul(
+                                        cuda->cublasLt,
+                                        cuda->lt_i8[slot].desc, &alpha, d_w,
+                                        cuda->lt_i8[slot].a, d_x,
+                                        cuda->lt_i8[slot].b, &beta, d_acc,
+                                        cuda->lt_i8[slot].c, d_acc,
+                                        cuda->lt_i8[slot].c,
+                                        &heurs[hi].algo, workspace,
+                                        heurs[hi].workspaceSize,
+                                        at_stream) != CUBLAS_STATUS_SUCCESS) {
+                                    valid = 0;
+                                    break;
+                                }
+                                cudaEventRecord(at_ev1, at_stream);
+                                cudaEventSynchronize(at_ev1);
+                                cudaEventElapsedTime(&times[ti], at_ev0,
+                                                     at_ev1);
+                            }
+                            if (!valid) continue;
+                            for (ti = 0; ti < 5; ti++) {
+                                for (tj = ti + 1; tj < 5; tj++) {
+                                    if (times[tj] < times[ti]) {
+                                        float tmp = times[ti];
+                                        times[ti] = times[tj];
+                                        times[tj] = tmp;
+                                    }
+                                }
+                            }
+                            med = times[2];
+                            if (hi == pick) at_first_ms = med;
+                            at_n++;
+                            if (med < at_best_ms) {
+                                at_best_ms = med;
+                                at_best = hi;
+                            }
+                        }
+                        cudaEventDestroy(at_ev0);
+                        cudaEventDestroy(at_ev1);
+                        cuda->lt_i8[slot].heur = heurs[at_best];
+                        fprintf(stderr,
+                                "[h3] int8_gemm autotune: m=%zu n=%zu k=%zu "
+                                "algos=%d best=#%d t=%.3fms vs first-fit "
+                                "%.3fms\n",
+                                m, n, k, at_n, at_best, at_best_ms,
+                                at_first_ms);
+                        fflush(stderr);
+                    }
+                }
+            }
         }
         cuda->lt_i8[slot].state = 1;
         cuda->lt_i8_n++;
         if (!cuda->lt_i8_logged) {
             fprintf(stderr,
                     "[h3] int8_gemm: cublasLt cached m=%zu n=%zu k=%zu "
-                    "ws=%zu\n",
-                    m, n, k, (size_t)cuda->lt_i8[slot].heur.workspaceSize);
+                    "ws=%zu/%zu heurs=%d\n",
+                    m, n, k, (size_t)cuda->lt_i8[slot].heur.workspaceSize,
+                    workspace_bytes, returned);
             cuda->lt_i8_logged = 1;
         }
     }
@@ -2333,6 +3500,29 @@ void h3_cuda_host_free(void *p, int pinned) {
         free(p);
 }
 
+int h3_cuda_host_register(void *p, size_t bytes, char *error, size_t error_size) {
+    cudaError_t st;
+    if (!p || bytes == 0) {
+        h3_cuda_set_error(error, error_size, "host_register invalid args");
+        return 0;
+    }
+    st = cudaHostRegister(p, bytes, cudaHostRegisterDefault);
+#ifdef cudaHostRegisterReadOnly
+    if (st != cudaSuccess)
+        st = cudaHostRegister(p, bytes, cudaHostRegisterReadOnly);
+#endif
+    if (st != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaHostRegister", st);
+        return 0;
+    }
+    return 1;
+}
+
+void h3_cuda_host_unregister(void *p) {
+    if (p)
+        (void)cudaHostUnregister(p);
+}
+
 int h3_cuda_w4a8_weight_create_from_i8(h3_cuda *cuda, int8_t *w_i8, size_t n,
                                        size_t k, float *s_channel,
                                        h3_cuda_w4a8_weight **out,
@@ -2365,6 +3555,10 @@ int h3_cuda_w4a8_weight_create_from_i8(h3_cuda *cuda, int8_t *w_i8, size_t n,
     weight->n = n;
     weight->k = k;
     status = cudaMalloc((void **)&weight->d_w_i8, n * k);
+    if (status != cudaSuccess) {
+        h3_cuda_sol_cute_trim_cache();
+        status = cudaMalloc((void **)&weight->d_w_i8, n * k);
+    }
     if (status != cudaSuccess) {
         h3_cuda_set_error_cuda(error, error_size, "cudaMalloc w_i8", status);
         goto cleanup;
@@ -2562,6 +3756,86 @@ int h3_cuda_w4a8_weight_on_device(const h3_cuda_w4a8_weight *weight,
             return 0;
         }
     }
+    return 1;
+}
+
+int h3_cuda_w4a8_weight_upload_i8(h3_cuda_w4a8_weight *weight, int8_t *w_i8,
+                                  size_t n, size_t k, float *s_channel,
+                                  int borrow_host, char *error,
+                                  size_t error_size) {
+    cudaError_t status;
+    cudaStream_t st;
+    if (!weight || !w_i8 || !s_channel || n == 0 || k == 0) {
+        h3_cuda_set_error(error, error_size, "invalid weight_upload_i8 args");
+        return 0;
+    }
+    if (!weight->d_w_i8 || !weight->d_s_channel || weight->n != n ||
+        weight->k != k) {
+        h3_cuda_set_error(error, error_size, "upload_i8 shape mismatch");
+        return 0;
+    }
+    if (!h3_cuda_w4a8_weight_ensure_ready(weight, error, error_size))
+        return 0;
+    if (weight->cuda &&
+        !h3_cuda_bind(weight->cuda, error, error_size))
+        return 0;
+    st = (weight->cuda && weight->cuda->streams_ready &&
+          weight->cuda->streams[0])
+             ? weight->cuda->streams[0]
+             : (cudaStream_t)0;
+    status = cudaMemcpyAsync(weight->d_w_i8, w_i8, n * k,
+                             cudaMemcpyHostToDevice, st);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaMemcpyAsync w_i8",
+                               status);
+        return 0;
+    }
+    status = cudaMemcpyAsync(weight->d_s_channel, s_channel, n * sizeof(float),
+                             cudaMemcpyHostToDevice, st);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaMemcpyAsync s_channel",
+                               status);
+        return 0;
+    }
+    if (borrow_host) {
+        status = cudaEventCreateWithFlags(&weight->ready_event,
+                                          cudaEventDisableTiming);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate",
+                                   status);
+            return 0;
+        }
+        status = cudaEventRecord(weight->ready_event, st);
+        if (status != cudaSuccess) {
+            cudaEventDestroy(weight->ready_event);
+            weight->ready_event = NULL;
+            h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
+                                   status);
+            return 0;
+        }
+        weight->ready_event_valid = 1;
+        return 1;
+    }
+    weight->h_w_owned = w_i8;
+    weight->h_s_owned = s_channel;
+    status = cudaEventCreateWithFlags(&weight->ready_event,
+                                      cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        weight->h_w_owned = NULL;
+        weight->h_s_owned = NULL;
+        h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate", status);
+        return 0;
+    }
+    status = cudaEventRecord(weight->ready_event, st);
+    if (status != cudaSuccess) {
+        cudaEventDestroy(weight->ready_event);
+        weight->ready_event = NULL;
+        weight->h_w_owned = NULL;
+        weight->h_s_owned = NULL;
+        h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord", status);
+        return 0;
+    }
+    weight->ready_event_valid = 1;
     return 1;
 }
 
@@ -2776,6 +4050,82 @@ int h3_cuda_convrot_act_f32_dd(h3_cuda *cuda, const float *d_x, size_t m,
     return 1;
 }
 
+static int h3_cuda_ensure_hadamard_f16(h3_cuda *cuda, int gs, char *error,
+                                       size_t error_size) {
+    if (!h3_cuda_ensure_hadamard(cuda, gs, error, error_size)) return 0;
+    if (cuda->d_hadamard_f16 && cuda->hadamard_f16_gs == gs) return 1;
+    if (cuda->d_hadamard_f16) {
+        cudaFree(cuda->d_hadamard_f16);
+        cuda->d_hadamard_f16 = NULL;
+        cuda->hadamard_f16_gs = 0;
+    }
+    if (cudaMalloc(&cuda->d_hadamard_f16, (size_t)gs * (size_t)gs * 2) !=
+        cudaSuccess) {
+        h3_cuda_set_error(error, error_size, "cudaMalloc hadamard f16");
+        return 0;
+    }
+    if (!h3_cuda_f32_to_f16_dev(cuda, cuda->d_hadamard, cuda->d_hadamard_f16,
+                                (size_t)gs * (size_t)gs, error, error_size)) {
+        cudaFree(cuda->d_hadamard_f16);
+        cuda->d_hadamard_f16 = NULL;
+        return 0;
+    }
+    cuda->hadamard_f16_gs = gs;
+    return 1;
+}
+
+extern "C" int h3_cuda_convrot_act_f16_dd(h3_cuda *cuda, const void *d_x_half,
+                                          size_t m, size_t k,
+                                          int convrot_groupsize,
+                                          void *d_y_half, char *error,
+                                          size_t error_size) {
+    size_t n_groups, g;
+    int gs;
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st;
+    if (!cuda || !d_x_half || !d_y_half || m == 0 || k == 0 ||
+        convrot_groupsize < 4) {
+        h3_cuda_set_error(error, error_size, "invalid convrot_act_f16");
+        return 0;
+    }
+    if (d_x_half == d_y_half) {
+        h3_cuda_set_error(error, error_size, "convrot_act_f16 aliases");
+        return 0;
+    }
+    gs = convrot_groupsize;
+    if (k % (size_t)gs != 0) {
+        h3_cuda_set_error(error, error_size, "K not divisible by convrot_gs");
+        return 0;
+    }
+    if (!h3_cuda_ensure_hadamard_f16(cuda, gs, error, error_size)) return 0;
+    n_groups = k / (size_t)gs;
+    {
+        const __half *x = (const __half *)d_x_half;
+        __half *y = (__half *)d_y_half;
+        long long stride = (long long)gs;
+        st = cublasGemmStridedBatchedEx(
+            cuda->cublas, CUBLAS_OP_N, CUBLAS_OP_N, gs, (int)m, gs, &alpha,
+            cuda->d_hadamard_f16, CUDA_R_16F, gs, 0LL, x, CUDA_R_16F, (int)k,
+            stride, &beta, y, CUDA_R_16F, (int)k, stride, (int)n_groups,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st == CUBLAS_STATUS_SUCCESS) return 1;
+        for (g = 0; g < n_groups; g++) {
+            st = cublasGemmEx(cuda->cublas, CUBLAS_OP_N, CUBLAS_OP_N, gs,
+                              (int)m, gs, &alpha, cuda->d_hadamard_f16,
+                              CUDA_R_16F, gs, x + g * (size_t)gs, CUDA_R_16F,
+                              (int)k, &beta, y + g * (size_t)gs, CUDA_R_16F,
+                              (int)k, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                h3_cuda_set_error(error, error_size,
+                                  "cublasGemmEx convrot f16 group");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int h3_cuda_ensure_hadamard_fwht(h3_cuda *cuda, int gs, char *error,
                                         size_t error_size) {
     float *host_h;
@@ -2905,7 +4255,12 @@ __global__ void h3_cuda_quantize_act_per_row_kernel(const float *x, int8_t *y,
     const float *src = x + row * k;
 
     float local = 0.0f;
-    if ((k & 3u) == 0) {
+    /* float4 needs 16-byte src. NVFP4 gs==0 quantizes AdaLN `d_a` in the
+     * block workspace; odd seq makes map pad 8 and `d_a` only 8-aligned.
+     * Gold ConvRot quantizes act-scratch `d_rot` (cudaMalloc-aligned). */
+    const int vec4 = ((k & 3u) == 0) &&
+                     ((((uintptr_t)src) & (uintptr_t)15u) == 0);
+    if (vec4) {
         const float4 *src4 = (const float4 *)src;
         size_t n4 = k >> 2;
         for (size_t col = (size_t)tid; col < n4; col += (size_t)nthreads) {
@@ -2935,7 +4290,7 @@ __global__ void h3_cuda_quantize_act_per_row_kernel(const float *x, int8_t *y,
     if (tid == 0) scales[row] = scale;
     __syncthreads();
     float inv = 1.0f / scale;
-    if ((k & 3u) == 0) {
+    if (vec4) {
         const float4 *src4 = (const float4 *)src;
         size_t n4 = k >> 2;
         for (size_t col = (size_t)tid; col < n4; col += (size_t)nthreads) {
@@ -2968,6 +4323,296 @@ __global__ void h3_cuda_quantize_act_per_row_kernel(const float *x, int8_t *y,
     }
 }
 
+/* -------------------------------------------------------------------------
+ * NVFP4 activation quantization (Phase 1 P1.2).
+ * Per 16-element micro-block: amax -> UE4M3 scale -> E2M1 nibble pack.
+ * SF written in the layout measured empirically on sm_120 cuBLASLt
+ * (bench/nvfp4_phase0/diag_sf_layout.cu single-marker probe, both row and
+ * column decoded): logical (row r, micro-block c) maps to
+ *   tile = (r/128)*ncb + c/4   (ncb = (K/16)/4, K%64==0)
+ *   off  = tile*512 + (r%128)*4 + (c%4)
+ * i.e. within a 512B tile the 128 rows are the major axis (4 bytes each) and
+ * the 4 micro-block columns are the minor axis. One block per row; 256
+ * threads; 16-wide __shfl_xor butterfly amax; lane0 writes SF, even lane packs.
+ * ----------------------------------------------------------------------- */
+__device__ __forceinline__ float h3_e2m1_round(float q) {
+    /* E2M1 magnitudes {0,.5,1,1.5,2,3,4,6}; round-to-nearest on the FP4 grid. */
+    float a = fabsf(q);
+    float r;
+    if (a < 0.25f) r = 0.0f;
+    else if (a < 0.75f) r = 0.5f;
+    else if (a < 1.25f) r = 1.0f;
+    else if (a < 1.75f) r = 1.5f;
+    else if (a < 2.5f) r = 2.0f;
+    else if (a < 3.5f) r = 3.0f;
+    else if (a < 5.0f) r = 4.0f;
+    else r = 6.0f;
+    return copysignf(r, q);
+}
+
+__device__ __forceinline__ uint8_t h3_e2m1_nibble(float q) {
+    float v = h3_e2m1_round(q);
+    float a = fabsf(v);
+    uint8_t mag;
+    if (a < 0.25f) mag = 0;
+    else if (a < 0.75f) mag = 1;
+    else if (a < 1.25f) mag = 2;
+    else if (a < 1.75f) mag = 3;
+    else if (a < 2.5f) mag = 4;
+    else if (a < 3.5f) mag = 5;
+    else if (a < 5.0f) mag = 6;
+    else mag = 7;   /* E2M1 max = 6.0 (bits 0111); no NaN encoding exists */
+    return (uint8_t)((v < 0.0f ? 8 : 0) | mag);
+}
+
+__device__ __forceinline__ uint8_t h3_f32_to_ue4m3(float v) {
+    int e, m, E;
+    float f;
+    if (!(v > 0.0f)) return 0;          /* 0 / negative / NaN -> 0 scale */
+    f = frexpf(v, &e);                  /* v = f*2^e, f in [0.5,1) */
+    E = e - 1 + 7;
+    if (E <= 0) {                        /* subnormal */
+        m = (int)lroundf(ldexpf(v, 6) * 8.0f);
+        if (m > 7) m = 7;
+        return (uint8_t)m;
+    }
+    if (E >= 15) return 0x7E;            /* clamp to max normal (448) */
+    m = (int)lroundf((f * 2.0f - 1.0f) * 8.0f);
+    if (m == 8) { E += 1; m = 0; if (E >= 15) return 0x7E; }
+    return (uint8_t)((E << 3) | m);
+}
+
+__device__ __forceinline__ float h3_ue4m3_to_f32(uint8_t b) {
+    int e = (b >> 3) & 0xF, m = b & 0x7;
+    if (e == 0) return ldexpf((float)m / 8.0f, -6);
+    if (e == 0xF && m == 0x7) return NAN;
+    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
+/* x[m,k] f32 -> x_fp4[m,k/2] packed (hi nibble = even K, Comfy hi_first) +
+ * sf swizzled UE4M3. nc = k/16 micro-blocks per row; ncb = nc/4 (k%64==0).
+ *
+ * The grid is sized over m_pad (round_up(m,128)), and rows [m, m_pad) run a
+ * zero-fill path: they write nibble 0 AND sf 0. cuBLASLt reads the full
+ * 128-row x 2048-K-element SF tile grid regardless of m, and a stale SF byte
+ * >= 0xFE is UE4M3 NaN (NaN * 0 nibble = NaN in the accumulator), so padding
+ * rows must carry sf 0, not garbage. Rows < m additionally zero-fill the
+ * K-tail: cuBLASLt's per-row-tile SF extent is ceil(ncb/32)*32 tile-columns
+ * (2048 K elems), so for K%2048!=0 the kernel covers tile-cols up to that
+ * padded extent with sf 0 (their nibbles were memset to 0 by the caller). */
+__global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
+                                                  uint8_t *__restrict__ x_fp4,
+                                                  uint8_t *__restrict__ sf,
+                                                  size_t m, size_t k) {
+    const size_t row = (size_t)blockIdx.x + (size_t)blockIdx.y * gridDim.x;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int mb = tid >> 4;             /* micro-block index within block */
+    const int lane_in_mb = tid & 15;
+    const size_t nc = k >> 4;            /* k/16 */
+    const int mb_per_block = 16;         /* 256 threads / 16 lanes */
+    const size_t ncb = nc >> 2;          /* k/64; assumes k%64==0 */
+    /* cuBLASLt reads ceil(ncb/32)*32 tile-columns per 128-row tile (2048 K
+     * elems each); cover that padded extent so no stale byte is ever read. */
+    const size_t ncb_rd = (ncb + 31u) & ~(size_t)31u;
+    const size_t tile_base = (row >> 7) * ncb_rd;
+    const size_t r128 = row & 127u;      /* row % 128 : major axis in tile */
+    if (row >= m) {
+        /* Padding row: zero-fill ALL 4 byte-columns of its SF across the full
+         * padded extent. (tid&3 collapses to 0 for lane_in_mb==0 threads, so
+         * loop cc explicitly — writing only cc=0 leaves cc=1..3 as garbage,
+         * which cuBLASLt reads as UE4M3 NaN.) */
+        if (lane_in_mb == 0) {
+            size_t tc;
+            int cc;
+            for (tc = (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
+                for (cc = 0; cc < 4; cc++)
+                    sf[(tile_base + tc) * 512 + r128 * 4 + (size_t)cc] = 0;
+        }
+        return;
+    }
+    {
+        const float *xr = x + row * k;
+        uint8_t *xr_fp4 = x_fp4 + row * (k >> 1);
+        int nblk = (int)(nc / mb_per_block);
+        int blk;
+        for (blk = 0; blk < nblk; blk++) {
+            int g = blk * mb_per_block + mb;   /* global micro-block in row */
+            float v = xr[(size_t)g * 16 + lane_in_mb];
+            float amax = fabsf(v);
+            float scale_f, inv;
+            uint8_t sf_b;
+            uint8_t nib;
+            /* 16-wide butterfly amax within the micro-block (lanes 0-15 of
+             * each half-warp). */
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+            scale_f = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
+            sf_b = h3_f32_to_ue4m3(scale_f);
+            scale_f = h3_ue4m3_to_f32(sf_b);   /* use exact representable */
+            inv = 1.0f / scale_f;
+            nib = h3_e2m1_nibble(v * inv);
+            /* lane0 writes SF in the measured sm_120 layout. */
+            if (lane_in_mb == 0) {
+                size_t cc = (size_t)g & 3u;
+                size_t off_sf =
+                    (tile_base + ((size_t)g >> 2)) * 512 + r128 * 4 + cc;
+                sf[off_sf] = sf_b;
+            }
+            /* gather lo nibble from odd lane to even lane */
+            {
+                uint8_t nib_lo = (uint8_t)__shfl_down_sync(0xffffffffu, nib, 1);
+                if ((lane_in_mb & 1) == 0) {
+                    size_t col = (size_t)g * 16 + lane_in_mb; /* even */
+                    xr_fp4[col >> 1] = (uint8_t)((nib << 4) | (nib_lo & 0xF));
+                }
+            }
+        }
+        /* K-tail zero-fill: tile-cols [ncb, ncb_rd) for K%2048!=0. Same cc
+         * collapse caveat as the padding path — write all 4 byte-columns. */
+        if (ncb_rd > ncb && lane_in_mb == 0) {
+            size_t tc;
+            int cc;
+            for (tc = ncb + (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
+                for (cc = 0; cc < 4; cc++)
+                    sf[(tile_base + tc) * 512 + r128 * 4 + (size_t)cc] = 0;
+        }
+    }
+}
+
+/* Host wrapper: quantize act to NVFP4. sf buffer must be sf_elems(m,k/16)
+ * bytes (128x4 padded). Uses d_rq_scratch-sized caller buffers. The grid
+ * covers m_pad = round_up(m,128) rows so padding rows get sf 0 (not stale
+ * garbage, which cuBLASLt would read as UE4M3 NaN). */
+static int h3_cuda_quantize_act_nvfp4(h3_cuda *cuda, const float *d_x,
+                                      size_t m, size_t k, uint8_t *d_x_fp4,
+                                      uint8_t *d_sf, char *error,
+                                      size_t error_size) {
+    unsigned threads = 256;
+    unsigned gx, gy;
+    dim3 grid;
+    size_t m_pad = (m + 127u) & ~(size_t)127u;
+    if (!cuda || !d_x || !d_x_fp4 || !d_sf || m == 0 || k == 0 ||
+        (k & 63u) != 0) {
+        h3_cuda_set_error(error, error_size,
+                          "nvfp4 quant: bad args (K must be %64==0)");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    gx = m_pad > 65535u ? 65535u : (unsigned)m_pad;
+    gy = (unsigned)((m_pad + gx - 1u) / gx);
+    grid = dim3(gx, gy, 1);
+    h3_cuda_quantize_act_nvfp4_kernel<<<grid, threads, 0, h3_cuda_op_st(cuda)>>>(
+        d_x, d_x_fp4, d_sf, m, k);
+    {
+        cudaError_t st = cudaGetLastError();
+        if (st != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "nvfp4 quant kernel", st);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Public wrapper (P1.2/P1.3 shared): quantize an F32 [m,k] tensor to NVFP4
+ * packed E2M1 + swizzled UE4M3 SF. Caller allocates d_x_fp4 (m*k/2 bytes) and
+ * d_sf (sf_elems(m, k/16) = ceil(m/128)*ceil(k/16/4)*512 bytes). */
+int h3_cuda_quantize_act_nvfp4_dev(h3_cuda *cuda, const float *d_x, size_t m,
+                                   size_t k, uint8_t *d_x_fp4, uint8_t *d_sf,
+                                   char *error, size_t error_size) {
+    return h3_cuda_quantize_act_nvfp4(cuda, d_x, m, k, d_x_fp4, d_sf, error,
+                                      error_size);
+}
+
+/* F32→F16 with per-row scale so AdaLN/SwiGLU + ConvRot fit in F16. */
+__global__ void h3_cuda_f32_to_f16_row_prescale_kernel(const float *x, __half *y,
+                                                      float *pre_scale,
+                                                      size_t m, size_t k,
+                                                      int gs) {
+    const size_t row = (size_t)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    if (row >= m) return;
+    extern __shared__ float red[];
+    const float *src = x + row * k;
+    __half *dst = y + row * k;
+    float local = 0.0f;
+    for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads) {
+        float a = fabsf(src[col]);
+        if (a == a && a > local) local = a;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && red[tid + stride] > red[tid])
+            red[tid] = red[tid + stride];
+        __syncthreads();
+    }
+    float S = h3_dit_act_f16_pre_scale(red[0], gs);
+    if (tid == 0) pre_scale[row] = S;
+    __syncthreads();
+    for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads) {
+        float v = src[col] * S;
+        if (v != v) v = 0.0f;
+        if (v > 65504.0f) v = 65504.0f;
+        if (v < -65504.0f) v = -65504.0f;
+        dst[col] = __float2half(v);
+    }
+}
+
+/* Same absmax/127 quant as F32, from F16 ConvRot (DiT act_f16).
+ * pre_scale: divide act_scale so INT8 dequant restores F32 magnitude. */
+__global__ void h3_cuda_quantize_act_per_row_f16_kernel(const __half *x,
+                                                        int8_t *y,
+                                                        float *scales,
+                                                        const float *pre_scale,
+                                                        size_t m, size_t k) {
+    const size_t row = (size_t)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    int8_t *dst = y + row * k;
+    if (row >= m) {
+        for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads)
+            dst[col] = 0;
+        return;
+    }
+    extern __shared__ float red[];
+    const __half *src = x + row * k;
+    float local = 0.0f;
+    for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads) {
+        float a = fabsf(__half2float(src[col]));
+        if (a == a && a <= 65504.0f && a > local) local = a;
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && red[tid + stride] > red[tid])
+            red[tid] = red[tid + stride];
+        __syncthreads();
+    }
+    float absmax = red[0];
+    float ps = 1.0f;
+    if (pre_scale) {
+        ps = pre_scale[row];
+        if (!(ps > 0.0f) || !(ps <= 3.402823466e+38f)) ps = 1.0f;
+    }
+    float scale = 1.0f;
+    if (absmax > 0.0f) scale = (absmax / 127.0f) / ps;
+    if (!(scale > 0.0f) || !(scale <= 3.402823466e+38f)) scale = 1.0f;
+    if (tid == 0) scales[row] = scale;
+    __syncthreads();
+    float inv = 1.0f / scale;
+    for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads) {
+        float q = roundf(__half2float(src[col]) * inv);
+        if (q != q) q = 0.0f;
+        if (q > 127.0f) q = 127.0f;
+        if (q < -127.0f) q = -127.0f;
+        dst[col] = (int8_t)q;
+    }
+}
+
 /* Device-pointer GEMM+dequant (x already on device).
  * m_gemm >= m: Tensor-Core INT8 wants M%16==0; extra act rows must be zero
  * so they cannot change the first m output rows. Dequant writes only m. */
@@ -2975,7 +4620,8 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
     h3_cuda *cuda, const int8_t *d_x, const int8_t *d_w, const float *d_act,
     int per_tensor_scale, const float *d_sc, size_t m, size_t n, size_t k,
     float *d_y, size_t m_gemm, double *gemm_ms, char *backend_out,
-    size_t backend_out_size, char *error, size_t error_size) {
+    size_t backend_out_size, char *error, size_t error_size,
+    const h3_cuda_dit_gemm_epi *epi) {
     int32_t *d_acc = NULL;
     cudaError_t status;
     cudaEvent_t ev_start = NULL;
@@ -2994,12 +4640,52 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
         h3_cuda_set_error(error, error_size, "invalid device gemm args");
         return 0;
     }
-    if (m_gemm < m) m_gemm = m;
-    quiet = !h3_cuda_want_events(cuda);
-
-    if (!h3_cuda_ensure_gemm_acc(cuda, m_gemm * n * sizeof(int32_t), error,
-                                 error_size))
+    if (epi && epi->swiglu && epi->gate) {
+        h3_cuda_set_error(error, error_size, "dit gemm epi swiglu+gate");
         return 0;
+    }
+    if (epi && epi->swiglu && (n & 1u)) {
+        h3_cuda_set_error(error, error_size, "dit gemm swiglu n odd");
+        return 0;
+    }
+    if (epi && epi->gate &&
+        (!epi->d_residual || !epi->d_modulation || epi->slots == 0)) {
+        h3_cuda_set_error(error, error_size, "dit gemm gate epi args");
+        return 0;
+    }
+    if (m_gemm < m) m_gemm = m;
+    int rq_mode = epi ? epi->requant_mode : 0;
+    if (rq_mode && !(epi->d_rq_x && epi->d_rq_act && epi->requant_rows >= m_gemm)) {
+        h3_cuda_set_error(error, error_size, "dit gemm epi requant args");
+        return 0;
+    }
+    if (rq_mode == 1 && !(epi->swiglu)) {
+        h3_cuda_set_error(error, error_size, "dit requant mode1 needs swiglu");
+        return 0;
+    }
+    if (rq_mode >= 2 && !(epi->gate && epi->d_residual && epi->requant_gs > 0 &&
+                          epi->d_rq_pre)) {
+        h3_cuda_set_error(error, error_size, "dit requant mode2 args");
+        return 0;
+    }
+    {
+        size_t rq_k = (rq_mode == 1) ? (n / 2u) : n;
+        if (rq_mode && (size_t)epi->requant_gs != rq_k) {
+            h3_cuda_set_error(error, error_size,
+                              "dit requant gs must equal act row width");
+            return 0;
+        }
+    }
+    quiet = !h3_cuda_want_events(cuda);
+    {
+        size_t tile = h3_dit_int8_gemm_tile_rows(m_gemm, n);
+        size_t acc_m = tile;
+        if (acc_m < 1)
+            acc_m = m_gemm;
+        if (!h3_cuda_ensure_gemm_acc(cuda, acc_m * n * sizeof(int32_t), error,
+                                     error_size))
+            return 0;
+    }
     d_acc = (int32_t *)cuda->d_gemm_acc;
 
     if (!quiet) {
@@ -3025,41 +4711,169 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
     }
 
     gemm_err[0] = '\0';
-    if (h3_cuda_lt_gemm_i8_i32(cuda, d_w, d_x, d_acc, m_gemm, n, k, gemm_err,
-                               sizeof(gemm_err))) {
-        gemm_ok = 1;
-        gemm_backend = "cublasLt";
-    } else if (h3_cuda_ex_gemm_i8_i32(cuda, d_w, d_x, d_acc, m_gemm, n, k,
-                                      gemm_err, sizeof(gemm_err))) {
-        gemm_ok = 1;
-        gemm_backend = "cublasGemmEx";
-    } else {
-        h3_cuda_kernel_gemm_i8_i32(cuda, d_x, d_w, d_acc, m_gemm, n, k);
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "INT8 GEMM kernel",
-                                   status);
-            goto cleanup;
-        }
-        gemm_ok = 1;
-        gemm_backend = "cuda_kernel";
-    }
-    if (!gemm_ok) {
-        h3_cuda_set_error(error, error_size,
-                          gemm_err[0] ? gemm_err : "INT8 GEMM failed");
-        goto cleanup;
-    }
-
     {
-        unsigned threads = 256;
-        dim3 dq_grid((unsigned)((n + (size_t)threads - 1) / (size_t)threads),
-                     (unsigned)m, 1);
-        h3_cuda_dequant_i32_kernel<<<dq_grid, threads, 0, h3_cuda_op_st(cuda)>>>(
-            d_acc, d_act, per_tensor_scale ? 1 : 0, d_sc, d_y, m, n);
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "dequant kernel", status);
-            goto cleanup;
+        size_t tile = h3_dit_int8_gemm_tile_rows(m, n);
+        size_t m0;
+        int use_tiles = (tile < m);
+        int waited_lora = 0;
+        static int tile_logged;
+        if (!tile_logged) {
+            fprintf(stderr,
+                    "[h3] int8_gemm: tile M=%zu (full M=%zu n=%zu; acc %.1fMiB "
+                    "vs %.1fMiB)\n",
+                    tile, m, n,
+                    (double)(tile * n * sizeof(int32_t)) / (1024.0 * 1024.0),
+                    (double)(m * n * sizeof(int32_t)) / (1024.0 * 1024.0));
+            tile_logged = 1;
+        }
+        for (m0 = 0; m0 < m; m0 += (use_tiles ? tile : m)) {
+            size_t mh = use_tiles ? tile : m;
+            size_t mh_pad;
+            const int8_t *x_row;
+            float *y_row;
+            const float *act_row;
+            if (m0 + mh > m)
+                mh = m - m0;
+            mh_pad = (mh + 15u) & ~(size_t)15u;
+            if (m0 + mh_pad > m_gemm)
+                mh_pad = m_gemm - m0;
+            x_row = d_x + m0 * k;
+            if (epi && epi->swiglu)
+                y_row = d_y + m0 * (n / 2u);
+            else
+                y_row = d_y + m0 * n;
+            act_row = per_tensor_scale ? d_act : (d_act + m0);
+            gemm_ok = 0;
+            if (h3_cuda_lt_gemm_i8_i32(cuda, d_w, x_row, d_acc, mh_pad, n, k,
+                                       gemm_err, sizeof(gemm_err))) {
+                gemm_ok = 1;
+                gemm_backend = "cublasLt";
+            } else if (h3_cuda_ex_gemm_i8_i32(cuda, d_w, x_row, d_acc, mh_pad, n,
+                                              k, gemm_err, sizeof(gemm_err))) {
+                gemm_ok = 1;
+                gemm_backend = "cublasGemmEx";
+            } else {
+                h3_cuda_kernel_gemm_i8_i32(cuda, x_row, d_w, d_acc, mh_pad, n,
+                                           k);
+                status = cudaGetLastError();
+                if (status != cudaSuccess) {
+                    h3_cuda_set_error_cuda(error, error_size, "INT8 GEMM kernel",
+                                           status);
+                    goto cleanup;
+                }
+                gemm_ok = 1;
+                gemm_backend = "cuda_kernel";
+            }
+            if (!gemm_ok) {
+                h3_cuda_set_error(error, error_size,
+                                  gemm_err[0] ? gemm_err : "INT8 GEMM failed");
+                goto cleanup;
+            }
+            if (epi && epi->lora_ready && !waited_lora) {
+                status = cudaStreamWaitEvent(h3_cuda_op_st(cuda),
+                                             (cudaEvent_t)epi->lora_ready, 0);
+                if (status != cudaSuccess) {
+                    h3_cuda_set_error_cuda(error, error_size,
+                                           "wait lora_ready", status);
+                    goto cleanup;
+                }
+                waited_lora = 1;
+            }
+            {
+                unsigned threads = 256;
+                int use_swiglu = epi && epi->swiglu;
+                int use_gate = epi && epi->gate;
+                int vec4 = !use_swiglu && !use_gate && ((n & 3u) == 0) &&
+                           ((((uintptr_t)d_acc) & 15u) == 0) &&
+                           ((((uintptr_t)y_row) & 15u) == 0) &&
+                           ((((uintptr_t)d_sc) & 15u) == 0);
+                if (rq_mode) {
+                    size_t rows0 = (m0 == 0) ? epi->requant_rows : mh;
+                    unsigned gx = rows0 > 65535u ? 65535u : (unsigned)rows0;
+                    unsigned gy = (unsigned)((rows0 + gx - 1u) / gx);
+                    dim3 rq_grid(gx, gy, 1);
+                    const float *lora_row =
+                        (epi && epi->d_lora) ? (epi->d_lora + m0 * n) : NULL;
+                    if (rq_mode == 1) {
+                        size_t width = n / 2u;
+                        size_t smem = (size_t)threads * sizeof(float);
+                        h3_cuda_dequant_swiglu_requant_kernel<<<
+                            rq_grid, threads, smem, h3_cuda_op_st(cuda)>>>(
+                            d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                            lora_row, y_row, mh, width, epi->d_rq_x + m0 * width,
+                            epi->d_rq_act + m0);
+                    } else if (rq_mode == 2) {
+                        size_t smem = (size_t)threads * sizeof(float);
+                        h3_cuda_dequant_gate_requant_res_kernel<<<
+                            rq_grid, threads, smem, h3_cuda_op_st(cuda)>>>(
+                            d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                            epi->d_residual + m0 * n, epi->d_modulation,
+                            epi->d_row_map, lora_row, y_row, mh, n, m0,
+                            epi->slots, epi->gate_slot, epi->d_rq_x + m0 * n,
+                            epi->d_rq_act + m0);
+                    } else {
+                        size_t ngroups = n / (size_t)epi->requant_gs;
+                        size_t smem = ngroups * sizeof(float);
+                        h3_cuda_dequant_gate_requant_pre_kernel<<<
+                            rq_grid, threads, smem, h3_cuda_op_st(cuda)>>>(
+                            d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                            epi->d_residual + m0 * n, epi->d_modulation,
+                            epi->d_row_map, lora_row, y_row, mh, n, m0,
+                            epi->slots, epi->gate_slot, epi->requant_gs,
+                            epi->d_rq_x + m0 * n, epi->d_rq_act + m0 * ngroups,
+                            epi->d_rq_pre + m0);
+                    }
+                } else if (use_swiglu) {
+                    size_t width = n / 2u;
+                    const float *lora_row =
+                        (epi && epi->d_lora) ? (epi->d_lora + m0 * n) : NULL;
+                    dim3 dq_grid(
+                        (unsigned)((width + (size_t)threads - 1) /
+                                   (size_t)threads),
+                        (unsigned)mh, 1);
+                    h3_cuda_dequant_i32_swiglu_kernel<<<dq_grid, threads, 0,
+                                                        h3_cuda_op_st(cuda)>>>(
+                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                        lora_row, y_row, mh, width);
+                } else if (use_gate) {
+                    const float *lora_row =
+                        (epi && epi->d_lora) ? (epi->d_lora + m0 * n) : NULL;
+                    dim3 dq_grid(
+                        (unsigned)((n + (size_t)threads - 1) / (size_t)threads),
+                        (unsigned)mh, 1);
+                    h3_cuda_dequant_i32_gate_kernel<<<dq_grid, threads, 0,
+                                                      h3_cuda_op_st(cuda)>>>(
+                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                        epi->d_residual + m0 * n, epi->d_modulation,
+                        epi->d_row_map, lora_row, y_row, mh, n, m0, epi->slots,
+                        epi->gate_slot);
+                } else if (vec4) {
+                    size_t n4 = n >> 2;
+                    dim3 dq_grid(
+                        (unsigned)((n4 + (size_t)threads - 1) / (size_t)threads),
+                        (unsigned)mh, 1);
+                    h3_cuda_dequant_i32_vec4_kernel<<<dq_grid, threads, 0,
+                                                      h3_cuda_op_st(cuda)>>>(
+                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc, y_row,
+                        mh, n);
+                } else {
+                    dim3 dq_grid(
+                        (unsigned)((n + (size_t)threads - 1) / (size_t)threads),
+                        (unsigned)mh, 1);
+                    h3_cuda_dequant_i32_kernel<<<dq_grid, threads, 0,
+                                                 h3_cuda_op_st(cuda)>>>(
+                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc, y_row,
+                        mh, n);
+                }
+                status = cudaGetLastError();
+                if (status != cudaSuccess) {
+                    h3_cuda_set_error_cuda(error, error_size, "dequant kernel",
+                                           status);
+                    goto cleanup;
+                }
+            }
+            if (!use_tiles)
+                break;
         }
     }
 
@@ -3094,17 +4908,30 @@ cleanup:
     return ok;
 }
 
+static int dit_act_f16_wanted(void) {
+    static int inited, want;
+    if (!inited) {
+        const char *e = getenv("H3_DIT_ACT_F16");
+        inited = 1;
+        want = !(e && e[0] == '0' && e[1] == '\0');
+        fprintf(stderr, "dit_gemm_path: %s\n",
+                want ? "act_f16" : "f32_convrot");
+    }
+    return want;
+}
+
 /* Device-resident ConvRot+quant+INT8 GEMM. d_x / d_y already on GPU.
  * ConvRot = per-group x @ H via cuBLAS (TC-friendly) instead of O(gs^2)
  * naive kernel; temporary rot/i8/scales from act scratch. */
-int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
     h3_cuda *cuda, const h3_cuda_w4a8_weight *weight, const float *d_x_f32,
     int convrot_groupsize, size_t m, float *d_y_f32, double *prep_ms,
-    double *gemm_ms, char *backend_out, size_t backend_out_size, char *error,
-    size_t error_size) {
+    double *gemm_ms, char *backend_out, size_t backend_out_size,
+    const h3_cuda_dit_gemm_epi *epi, char *error, size_t error_size) {
     float *d_rot = NULL;
     int8_t *d_xi8 = NULL;
     float *d_act = NULL;
+    float *d_pre = NULL;
     cudaError_t status;
     cudaEvent_t ev0 = NULL, ev1 = NULL;
     float prep_elapsed = 0.0f;
@@ -3118,7 +4945,8 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
     if (gemm_ms) *gemm_ms = 0.0;
     if (backend_out && backend_out_size) backend_out[0] = '\0';
     if (!cuda || !weight || !weight->d_w_i8 || !weight->d_s_channel ||
-        !d_x_f32 || !d_y_f32 || m == 0 || convrot_groupsize < 4) {
+        !d_x_f32 || !d_y_f32 || m == 0 ||
+        (convrot_groupsize != 0 && convrot_groupsize < 4)) {
         h3_cuda_set_error(error, error_size, "invalid w_act_dev gemm args");
         return 0;
     }
@@ -3130,11 +4958,12 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
     n = weight->n;
     k = weight->k;
     gs = convrot_groupsize;
-    if (k % (size_t)gs != 0) {
+    if (gs > 0 && k % (size_t)gs != 0) {
         h3_cuda_set_error(error, error_size, "K not divisible by convrot_gs");
         return 0;
     }
-    if (!h3_cuda_ensure_hadamard(cuda, gs, error, error_size)) return 0;
+    if (gs > 0 && !h3_cuda_ensure_hadamard(cuda, gs, error, error_size))
+        return 0;
 
     quiet = !h3_cuda_want_events(cuda);
     /* Quiet used to skip SetDevice (U=1 already on the handle's GPU).
@@ -3150,14 +4979,71 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
                 m_pad);
         m_pad_logged = 1;
     }
-    tmp_bytes = m * k * sizeof(float) + m_pad * k + m_pad * sizeof(float);
+    /* gs==0 also keeps an aligned float copy of X. NVFP4 quantizes AdaLN
+     * `d_a` which can be only 8-byte aligned (odd seq + map pad). Gold
+     * ConvRot already writes an aligned `d_rot` in this scratch. */
+    int use_f16 = (gs > 0) && dit_act_f16_wanted();
+    if (epi && epi->requant_mode && use_f16) {
+        /* Fused requant replaces the whole act-prep region: the next GEMM
+         * consumes d_rq_* directly (dev_pre_q), so skip rot/i8 scratch. */
+        size_t i8_bytes = m_pad * k;
+        size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
+        size_t pre_off;
+        size_t gs_eff;
+        size_t ngroups;
+        if (epi->requant_mode == 3 && epi->requant_gs > 0)
+            gs_eff = (size_t)epi->requant_gs;
+        else
+            gs_eff = k > 0 ? k : 1;
+        ngroups = (gs_eff > 0 && k % gs_eff == 0) ? (k / gs_eff) : 1;
+        pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
+                  ~(size_t)15u;
+        tmp_bytes = pre_off + m_pad * sizeof(float);
+    } else if (use_f16) {
+        size_t rot_bytes = m * k * sizeof(__half) * 2u;
+        size_t i8_bytes = m_pad * k;
+        size_t act_off = (rot_bytes + i8_bytes + 15u) & ~(size_t)15u;
+        size_t pre_off = (act_off + m_pad * sizeof(float) + 15u) & ~(size_t)15u;
+        tmp_bytes = pre_off + m_pad * sizeof(float);
+    } else {
+        tmp_bytes = m * k * sizeof(float) + m_pad * k + m_pad * sizeof(float);
+    }
     if (!h3_cuda_ensure_act_scratch(cuda, tmp_bytes, error, error_size))
         return 0;
     {
         char *base = (char *)cuda->d_act_scratch;
-        d_rot = (float *)base;
-        d_xi8 = (int8_t *)(d_rot + m * k);
-        d_act = (float *)(d_xi8 + m_pad * k);
+        if (epi && epi->requant_mode && use_f16) {
+            size_t i8_bytes = m_pad * k;
+            size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
+            size_t pre_off;
+            size_t gs_eff;
+            size_t ngroups;
+            if (epi->requant_mode == 3 && epi->requant_gs > 0)
+                gs_eff = (size_t)epi->requant_gs;
+            else
+                gs_eff = k > 0 ? k : 1;
+            ngroups = (gs_eff > 0 && k % gs_eff == 0) ? (k / gs_eff) : 1;
+            pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
+                      ~(size_t)15u;
+            d_rot = NULL;
+            d_xi8 = (int8_t *)base;
+            d_act = (float *)(base + act_off);
+            d_pre = (float *)(base + pre_off);
+        } else if (use_f16) {
+            size_t rot_bytes = m * k * sizeof(__half) * 2u;
+            size_t i8_bytes = m_pad * k;
+            size_t act_off = (rot_bytes + i8_bytes + 15u) & ~(size_t)15u;
+            size_t pre_off = (act_off + m_pad * sizeof(float) + 15u) &
+                             ~(size_t)15u;
+            d_rot = NULL;
+            d_xi8 = (int8_t *)(base + rot_bytes);
+            d_act = (float *)(base + act_off);
+            d_pre = (float *)(base + pre_off);
+        } else {
+            d_rot = (float *)base;
+            d_xi8 = (int8_t *)(d_rot + m * k);
+            d_act = (float *)(d_xi8 + m_pad * k);
+        }
     }
 
     if (!quiet) {
@@ -3181,9 +5067,74 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
         }
     }
 
+    /* gs==0: NVFP4 requant path — no ConvRot. Copy X into aligned scratch
+     * then quantize (float4-safe). Gold INT8 keeps gs>=4 (Hadamard). */
+    if (gs <= 0) {
+        unsigned threads = 256;
+        size_t smem = (size_t)threads * sizeof(float);
+        unsigned qrows = (unsigned)(m_pad > m ? m_pad : m);
+        status = cudaMemcpyAsync(d_rot, d_x_f32, m * k * sizeof(float),
+                                 cudaMemcpyDeviceToDevice, h3_cuda_op_st(cuda));
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "nvfp4 act align copy",
+                                   status);
+            goto cleanup;
+        }
+        h3_cuda_quantize_act_per_row_kernel<<<qrows, threads, smem,
+                                              h3_cuda_op_st(cuda)>>>(
+            d_rot, d_xi8, d_act, m, k);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "quant kernel", status);
+            goto cleanup;
+        }
+        n_groups = 0;
+        goto quant_done;
+    }
     /* Per-group ConvRot via strided-batched Sgemm: one launch for all groups.
      * Y[:, g*gs:(g+1)*gs] = X[:, g*gs:(g+1)*gs] @ H  (H shared, strideA=0). */
     n_groups = k / (size_t)gs;
+    if (use_f16) {
+        char *base = (char *)cuda->d_act_scratch;
+        void *d_xh = base;
+        void *d_rot_h = base + m * k * sizeof(__half);
+        unsigned threads = 256;
+        size_t smem = (size_t)threads * sizeof(float);
+        unsigned qrows = (unsigned)(m_pad > m ? m_pad : m);
+        if (!d_pre) {
+            h3_cuda_set_error(error, error_size, "act f16 prescale scratch");
+            goto cleanup;
+        }
+        static int prescale_logged;
+        if (!prescale_logged) {
+            fprintf(stderr, "dit_gemm_path: act_f16 prescale (AdaLN range)\n");
+            prescale_logged = 1;
+        }
+        h3_cuda_f32_to_f16_row_prescale_kernel<<<(unsigned)m, threads, smem,
+                                                 h3_cuda_op_st(cuda)>>>(
+            d_x_f32, (__half *)d_xh, d_pre, m, k, gs);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "act f16 prescale",
+                                   status);
+            goto cleanup;
+        }
+        if (!h3_cuda_convrot_act_f16_dd(cuda, d_xh, m, k, gs, d_rot_h, error,
+                                        error_size))
+            goto cleanup;
+        h3_cuda_quantize_act_per_row_f16_kernel<<<qrows, threads, smem,
+                                                  h3_cuda_op_st(cuda)>>>(
+            (const __half *)d_rot_h, d_xi8, d_act, d_pre, m, k);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "quant f16 kernel",
+                                   status);
+            goto cleanup;
+        }
+        goto quant_done;
+    }
+    /* Per-group ConvRot via strided-batched Sgemm: one launch for all groups.
+     * Y[:, g*gs:(g+1)*gs] = X[:, g*gs:(g+1)*gs] @ H  (H shared, strideA=0). */
     {
         const float alpha = 1.0f, beta = 0.0f;
         cublasStatus_t st = cublasSgemmStridedBatched(
@@ -3220,6 +5171,7 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
         }
     }
 
+quant_done:
     if (ev0 && ev1) {
         status = cudaEventRecord(ev1, 0);
         if (status != cudaSuccess) {
@@ -3242,10 +5194,17 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
         if (prep_ms) *prep_ms = (double)prep_elapsed;
     }
 
+    if (epi && epi->requant_mode && use_f16) {
+        h3_cuda_dit_gemm_epi *epi_mut = (h3_cuda_dit_gemm_epi *)epi;
+        epi_mut->d_rq_x = d_xi8;
+        epi_mut->d_rq_act = d_act;
+        epi_mut->d_rq_pre = d_pre;
+        epi_mut->requant_rows = m_pad;
+    }
     if (!h3_cuda_gemm_i8_dequant_f32_dev_dx(
             cuda, d_xi8, weight->d_w_i8, d_act, 0, weight->d_s_channel, m, n, k,
             d_y_f32, m_pad, gemm_ms, backend_out, backend_out_size, error,
-            error_size))
+            error_size, epi))
         goto cleanup;
     ok = 1;
     if (h3_sol_profile_on()) {
@@ -3260,6 +5219,998 @@ cleanup:
     if (ev0) cudaEventDestroy(ev0);
     if (ev1) cudaEventDestroy(ev1);
     return ok;
+}
+
+/* E2 fused pair (H3_DIT_EPI_FUSE=1): GEMM B with a pre-quantized act input
+ * (int8 + scale produced by GEMM A's fused requant) and an optional fused
+ * requant on B's own epilogue. No ConvRot, no act quant kernel — prep is a
+ * no-op. rq_in layout must match rq_mode: mode 1/2 → per-row scale
+ * [m_pad]; mode 3 → per-group scale [m_pad, k/gs].
+ * NOTE: mode 3 changes quantization semantics vs the f32 ConvRot+per-row
+ * baseline (per-group absmax prescale, f16-prescale math chain). Bit-exact
+ * vs baseline only for modes 1/2. */
+int h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
+    h3_cuda *cuda, const h3_cuda_w4a8_weight *weight, const int8_t *d_x_i8,
+    const float *d_act_in, size_t m, float *d_y_f32, double *prep_ms,
+    double *gemm_ms, char *backend_out, size_t backend_out_size,
+    const h3_cuda_dit_gemm_epi *epi, char *error, size_t error_size) {
+    size_t n, k, m_pad;
+    int8_t *d_rq_x = NULL;
+    float *d_rq_act = NULL;
+    h3_cuda_dit_gemm_epi epi_local;
+    if (prep_ms) *prep_ms = 0.0;
+    if (gemm_ms) *gemm_ms = 0.0;
+    if (backend_out && backend_out_size) backend_out[0] = '\0';
+    if (!cuda || !weight || !weight->d_w_i8 || !weight->d_s_channel ||
+        !d_x_i8 || !d_act_in || !d_y_f32 || m == 0) {
+        h3_cuda_set_error(error, error_size, "invalid pre_q gemm args");
+        return 0;
+    }
+    if (weight->cuda && weight->cuda != cuda) {
+        h3_cuda_set_error(error, error_size, "weight cuda handle mismatch");
+        return 0;
+    }
+    if (!h3_cuda_w4a8_weight_wait_ready(weight, error, error_size)) return 0;
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    n = weight->n;
+    k = weight->k;
+    m_pad = (m + 15u) & ~(size_t)15u;
+    /* E2 fused requant: _dev_dx writes this GEMM's act source quantized into
+     * epi->d_rq_* for the NEXT GEMM, but unlike _w_act_dev_epi there is no
+     * act-prep stage here to own that scratch. Allocate it in act_scratch and
+     * fill d_rq_* / requant_rows before dispatch, mirroring 4655-4667/4863. */
+    if (epi && epi->requant_mode) {
+        size_t out_width = (epi->requant_mode == 1) ? (n / 2u) : n;
+        size_t i8_bytes = m_pad * out_width;
+        size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
+        size_t tmp_bytes = act_off + m_pad * sizeof(float);
+        char *base;
+        if (!h3_cuda_ensure_rq_scratch(cuda, tmp_bytes, error, error_size))
+            return 0;
+        base = (char *)cuda->d_rq_scratch;
+        d_rq_x = (int8_t *)base;
+        d_rq_act = (float *)(base + act_off);
+        epi_local = *epi;
+        epi_local.d_rq_x = d_rq_x;
+        epi_local.d_rq_act = d_rq_act;
+        epi_local.requant_rows = m_pad;
+        if (epi_local.requant_gs <= 0)
+            epi_local.requant_gs = (int)out_width;
+        epi = &epi_local;
+    }
+    if (!h3_cuda_gemm_i8_dequant_f32_dev_dx(
+            cuda, d_x_i8, weight->d_w_i8, d_act_in, 0, weight->d_s_channel, m,
+            n, k, d_y_f32, m_pad, gemm_ms, backend_out, backend_out_size,
+            error, error_size, epi))
+        return 0;
+    /* Surface the freshly-quantized act to the caller for the next GEMM. */
+    if (epi && epi->requant_mode) {
+        h3_cuda_dit_gemm_epi *epi_mut = (h3_cuda_dit_gemm_epi *)epi;
+        epi_mut->d_rq_x = d_rq_x;
+        epi_mut->d_rq_act = d_rq_act;
+        epi_mut->requant_rows = m_pad;
+    }
+    if (h3_sol_profile_on()) {
+        double g = 0.0;
+        if (gemm_ms) g = *gemm_ms;
+        h3_sp_add_n(&g_sp_step.gemm, &g_sp_tot.gemm, &g_sp_step.n_gemm,
+                    &g_sp_tot.n_gemm, g);
+    }
+    return 1;
+}
+
+int h3_cuda_gemm_i8_dequant_f32_w_act_dev(
+    h3_cuda *cuda, const h3_cuda_w4a8_weight *weight, const float *d_x_f32,
+    int convrot_groupsize, size_t m, float *d_y_f32, double *prep_ms,
+    double *gemm_ms, char *backend_out, size_t backend_out_size, char *error,
+    size_t error_size) {
+    return h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+        cuda, weight, d_x_f32, convrot_groupsize, m, d_y_f32, prep_ms, gemm_ms,
+        backend_out, backend_out_size, NULL, error, error_size);
+}
+
+/* -------------------------------------------------------------------------
+ * NVFP4 W4A4 block-scaled GEMM backend (Phase 1).
+ * Mirrors the Phase 0 probe (bench/nvfp4_phase0/bench_cublaslt_fp4.cu) which
+ * measured a uniform ~1.73x over INT8 on all 8 production DiT shapes with
+ * heuristics returning 6 native algorithms (no dequant->BF16 fallback).
+ *
+ * Mapping (same TN form as the INT8 path):
+ *   cublasLt A = weights [n,k] row-major packed FP4 -> layout [k,n] col, OP_T
+ *   cublasLt B = acts    [m,k] row-major packed FP4 -> layout [k,m] col, OP_N
+ *   cublasLt C = out     [m,n] row-major BF16       -> layout [n,m] col
+ * A/B SF = UE4M3, per-16-element micro-block, 128x4 swizzled SF layout.
+ * Returns 0 with error set if cublasLt returns no native algo (NO-GO signal).
+ * ----------------------------------------------------------------------- */
+static int h3_cuda_lt_gemm_fp4_bf16(h3_cuda *cuda, const uint8_t *d_w_fp4,
+                                    const uint8_t *d_sf_w, const uint8_t *d_x_fp4,
+                                    const uint8_t *d_sf_x, void *d_y_bf16,
+                                    size_t m, size_t n, size_t k, char *error,
+                                    size_t error_size) {
+    void *workspace = NULL;
+    size_t workspace_bytes = h3_dit_int8_lt_workspace_bytes();
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    cublasStatus_t st;
+    char ws_err[128];
+    int slot = -1;
+    int i;
+    int returned = 0;
+
+    if (!h3_cuda_ensure_lt_workspace(cuda, workspace_bytes, ws_err,
+                                     sizeof(ws_err))) {
+        h3_cuda_set_error(error, error_size, ws_err[0] ? ws_err : "lt workspace");
+        return 0;
+    }
+    workspace = cuda->d_lt_workspace;
+    /* Persistent device [alpha,beta] for DEVICE pointer mode. */
+    if (!cuda->d_fp4_ab) {
+        float h_ab[2] = {1.0f, 0.0f};
+        if (cudaMalloc(&cuda->d_fp4_ab, 2 * sizeof(float)) != cudaSuccess ||
+            cudaMemcpy(cuda->d_fp4_ab, h_ab, sizeof(h_ab),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            h3_cuda_set_error(error, error_size, "fp4 alpha/beta alloc");
+            return 0;
+        }
+    }
+
+    for (i = 0; i < cuda->lt_fp4_n; i++) {
+        if (cuda->lt_fp4[i].m == m && cuda->lt_fp4[i].n == n &&
+            cuda->lt_fp4[i].k == k) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 0 && cuda->lt_fp4[slot].state < 0) {
+        h3_cuda_set_error(error, error_size, "cublasLt FP4 cached miss");
+        return 0;
+    }
+    if (slot < 0) {
+        cublasLtMatmulMatrixScale_t vec16 = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        cublasLtMatmulMatrixScale_t sc32f = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        cublasLtPointerMode_t pmode = CUBLASLT_POINTER_MODE_DEVICE;
+        if (cuda->lt_fp4_n >= (int)(sizeof(cuda->lt_fp4) / sizeof(cuda->lt_fp4[0]))) {
+            h3_cuda_set_error(error, error_size, "cublasLt FP4 cache full");
+            return 0;
+        }
+        slot = cuda->lt_fp4_n;
+        memset(&cuda->lt_fp4[slot], 0, sizeof(cuda->lt_fp4[slot]));
+        cuda->lt_fp4[slot].m = m;
+        cuda->lt_fp4[slot].n = n;
+        cuda->lt_fp4[slot].k = k;
+        st = cublasLtMatmulDescCreate(&cuda->lt_fp4[slot].desc,
+                                      CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 descCreate", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_TRANSA,
+                                            &transa, sizeof(transa));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 TRANSA", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_TRANSB,
+                                            &transb, sizeof(transb));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 TRANSB", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                            &vec16, sizeof(vec16));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 A_SCALE_MODE", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                            &vec16, sizeof(vec16));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 B_SCALE_MODE", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_C_SCALE_MODE,
+                                            &sc32f, sizeof(sc32f));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 C_SCALE_MODE", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_D_SCALE_MODE,
+                                            &sc32f, sizeof(sc32f));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 D_SCALE_MODE", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_POINTER_MODE,
+                                            &pmode, sizeof(pmode));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 POINTER_MODE", st);
+            goto fail_slot;
+        }
+        /* cuBLASLt FP4 requires the SF pointers to be present BEFORE the
+         * heuristic query (diag_m_limit: with scale pointers set, returned=6;
+         * without them, returned=0 / st=7 regardless of M). They are per-call
+         * and re-set below before matmul; setting them here only seeds the
+         * heuristic. */
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                            &d_sf_w, sizeof(d_sf_w));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 A_SCALE_PTR seed", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                            &d_sf_x, sizeof(d_sf_x));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 B_SCALE_PTR seed", st);
+            goto fail_slot;
+        }
+        /* A = weights: logical [n,k] row-major FP4 -> col-major [k,n], ld=k */
+        st = cublasLtMatrixLayoutCreate(&cuda->lt_fp4[slot].a, CUDA_R_4F_E2M1,
+                                        (uint64_t)k, (uint64_t)n, (int64_t)k);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 layout A", st);
+            goto fail_slot;
+        }
+        /* B = acts: logical [m,k] row-major FP4 -> col-major [k,m], ld=k */
+        st = cublasLtMatrixLayoutCreate(&cuda->lt_fp4[slot].b, CUDA_R_4F_E2M1,
+                                        (uint64_t)k, (uint64_t)m, (int64_t)k);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 layout B", st);
+            goto fail_slot;
+        }
+        /* C = out BF16: logical [m,n] row-major -> col-major [n,m], ld=n */
+        st = cublasLtMatrixLayoutCreate(&cuda->lt_fp4[slot].c, CUDA_R_16BF,
+                                        (uint64_t)n, (uint64_t)m, (int64_t)n);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 layout C", st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulPreferenceCreate(&cuda->lt_fp4[slot].pref);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 preferenceCreate",
+                                     st);
+            goto fail_slot;
+        }
+        st = cublasLtMatmulPreferenceSetAttribute(
+            cuda->lt_fp4[slot].pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_bytes, sizeof(workspace_bytes));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 workspace pref",
+                                     st);
+            goto fail_slot;
+        }
+        {
+            cublasLtMatmulHeuristicResult_t heurs[8];
+            int hi, pick = -1;
+            st = cublasLtMatmulAlgoGetHeuristic(
+                cuda->cublasLt, cuda->lt_fp4[slot].desc, cuda->lt_fp4[slot].a,
+                cuda->lt_fp4[slot].b, cuda->lt_fp4[slot].c, cuda->lt_fp4[slot].c,
+                cuda->lt_fp4[slot].pref, 8, heurs, &returned);
+            if (st != CUBLAS_STATUS_SUCCESS || returned <= 0) {
+                fprintf(stderr,
+                        "[fp4] heuristic NO-GO m=%zu n=%zu k=%zu st=%d returned=%d ws=%zu\n",
+                        m, n, k, (int)st, returned, workspace_bytes);
+                h3_cuda_set_error(error, error_size,
+                                  "cublasLt FP4: no native algo (NO-GO)");
+                goto fail_slot;
+            }
+            for (hi = 0; hi < returned; hi++) {
+                if (heurs[hi].workspaceSize <= workspace_bytes) {
+                    pick = hi;
+                    break;
+                }
+            }
+            if (pick < 0) {
+                h3_cuda_set_error(error, error_size,
+                                  "cublasLt FP4 algo needs more workspace");
+                goto fail_slot;
+            }
+            cuda->lt_fp4[slot].heur = heurs[pick];
+            cuda->lt_fp4[slot].state = 1;
+            cuda->lt_fp4_n++;
+        }
+    }
+    if (cuda->lt_fp4[slot].state != 1) {
+        h3_cuda_set_error(error, error_size, "cublasLt FP4 slot not ready");
+        return 0;
+    }
+    /* SF pointers are per-call (weights/acts change), set them now. */
+    st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                        &d_sf_w, sizeof(d_sf_w));
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        h3_cuda_set_error_cublas(error, error_size, "fp4 A_SCALE_POINTER", st);
+        return 0;
+    }
+    st = cublasLtMatmulDescSetAttribute(cuda->lt_fp4[slot].desc,
+                                        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                        &d_sf_x, sizeof(d_sf_x));
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        h3_cuda_set_error_cublas(error, error_size, "fp4 B_SCALE_POINTER", st);
+        return 0;
+    }
+    {
+        const float *alpha = (const float *)cuda->d_fp4_ab;
+        const float *beta = (const float *)cuda->d_fp4_ab + 1;
+        st = cublasLtMatmul(cuda->cublasLt, cuda->lt_fp4[slot].desc, alpha,
+                            d_w_fp4, cuda->lt_fp4[slot].a, d_x_fp4,
+                            cuda->lt_fp4[slot].b, beta, d_y_bf16,
+                            cuda->lt_fp4[slot].c, d_y_bf16, cuda->lt_fp4[slot].c,
+                            &cuda->lt_fp4[slot].heur.algo, workspace,
+                            cuda->lt_fp4[slot].heur.workspaceSize,
+                            h3_cuda_op_st(cuda));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            h3_cuda_set_error_cublas(error, error_size, "fp4 matmul", st);
+            return 0;
+        }
+    }
+    return 1;
+
+fail_slot:
+    cuda->lt_fp4[slot].state = -1;
+    cuda->lt_fp4_n++;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * NVFP4 P1.4 resident weight lifecycle (mirrors the INT8 w4a8 weight
+ * conventions: side-stream H2D, ready event waited by the first GEMM,
+ * host staging owned until ready).
+ * ----------------------------------------------------------------------- */
+
+int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
+                                const uint8_t *sf_swizzled_host, float scale2,
+                                size_t n, size_t k,
+                                h3_cuda_nvfp4_weight **out, double *h2d_ms,
+                                char *error, size_t error_size) {
+    h3_cuda_nvfp4_weight *weight = NULL;
+    cudaError_t status;
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    float ms = 0.0f;
+    size_t w_bytes, sf_bytes;
+    int ok = 0;
+
+    if (out) *out = NULL;
+    if (h2d_ms) *h2d_ms = 0.0;
+    if (!cuda || !packed_host || !sf_swizzled_host || !out || n == 0 ||
+        k == 0 || (k & 15u) != 0) {
+        h3_cuda_set_error(error, error_size,
+                          "invalid h3_cuda_nvfp4_weight_create args (K%16!=0)");
+        return 0;
+    }
+    w_bytes = n * (k / 2);
+    sf_bytes = ((n + 127u) / 128u) * (((k / 16u) + 3u) / 4u) * 512u;
+    status = cudaSetDevice(cuda->device_index);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaSetDevice", status);
+        return 0;
+    }
+    weight = (h3_cuda_nvfp4_weight *)calloc(1, sizeof(*weight));
+    if (!weight) {
+        h3_cuda_set_error(error, error_size, "out of memory");
+        return 0;
+    }
+    weight->cuda = cuda;
+    weight->n = n;
+    weight->k = k;
+    weight->scale2 = (scale2 > 0.0f && isfinite(scale2)) ? scale2 : 1.0f;
+    status = cudaMalloc((void **)&weight->d_w_fp4, w_bytes);
+    if (status != cudaSuccess) {
+        h3_cuda_sol_cute_trim_cache();
+        status = cudaMalloc((void **)&weight->d_w_fp4, w_bytes);
+    }
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaMalloc w_fp4", status);
+        goto cleanup;
+    }
+    status = cudaMalloc((void **)&weight->d_sf_w, sf_bytes);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaMalloc sf_w", status);
+        goto cleanup;
+    }
+    {
+        const int want_time = (h2d_ms != NULL);
+        cudaStream_t st =
+            (cuda->streams_ready && cuda->streams[0]) ? cuda->streams[0]
+                                                       : (cudaStream_t)0;
+        if (want_time) {
+            status = cudaEventCreate(&ev0);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate",
+                                       status);
+                goto cleanup;
+            }
+            status = cudaEventCreate(&ev1);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate",
+                                       status);
+                goto cleanup;
+            }
+            status = cudaEventRecord(ev0, st);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
+                                       status);
+                goto cleanup;
+            }
+        }
+        status = cudaMemcpyAsync(weight->d_w_fp4, packed_host, w_bytes,
+                                 cudaMemcpyHostToDevice, st);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaMemcpyAsync w_fp4",
+                                   status);
+            goto cleanup;
+        }
+        status = cudaMemcpyAsync(weight->d_sf_w, sf_swizzled_host, sf_bytes,
+                                 cudaMemcpyHostToDevice, st);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaMemcpyAsync sf_w",
+                                   status);
+            goto cleanup;
+        }
+        if (want_time) {
+            status = cudaEventRecord(ev1, st);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
+                                       status);
+                goto cleanup;
+            }
+            status = cudaEventSynchronize(ev1);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size,
+                                       "cudaEventSynchronize", status);
+                goto cleanup;
+            }
+            status = cudaEventElapsedTime(&ms, ev0, ev1);
+            if (status == cudaSuccess && h2d_ms) *h2d_ms = (double)ms;
+        } else {
+            /* Keep host staging alive until the first GEMM's ensure_ready
+             * (pageable async H2D must not see freed host memory). */
+            weight->h_w_owned = (uint8_t *)packed_host;
+            weight->h_sf_owned = (uint8_t *)sf_swizzled_host;
+            status = cudaEventCreateWithFlags(&weight->ready_event,
+                                              cudaEventDisableTiming);
+            if (status != cudaSuccess) {
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate",
+                                       status);
+                weight->h_w_owned = NULL;
+                weight->h_sf_owned = NULL;
+                goto cleanup;
+            }
+            status = cudaEventRecord(weight->ready_event, st);
+            if (status != cudaSuccess) {
+                cudaEventDestroy(weight->ready_event);
+                weight->h_w_owned = NULL;
+                weight->h_sf_owned = NULL;
+                h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
+                                       status);
+                goto cleanup;
+            }
+            weight->ready_event_valid = 1;
+        }
+    }
+    *out = weight;
+    weight = NULL;
+    ok = 1;
+
+cleanup:
+    if (ev0) cudaEventDestroy(ev0);
+    if (ev1) cudaEventDestroy(ev1);
+    if (weight) {
+        if (weight->d_w_fp4) cudaFree(weight->d_w_fp4);
+        if (weight->d_sf_w) cudaFree(weight->d_sf_w);
+        if (weight->ready_event_valid && weight->ready_event)
+            cudaEventDestroy(weight->ready_event);
+        free(weight);
+    }
+    return ok;
+}
+
+int h3_cuda_nvfp4_weight_ensure_ready(h3_cuda_nvfp4_weight *weight,
+                                      char *error, size_t error_size) {
+    if (!weight) return 1;
+    if (!weight->ready_event_valid || !weight->ready_event) {
+        free(weight->h_w_owned);
+        free(weight->h_sf_owned);
+        weight->h_w_owned = NULL;
+        weight->h_sf_owned = NULL;
+        return 1;
+    }
+    /* Same cross-stream contract as the INT8 weight: wait on the legacy
+     * default stream AND the op stream so a Ulysses GEMM never reads
+     * weights still in flight. GPU-side wait only. */
+    if (cudaStreamWaitEvent((cudaStream_t)0, weight->ready_event, 0) !=
+        cudaSuccess) {
+        h3_cuda_set_error(error, error_size, "StreamWaitEvent fp4 weight ready");
+        return 0;
+    }
+    if (weight->cuda && weight->cuda->op_stream &&
+        cudaStreamWaitEvent(weight->cuda->op_stream, weight->ready_event, 0) !=
+            cudaSuccess) {
+        h3_cuda_set_error(error, error_size,
+                          "StreamWaitEvent fp4 weight ready (op)");
+        return 0;
+    }
+    cudaEventDestroy(weight->ready_event);
+    weight->ready_event = NULL;
+    weight->ready_event_valid = 0;
+    free(weight->h_w_owned);
+    free(weight->h_sf_owned);
+    weight->h_w_owned = NULL;
+    weight->h_sf_owned = NULL;
+    return 1;
+}
+
+void h3_cuda_nvfp4_weight_free(h3_cuda *cuda, h3_cuda_nvfp4_weight *w) {
+    (void)cuda;
+    if (!w) return;
+    if (w->ready_event_valid && w->ready_event) {
+        cudaEventSynchronize(w->ready_event);
+        cudaEventDestroy(w->ready_event);
+    }
+    free(w->h_w_owned);
+    free(w->h_sf_owned);
+    if (w->d_w_fp4) cudaFree(w->d_w_fp4);
+    if (w->d_sf_w) cudaFree(w->d_sf_w);
+    free(w);
+}
+
+const uint8_t *h3_cuda_nvfp4_weight_packed(const h3_cuda_nvfp4_weight *w) {
+    return w ? w->d_w_fp4 : NULL;
+}
+
+const uint8_t *h3_cuda_nvfp4_weight_sf(const h3_cuda_nvfp4_weight *w) {
+    return w ? w->d_sf_w : NULL;
+}
+
+float h3_cuda_nvfp4_weight_scale2(const h3_cuda_nvfp4_weight *w) {
+    return w ? w->scale2 : 0.0f;
+}
+
+size_t h3_cuda_nvfp4_weight_n(const h3_cuda_nvfp4_weight *w) {
+    return w ? w->n : 0;
+}
+
+size_t h3_cuda_nvfp4_weight_k(const h3_cuda_nvfp4_weight *w) {
+    return w ? w->k : 0;
+}
+
+/* -------------------------------------------------------------------------
+ * NVFP4 P1.5 fused FP4 GEMM + BF16 epilogue dispatch.
+ * scratch = NULL → per-call cudaMalloc; callers in the DiT hot loop pass a
+ * persistent scratch block laid out as
+ *   x_fp4 [m*k/2] | sf_x [ceil(m/128)*ceil(k/16/4)*512] | bf16 [m*n*2]
+ * ----------------------------------------------------------------------- */
+
+/* ---- H3_NVFP4_DEBUG_NAN=1 instrumentation (FP4 track only) ----
+ * One-pass NaN/Inf scan kernels with grid-stride loops, plus a sync host
+ * helper that prints the first offending index/value. Never compiled out;
+ * the host gate keeps production runs at zero cost. */
+__global__ void h3_cuda_nan_scan_f32_kernel(const float *__restrict__ x,
+                                            size_t n,
+                                            unsigned long long *__restrict__ cnt,
+                                            size_t *__restrict__ idx) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t stride = (size_t)gridDim.x * (size_t)blockDim.x;
+    for (; i < n; i += stride) {
+        float v = x[i];
+        if (!(v == v) || isinf(v)) {
+            atomicAdd(cnt, 1ull);
+            atomicCAS((unsigned long long *)idx,
+                      (unsigned long long)SIZE_MAX, (unsigned long long)i);
+        }
+    }
+}
+
+__global__ void h3_cuda_nan_scan_bf16_kernel(const __nv_bfloat16 *__restrict__ x,
+                                             size_t n,
+                                             unsigned long long *__restrict__ cnt,
+                                             size_t *__restrict__ idx) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t stride = (size_t)gridDim.x * (size_t)blockDim.x;
+    for (; i < n; i += stride) {
+        float v = __bfloat162float(x[i]);
+        if (!(v == v) || isinf(v)) {
+            atomicAdd(cnt, 1ull);
+            atomicCAS((unsigned long long *)idx,
+                      (unsigned long long)SIZE_MAX, (unsigned long long)i);
+        }
+    }
+}
+
+/* UE4M3 NaN encoding (>=0xFE) scan on an SF byte buffer; reports each hit's
+ * swizzle offset. last_tile is the index of the final 128-row tile (tiles
+ * [0,last_tile) are fully populated by all rows; tile last_tile holds the
+ * [m, m_pad) zero-filled padding rows, whose SF the quant kernel leaves
+ * stale by design). */
+__global__ void h3_cuda_nan_scan_u8_sf_kernel(const uint8_t *__restrict__ x,
+                                              size_t n,
+                                              size_t last_tile,
+                                              unsigned long long *__restrict__ cnt,
+                                              unsigned long long *__restrict__ cnt_last,
+                                              size_t *__restrict__ idx,
+                                              size_t *__restrict__ idx_last) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t stride = (size_t)gridDim.x * (size_t)blockDim.x;
+    for (; i < n; i += stride) {
+        if (x[i] >= 0xFEu) {
+            int in_last = (i / 512u) == last_tile;
+            atomicAdd(in_last ? cnt_last : cnt, 1ull);
+            atomicCAS((unsigned long long *)(in_last ? idx_last : idx),
+                      (unsigned long long)SIZE_MAX, (unsigned long long)i);
+        }
+    }
+}
+
+static int h3_nvfp4_debug_nan(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("H3_NVFP4_DEBUG_NAN");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Synchronous scan + report. kinds: "f32" / "bf16" / "sf" (UE4M3 bytes). */
+static void h3_nvfp4_debug_scan(h3_cuda *cuda, const void *ptr, size_t n,
+                                const char *kind, const char *tag,
+                                const char *stage) {
+    unsigned long long h_cnt = 0ull;
+    size_t h_idx = SIZE_MAX;
+    unsigned long long *d_cnt = NULL;
+    size_t *d_idx = NULL;
+    cudaStream_t st = h3_cuda_op_st(cuda);
+    unsigned nblk = (unsigned)((n + 255u) / 256u);
+    float fv = 0.0f;
+    int have_val = 0;
+    if (!ptr || n == 0) return;
+    if (nblk > 1024u) nblk = 1024u;
+    if (cudaMalloc(&d_cnt, sizeof(*d_cnt)) != cudaSuccess ||
+        cudaMalloc(&d_idx, sizeof(*d_idx)) != cudaSuccess) {
+        if (d_cnt) cudaFree(d_cnt);
+        if (d_idx) cudaFree(d_idx);
+        return;
+    }
+    cudaMemcpyAsync(d_cnt, &h_cnt, sizeof(h_cnt), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_idx, &h_idx, sizeof(h_idx), cudaMemcpyHostToDevice, st);
+    if (kind[0] == 'f')
+        h3_cuda_nan_scan_f32_kernel<<<nblk, 256, 0, st>>>(
+            (const float *)ptr, n, d_cnt, d_idx);
+    else if (kind[0] == 'b')
+        h3_cuda_nan_scan_bf16_kernel<<<nblk, 256, 0, st>>>(
+            (const __nv_bfloat16 *)ptr, n, d_cnt, d_idx);
+    cudaMemcpyAsync(&h_cnt, d_cnt, sizeof(h_cnt), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(&h_idx, d_idx, sizeof(h_idx), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (h_cnt > 0 && h_idx != SIZE_MAX) {
+        if (kind[0] == 'f') {
+            cudaMemcpy(&fv, (const float *)ptr + h_idx, sizeof(fv),
+                       cudaMemcpyDeviceToHost);
+            have_val = 1;
+        } else if (kind[0] == 'b') {
+            __nv_bfloat16 bv;
+            cudaMemcpy(&bv, (const __nv_bfloat16 *)ptr + h_idx, sizeof(bv),
+                       cudaMemcpyDeviceToHost);
+            fv = __bfloat162float(bv);
+            have_val = 1;
+        }
+    }
+    if (h_cnt > 0) {
+        fprintf(stderr, "[nvfp4_dbg] %s %s: count=%llu first_idx=%zu", tag,
+                stage, h_cnt, h_idx);
+        if (have_val) fprintf(stderr, " val=%g", (double)fv);
+        fprintf(stderr, " (n=%zu)\n", n);
+        fflush(stderr);
+    }
+    cudaFree(d_cnt);
+    cudaFree(d_idx);
+}
+
+static void h3_nvfp4_debug_scan_sf(h3_cuda *cuda, const uint8_t *ptr, size_t n,
+                                   size_t last_tile, const char *tag,
+                                   const char *stage) {
+    unsigned long long h_cnt[2] = {0ull, 0ull};
+    size_t h_idx[2] = {SIZE_MAX, SIZE_MAX};
+    unsigned long long *d_cnt = NULL;
+    size_t *d_idx = NULL;
+    cudaStream_t st = h3_cuda_op_st(cuda);
+    unsigned nblk = (unsigned)((n + 255u) / 256u);
+    if (!ptr || n == 0) return;
+    if (nblk > 1024u) nblk = 1024u;
+    if (cudaMalloc(&d_cnt, sizeof(h_cnt)) != cudaSuccess ||
+        cudaMalloc(&d_idx, sizeof(h_idx)) != cudaSuccess) {
+        if (d_cnt) cudaFree(d_cnt);
+        if (d_idx) cudaFree(d_idx);
+        return;
+    }
+    cudaMemcpyAsync(d_cnt, h_cnt, sizeof(h_cnt), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_idx, h_idx, sizeof(h_idx), cudaMemcpyHostToDevice, st);
+    h3_cuda_nan_scan_u8_sf_kernel<<<nblk, 256, 0, st>>>(
+        ptr, n, last_tile, d_cnt, d_cnt + 1, d_idx, d_idx + 1);
+    cudaMemcpyAsync(h_cnt, d_cnt, sizeof(h_cnt), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(h_idx, d_idx, sizeof(h_idx), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (h_cnt[0] > 0) {
+        fprintf(stderr,
+                "[nvfp4_dbg] %s %s: count=%llu first_idx=%zu (n=%zu) -- FULL tiles\n",
+                tag, stage, h_cnt[0], h_idx[0], n);
+        fflush(stderr);
+    }
+    if (h_cnt[1] > 0) {
+        fprintf(stderr,
+                "[nvfp4_dbg] %s %s: count=%llu first_idx=%zu (n=%zu) -- last tile (padding)\n",
+                tag, stage, h_cnt[1], h_idx[1], n);
+        fflush(stderr);
+    }
+    cudaFree(d_cnt);
+    cudaFree(d_idx);
+}
+
+int h3_nvfp4_debug_nan_dev(void) { return h3_nvfp4_debug_nan(); }
+
+void h3_nvfp4_debug_scan_dev(h3_cuda *cuda, const void *ptr, size_t n,
+                             const char *kind, const char *tag,
+                             const char *stage) {
+    h3_nvfp4_debug_scan(cuda, ptr, n, kind, tag, stage);
+}
+
+static int h3_cuda_fp4_gemm_run(h3_cuda *cuda,
+                                const h3_cuda_nvfp4_weight *weight,
+                                const float *d_x, float act_scale, size_t m,
+                                int swiglu, int gate, const float *d_residual,
+                                const float *d_modulation,
+                                const uint32_t *d_row_map, size_t slots,
+                                size_t gate_slot, const float *d_lora,
+                                float *d_y_f32, uint8_t *scratch,
+                                double *prep_ms, double *gemm_ms, char *error,
+                                size_t error_size, const char *tag) {
+    uint8_t *d_x_fp4 = NULL;
+    uint8_t *d_sf_x = NULL;
+    void *d_bf16 = NULL;
+    size_t n, k, x_bytes, sf_bytes, bf16_bytes;
+    size_t sf_ncb, sf_rb;
+    size_t m_pad;
+    float acc_scale;
+    cudaError_t status;
+    int ok = 0;
+
+    if (prep_ms) *prep_ms = 0.0;
+    if (gemm_ms) *gemm_ms = 0.0;
+    if (!cuda || !weight || !d_x || !d_y_f32 || m == 0 || (swiglu && gate)) {
+        h3_cuda_set_error(error, error_size, "invalid fp4 gemm_run args");
+        return 0;
+    }
+    if (gate && (!d_residual || !d_modulation)) {
+        h3_cuda_set_error(error, error_size, "fp4 gate epi missing residual/mod");
+        return 0;
+    }
+    n = weight->n;
+    k = weight->k;
+    if ((k & 63u) != 0) {
+        h3_cuda_set_error(error, error_size, "fp4 act quant needs K%64==0");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    if (!h3_cuda_nvfp4_weight_ensure_ready((h3_cuda_nvfp4_weight *)weight,
+                                           error, error_size))
+        return 0;
+
+    /* cuBLASLt FP4 block-scaled MMA rejects misaligned M (st=7 INVALID_VALUE).
+     * SF swizzle tiles rows in 128-blocks, so pad M to a 128 multiple for the
+     * GEMM; quantize fills rows [0,m), padding rows are zeroed (nibble AND sf,
+     * so a stale sf byte can't read as UE4M3 NaN), and the epilogue writes
+     * back only rows [0,m). SF is sized to cuBLASLt's padded K-extent
+     * (ceil(ncb/32)*32 tile-cols = 2048-K-elem granularity). */
+    m_pad = (m + 127u) & ~(size_t)127u;
+    sf_ncb = (((k / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    sf_rb = m_pad / 128u;
+    x_bytes = m_pad * (k / 2u);
+    sf_bytes = sf_rb * sf_ncb * 512u;
+    bf16_bytes = m_pad * n * 2u;
+    if (scratch) {
+        d_x_fp4 = scratch;
+        d_sf_x = scratch + x_bytes;
+        d_bf16 = scratch + x_bytes + sf_bytes;
+    } else {
+        status = cudaMalloc((void **)&d_x_fp4, x_bytes);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaMalloc fp4 x",
+                                   status);
+            return 0;
+        }
+        status = cudaMalloc((void **)&d_sf_x, sf_bytes);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaMalloc fp4 sf_x",
+                                   status);
+            goto cleanup;
+        }
+        status = cudaMalloc(&d_bf16, bf16_bytes);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "cudaMalloc fp4 bf16",
+                                   status);
+            goto cleanup;
+        }
+    }
+    /* Belt-and-braces: zero the whole SF buffer before quantize. sf=0 is a
+     * valid finite scale, and cuBLASLt reads the full padded tile grid
+     * (padding rows + K-tail); any byte the quantize kernel doesn't explicitly
+     * overwrite stays 0 instead of cudaMalloc garbage (>=0xFE = UE4M3 NaN).
+     * Same stream, memset before kernel — no race; valid rows get real scales
+     * written over the zeros. */
+    cudaMemsetAsync(d_sf_x, 0, sf_bytes, h3_cuda_op_st(cuda));
+    if (!h3_cuda_quantize_act_nvfp4_dev(cuda, d_x, m, k, d_x_fp4, d_sf_x,
+                                        error, error_size))
+        goto cleanup;
+    if (h3_nvfp4_debug_nan()) {
+        h3_nvfp4_debug_scan(cuda, d_x, m * k, "f32", tag, "act_in");
+        h3_nvfp4_debug_scan_sf(cuda, d_sf_x, sf_rb * sf_ncb * 512u,
+                               sf_rb - 1u, tag, "sf_x");
+    }
+    if (m_pad > m) {
+        size_t x_tail = (m_pad - m) * (k / 2u);
+        if (x_tail)
+            cudaMemsetAsync(d_x_fp4 + m * (k / 2u), 0, x_tail,
+                            h3_cuda_op_st(cuda));
+    }
+    if (!h3_cuda_gemm_fp4_bs_dev(cuda, weight->d_w_fp4, weight->d_sf_w,
+                                 d_x_fp4, d_sf_x, m_pad, n, k, d_bf16, gemm_ms,
+                                 error, error_size))
+        goto cleanup;
+    if (h3_nvfp4_debug_nan()) {
+        h3_nvfp4_debug_scan(cuda, d_bf16, m_pad * n, "bf16", tag, "bf16_out");
+        h3_nvfp4_debug_scan_sf(cuda, weight->d_sf_w,
+                               (n / 128u) * sf_ncb * 512u,
+                               (n / 128u) - 1u, tag, "sf_w");
+    }
+
+    /* FP4 SF (per-16 micro-block) is consumed inside the MMA; only the two
+     * per-tensor second-level scales remain. act_scale is 1.0 for the
+     * current dynamic-SF-only act path. */
+    acc_scale = weight->scale2 *
+                ((act_scale > 0.0f && isfinite(act_scale)) ? act_scale : 1.0f);
+    {
+        const __nv_bfloat16 *acc = (const __nv_bfloat16 *)d_bf16;
+        if (swiglu) {
+            const size_t width = n / 2u;
+            dim3 grid((unsigned)((width + 255u) / 256u), (unsigned)m, 1);
+            h3_cuda_fp4_swiglu_bf16_kernel<<<grid, 256, 0,
+                                             h3_cuda_op_st(cuda)>>>(
+                acc, acc_scale, d_lora, d_y_f32, m, width);
+        } else if (gate) {
+            dim3 grid((unsigned)((n + 255u) / 256u), (unsigned)m, 1);
+            h3_cuda_fp4_gate_bf16_kernel<<<grid, 256, 0,
+                                           h3_cuda_op_st(cuda)>>>(
+                acc, acc_scale, d_residual, d_modulation, d_row_map, d_lora,
+                d_y_f32, m, n, 0u, slots, gate_slot);
+        } else {
+            dim3 grid((unsigned)((n + 255u) / 256u), (unsigned)m, 1);
+            h3_cuda_fp4_dequant_bf16_kernel<<<grid, 256, 0,
+                                              h3_cuda_op_st(cuda)>>>(
+                acc, acc_scale, d_y_f32, m, n);
+        }
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "fp4 bf16 epilogue",
+                                   status);
+            goto cleanup;
+        }
+        if (h3_nvfp4_debug_nan()) {
+            size_t out_n = swiglu ? n / 2u : n;
+            h3_nvfp4_debug_scan(cuda, d_y_f32, m * out_n, "f32", tag,
+                                "epi_out");
+        }
+    }
+    ok = 1;
+
+cleanup:
+    if (!scratch) {
+        if (d_x_fp4) cudaFree(d_x_fp4);
+        if (d_sf_x) cudaFree(d_sf_x);
+        if (d_bf16) cudaFree(d_bf16);
+    }
+    return ok;
+}
+
+size_t h3_cuda_nvfp4_gemm_scratch_bytes(size_t m, size_t n, size_t k) {
+    /* Must match h3_cuda_fp4_gemm_run's padded-M scratch layout. SF uses the
+     * padded K-extent (ceil(ncb/32)*32 tile-cols = 2048-K-elem granularity). */
+    size_t m_pad = (m + 127u) & ~(size_t)127u;
+    size_t sf_ncb = (((k / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    size_t sf_rb = m_pad / 128u;
+    return m_pad * (k / 2u) + sf_rb * sf_ncb * 512u + m_pad * n * 2u;
+}
+
+int h3_cuda_gemm_fp4_w_act_dev(h3_cuda *cuda,
+                               const h3_cuda_nvfp4_weight *weight,
+                               const float *d_x, float act_scale, size_t m,
+                               float *d_y_f32, uint8_t *scratch,
+                               double *prep_ms, double *gemm_ms, char *error,
+                               size_t error_size, const char *tag) {
+    return h3_cuda_fp4_gemm_run(cuda, weight, d_x, act_scale, m, 0, 0, NULL,
+                                NULL, NULL, 0u, 0u, NULL, d_y_f32, scratch,
+                                prep_ms, gemm_ms, error, error_size, tag);
+}
+
+int h3_cuda_gemm_fp4_w_act_dev_swiglu(h3_cuda *cuda,
+                                      const h3_cuda_nvfp4_weight *weight,
+                                      const float *d_x, float act_scale,
+                                      size_t m, const float *d_lora,
+                                      float *d_y_f32, uint8_t *scratch,
+                                      double *prep_ms, double *gemm_ms,
+                                      char *error, size_t error_size,
+                                      const char *tag) {
+    return h3_cuda_fp4_gemm_run(cuda, weight, d_x, act_scale, m, 1, 0, NULL,
+                                NULL, NULL, 0u, 0u, d_lora, d_y_f32, scratch,
+                                prep_ms, gemm_ms, error, error_size, tag);
+}
+
+int h3_cuda_gemm_fp4_w_act_dev_gate(h3_cuda *cuda,
+                                    const h3_cuda_nvfp4_weight *weight,
+                                    const float *d_x, float act_scale,
+                                    size_t m, const float *d_residual,
+                                    const float *d_modulation,
+                                    const uint32_t *d_row_map, size_t slots,
+                                    size_t gate_slot, const float *d_lora,
+                                    float *d_y_f32, uint8_t *scratch,
+                                    double *prep_ms, double *gemm_ms,
+                                    char *error, size_t error_size,
+                                    const char *tag) {
+    return h3_cuda_fp4_gemm_run(cuda, weight, d_x, act_scale, m, 0, 1,
+                                d_residual, d_modulation, d_row_map, slots,
+                                gate_slot, d_lora, d_y_f32, scratch, prep_ms,
+                                gemm_ms, error, error_size, tag);
+}
+
+/* Public FP4 GEMM entry: packed weights/acts + swizzled SF -> BF16 out. */
+int h3_cuda_gemm_fp4_bs_dev(h3_cuda *cuda, const uint8_t *d_w_fp4,
+                            const uint8_t *d_sf_w, const uint8_t *d_x_fp4,
+                            const uint8_t *d_sf_x, size_t m, size_t n, size_t k,
+                            void *d_y_bf16, double *gemm_ms, char *error,
+                            size_t error_size) {
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    float elapsed = 0.0f;
+    int quiet, ok;
+    if (gemm_ms) *gemm_ms = 0.0;
+    if (!cuda || !d_w_fp4 || !d_sf_w || !d_x_fp4 || !d_sf_x || !d_y_bf16 ||
+        m == 0 || n == 0 || k == 0 || (k & 15u) != 0) {
+        h3_cuda_set_error(error, error_size, "invalid fp4 gemm args (K%16!=0)");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    quiet = !h3_cuda_want_events(cuda);
+    if (!quiet) {
+        if (cudaEventCreate(&ev0) != cudaSuccess ||
+            cudaEventCreate(&ev1) != cudaSuccess) {
+            if (ev0) cudaEventDestroy(ev0);
+            if (ev1) cudaEventDestroy(ev1);
+            h3_cuda_set_error(error, error_size, "fp4 event create");
+            return 0;
+        }
+        cudaEventRecord(ev0, h3_cuda_op_st(cuda));
+    }
+    ok = h3_cuda_lt_gemm_fp4_bf16(cuda, d_w_fp4, d_sf_w, d_x_fp4, d_sf_x,
+                                  d_y_bf16, m, n, k, error, error_size);
+    if (!ok) {
+        if (ev0) cudaEventDestroy(ev0);
+        if (ev1) cudaEventDestroy(ev1);
+        return 0;
+    }
+    if (!quiet) {
+        cudaEventRecord(ev1, h3_cuda_op_st(cuda));
+        cudaEventSynchronize(ev1);
+        cudaEventElapsedTime(&elapsed, ev0, ev1);
+        if (gemm_ms) *gemm_ms = (double)elapsed;
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+    }
+    return 1;
 }
 
 int h3_cuda_gemm_i8_dequant_f32_w_act(
@@ -3415,18 +6366,178 @@ __global__ void h3_cuda_sdpa_flash_kernel(const float *__restrict__ Q,
     }
 }
 
+int h3_cuda_sdpa_f32_dev(h3_cuda *cuda, const float *d_query, const float *d_key,
+                         const float *d_value, size_t seq, size_t heads,
+                         size_t head_dim, float scale, float *d_out,
+                         double *sdpa_ms, char *error, size_t error_size) {
+    cudaError_t status;
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    float elapsed = 0.0f;
+    size_t smem;
+    static int smem_attr_set = 0;
+    if (sdpa_ms) *sdpa_ms = 0.0;
+    if (!cuda || !d_query || !d_key || !d_value || !d_out || seq == 0 ||
+        heads == 0 || head_dim == 0) {
+        h3_cuda_set_error(error, error_size,
+                          "invalid h3_cuda_sdpa_f32_dev args");
+        return 0;
+    }
+    if (head_dim > (size_t)H3_CUDA_SDPA_DMAX) {
+        h3_cuda_set_error(error, error_size, "head_dim > 128 not supported");
+        return 0;
+    }
+#if defined(H3_HAVE_CUDNN) && defined(H3_HAVE_CUDNN_FRONTEND)
+    /* VAE full-frame: F16 cuDNN waffles. Try fused F32 (TF32 off) first. */
+    if (cuda->cudnn_ok && h3_cuda_bind(cuda, error, error_size)) {
+        char local[320];
+        static int logged_ok;
+        static int logged_fb;
+        static int raw_dead;
+        local[0] = '\0';
+        if (cuda->cudnn &&
+            cudnnSetStream(cuda->cudnn, h3_cuda_op_st(cuda)) !=
+                CUDNN_STATUS_SUCCESS) {
+            h3_cuda_set_error(error, error_size, "cudnnSetStream f32 sdpa");
+            return 0;
+        }
+        if (!raw_dead &&
+            h3_cuda_sdpa_cudnn_f32_run_ex(
+                (void *)cuda->cudnn, d_query, d_key, d_value, d_out, seq, heads,
+                head_dim, scale, 0, seq, 0, sdpa_ms, local, sizeof(local))) {
+            if (!logged_ok) {
+                fprintf(stderr,
+                        "[h3] sdpa_f32 backend=cuda_cudnn_f32 tf32=off "
+                        "seq=%zu H=%zu d=%zu\n",
+                        seq, heads, head_dim);
+                logged_ok = 1;
+            }
+            return 1;
+        }
+        if (!raw_dead)
+            raw_dead = 1;
+        {
+            size_t padded = h3_cuda_sdpa_cudnn_align_seq(seq);
+            if (padded > seq) {
+                size_t S = seq * heads * head_dim;
+                size_t P = padded * heads * head_dim;
+                float *base, *pq, *pk, *pv, *po;
+                if (error && error_size) error[0] = '\0';
+                local[0] = '\0';
+                if (h3_cuda_ensure_scratch(cuda, 4 * P * sizeof(float), error,
+                                           error_size)) {
+                    base = (float *)cuda->d_sdpa_scratch;
+                    pq = base;
+                    pk = base + P;
+                    pv = base + 2 * P;
+                    po = base + 3 * P;
+                    if (cudaMemcpy(pq, d_query, S * sizeof(float),
+                                   cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                        cudaMemcpy(pk, d_key, S * sizeof(float),
+                                   cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                        cudaMemcpy(pv, d_value, S * sizeof(float),
+                                   cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                        cudaMemset(pq + S, 0, (P - S) * sizeof(float)) ==
+                            cudaSuccess &&
+                        cudaMemset(pk + S, 0, (P - S) * sizeof(float)) ==
+                            cudaSuccess &&
+                        cudaMemset(pv + S, 0, (P - S) * sizeof(float)) ==
+                            cudaSuccess &&
+                        h3_cuda_sdpa_cudnn_f32_run_ex(
+                            (void *)cuda->cudnn, pq, pk, pv, po, padded, heads,
+                            head_dim, scale, 0, seq, 1, sdpa_ms, local,
+                            sizeof(local)) &&
+                        cudaMemcpy(d_out, po, S * sizeof(float),
+                                   cudaMemcpyDeviceToDevice) == cudaSuccess) {
+                        if (!logged_ok) {
+                            fprintf(stderr,
+                                    "[h3] sdpa_f32 backend=cuda_cudnn_f32 "
+                                    "tf32=off pad=%zu seq=%zu H=%zu d=%zu\n",
+                                    padded, seq, heads, head_dim);
+                            logged_ok = 1;
+                        }
+                        return 1;
+                    }
+                }
+            }
+        }
+        if (!logged_fb) {
+            fprintf(stderr,
+                    "[h3] sdpa_f32 cudnn unavailable (%s); naive F32 flash "
+                    "(slow)\n",
+                    local[0] ? local : "no plan");
+            logged_fb = 1;
+        }
+        if (error && error_size) error[0] = '\0';
+    }
+#endif
+    smem = (size_t)(2 * (H3_CUDA_SDPA_BR + H3_CUDA_SDPA_BC)) * head_dim *
+           sizeof(float);
+    if (!smem_attr_set) {
+        status = cudaFuncSetAttribute(
+            h3_cuda_sdpa_flash_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size,
+                                   "cudaFuncSetAttribute smem", status);
+            return 0;
+        }
+        smem_attr_set = 1;
+    }
+    status = cudaEventCreate(&ev0);
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate", status);
+        return 0;
+    }
+    status = cudaEventCreate(&ev1);
+    if (status != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate", status);
+        return 0;
+    }
+    {
+        unsigned q_tiles = (unsigned)((seq + (size_t)H3_CUDA_SDPA_BR - 1) /
+                                      (size_t)H3_CUDA_SDPA_BR);
+        dim3 grid((unsigned)heads, q_tiles, 1);
+        if (cudaEventRecord(ev0, 0) != cudaSuccess) {
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            h3_cuda_set_error(error, error_size, "cudaEventRecord");
+            return 0;
+        }
+        h3_cuda_sdpa_flash_kernel<<<grid, H3_CUDA_SDPA_BR, smem, h3_cuda_op_st(cuda)>>>(
+            d_query, d_key, d_value, d_out, (int)seq, (int)heads, (int)head_dim,
+            scale);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            h3_cuda_set_error_cuda(error, error_size, "sdpa flash kernel",
+                                   status);
+            return 0;
+        }
+        if (cudaEventRecord(ev1, 0) != cudaSuccess ||
+            cudaEventSynchronize(ev1) != cudaSuccess ||
+            cudaEventElapsedTime(&elapsed, ev0, ev1) != cudaSuccess) {
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            h3_cuda_set_error(error, error_size, "sdpa f32 timing");
+            return 0;
+        }
+    }
+    if (sdpa_ms) *sdpa_ms = (double)elapsed;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    return 1;
+}
+
 int h3_cuda_sdpa_f32(h3_cuda *cuda, const float *query, const float *key,
                      const float *value, size_t seq, size_t heads,
                      size_t head_dim, float scale, float *out, double *sdpa_ms,
                      char *error, size_t error_size) {
     float *d_q = NULL, *d_k = NULL, *d_v = NULL, *d_o = NULL;
     cudaError_t status;
-    cudaEvent_t ev0 = NULL, ev1 = NULL;
-    float elapsed = 0.0f;
     size_t elems;
-    size_t smem;
     int ok = 0;
-    static int smem_attr_set = 0;
 
     if (sdpa_ms) *sdpa_ms = 0.0;
     if (!cuda || !query || !key || !value || !out || seq == 0 || heads == 0 ||
@@ -3485,71 +6596,9 @@ int h3_cuda_sdpa_f32(h3_cuda *cuda, const float *query, const float *key,
         h3_cuda_set_error_cuda(error, error_size, "cudaMemcpy V", status);
         goto cleanup;
     }
-
-    smem = (size_t)(2 * (H3_CUDA_SDPA_BR + H3_CUDA_SDPA_BC)) * head_dim *
-           sizeof(float);
-    if (!smem_attr_set) {
-        status = cudaFuncSetAttribute(
-            h3_cuda_sdpa_flash_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size,
-                                   "cudaFuncSetAttribute smem", status);
-            goto cleanup;
-        }
-        smem_attr_set = 1;
-    }
-
-    status = cudaEventCreate(&ev0);
-    if (status != cudaSuccess) {
-        h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate", status);
+    if (!h3_cuda_sdpa_f32_dev(cuda, d_q, d_k, d_v, seq, heads, head_dim, scale,
+                              d_o, sdpa_ms, error, error_size))
         goto cleanup;
-    }
-    status = cudaEventCreate(&ev1);
-    if (status != cudaSuccess) {
-        h3_cuda_set_error_cuda(error, error_size, "cudaEventCreate", status);
-        goto cleanup;
-    }
-
-    {
-        unsigned q_tiles =
-            (unsigned)((seq + (size_t)H3_CUDA_SDPA_BR - 1) / (size_t)H3_CUDA_SDPA_BR);
-        dim3 grid((unsigned)heads, q_tiles, 1);
-        status = cudaEventRecord(ev0, 0);
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
-                                   status);
-            goto cleanup;
-        }
-        h3_cuda_sdpa_flash_kernel<<<grid, H3_CUDA_SDPA_BR, smem>>>(
-            d_q, d_k, d_v, d_o, (int)seq, (int)heads, (int)head_dim, scale);
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "sdpa flash kernel",
-                                   status);
-            goto cleanup;
-        }
-        status = cudaEventRecord(ev1, 0);
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord",
-                                   status);
-            goto cleanup;
-        }
-        status = cudaEventSynchronize(ev1);
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "cudaEventSynchronize",
-                                   status);
-            goto cleanup;
-        }
-        status = cudaEventElapsedTime(&elapsed, ev0, ev1);
-        if (status != cudaSuccess) {
-            h3_cuda_set_error_cuda(error, error_size, "cudaEventElapsedTime",
-                                   status);
-            goto cleanup;
-        }
-    }
-    if (sdpa_ms) *sdpa_ms = (double)elapsed;
-
     status =
         cudaMemcpy(out, d_o, elems * sizeof(float), cudaMemcpyDeviceToHost);
     if (status != cudaSuccess) {
@@ -3559,8 +6608,6 @@ int h3_cuda_sdpa_f32(h3_cuda *cuda, const float *query, const float *key,
     ok = 1;
 
 cleanup:
-    if (ev0) cudaEventDestroy(ev0);
-    if (ev1) cudaEventDestroy(ev1);
     if (d_q) cudaFree(d_q);
     if (d_k) cudaFree(d_k);
     if (d_v) cudaFree(d_v);
@@ -3582,17 +6629,26 @@ const char *h3_cuda_sdpa_backend_name(void) {
     return e;
 }
 
+static int g_sdpa_force_flash = 0;
+
+extern "C" void h3_cuda_sdpa_set_force_flash(int enabled) {
+    g_sdpa_force_flash = enabled ? 1 : 0;
+}
+
 /* Registry-backed selectors — no sm==120 branching; see h3_sdpa.h. */
 static h3_sdpa_backend_id h3_cuda_sdpa_id(void) {
     return h3_sdpa_cached_id();
 }
 
 static int h3_cuda_sdpa_want_tc(void) {
+    if (g_sdpa_force_flash) return 0;
     return h3_cuda_sdpa_id() == H3_SDPA_ID_TC;
 }
 
 static int h3_cuda_sdpa_want_cudnn(void) {
-    h3_sdpa_backend_id id = h3_cuda_sdpa_id();
+    h3_sdpa_backend_id id;
+    if (g_sdpa_force_flash) return 0;
+    id = h3_cuda_sdpa_id();
     /* Tier-0 cudnn, and dense fallback for Tier-1 sage3 / sol_cute. */
     return id == H3_SDPA_ID_CUDNN || id == H3_SDPA_ID_SAGE3 ||
            id == H3_SDPA_ID_SOL_CUTE;
@@ -3604,15 +6660,18 @@ static int h3_cuda_sdpa_want_sage2(void) {
 }
 
 static int h3_cuda_sdpa_want_sage3(void) {
+    if (g_sdpa_force_flash) return 0;
     return h3_cuda_sdpa_id() == H3_SDPA_ID_SAGE3;
 }
 
 static int h3_cuda_sdpa_want_sol(void) {
     /* Nested-loop fake — forbidden as product; not sol_cute. */
+    if (g_sdpa_force_flash) return 0;
     return h3_cuda_sdpa_id() == H3_SDPA_ID_SOL;
 }
 
 static int h3_cuda_sdpa_want_sol_cute(void) {
+    if (g_sdpa_force_flash) return 0;
     return h3_cuda_sdpa_id() == H3_SDPA_ID_SOL_CUTE;
 }
 
@@ -3646,6 +6705,17 @@ static unsigned long long g_sol_cute_fallback = 0;
 static unsigned long long g_sol_cute_want = 0;
 static unsigned long long g_sol_cute_hits_at_step = 0;
 static unsigned long long g_sol_cute_dense_at_step = 0;
+/* Skip sol from this seq upward (hires OOM or H3_SOL_MAX_SEQ). 0 = none. */
+static size_t g_sol_cute_skip_from = 0;
+static int g_sol_cute_skip_logged = 0;
+/* Hires "use-and-release" QKVO (env H3_SOL_HIRES_QKVO). Default off: zero
+ * behavior change for the mixed arm / 480p. When on AND this is the hires
+ * sol stage, release QKVO + torch cache after the LAST sol hit of each DiT
+ * step so the same step's adaln/GEMM activations have headroom; the next
+ * step's first hit reallocates via the torch caching allocator. */
+static int g_sol_cute_hires_qkvo = -1;   /* -1 unset, 0 off, 1 on */
+static int g_sol_cute_layers_per_step = 0; /* frozen hires layers/step */
+static int g_sol_cute_hires_seen = 0;    /* hires seq hit this step */
 
 typedef int (*h3_sol_cute_init_fn)(const char *, int, int, int, float, int, int,
                                    void **, void **, void **, void **, char *,
@@ -3733,6 +6803,41 @@ extern "C" void h3_cuda_sol_cute_dump_stats(void) {
     fflush(stderr);
 }
 
+extern "C" void h3_cuda_sol_cute_trim_cache(void) {
+    typedef int (*h3_sol_cute_trim_fn)(char *, size_t);
+    h3_sol_cute_trim_fn tfn;
+    char err[256];
+    if (!g_sol_cute_lib) return;
+    tfn = (h3_sol_cute_trim_fn)dlsym(g_sol_cute_lib, "h3_sol_cute_trim_cache");
+    if (!tfn) return;
+    err[0] = '\0';
+    if (!tfn(err, sizeof(err))) {
+        fprintf(stderr, "[h3] sol_cute trim_cache: %s\n",
+                err[0] ? err : "failed");
+    }
+}
+
+extern "C" void h3_cuda_sol_cute_drop_pool(void) {
+    typedef int (*h3_sol_cute_drop_fn)(char *, size_t);
+    h3_sol_cute_drop_fn dfn;
+    char err[256];
+    if (g_sol_cute_lib) {
+        dfn = (h3_sol_cute_drop_fn)dlsym(g_sol_cute_lib, "h3_sol_cute_drop");
+        if (dfn) {
+            err[0] = '\0';
+            if (!dfn(err, sizeof(err))) {
+                fprintf(stderr, "[h3] sol_cute drop_pool: %s\n",
+                        err[0] ? err : "failed");
+            }
+        }
+    }
+    g_sol_cute_q = g_sol_cute_k = g_sol_cute_v = g_sol_cute_o = NULL;
+    g_sol_cute_inited = 0;
+    g_sol_cute_seq = g_sol_cute_heads = g_sol_cute_dim = 0;
+    fprintf(stderr, "[h3] sol_cute drop_pool (QKVO released for hires/VAE)\n");
+    fflush(stderr);
+}
+
 extern "C" void h3_cuda_sol_profile_finish_step(int step, double step_ms) {
     double sdpa, layout, other, accounted, gap;
     unsigned long long hits, dense;
@@ -3760,9 +6865,14 @@ extern "C" void h3_cuda_sol_profile_finish_step(int step, double step_ms) {
     memset(&g_sp_step, 0, sizeof(g_sp_step));
 }
 
+static void h3_sol_cute_freeze_layers_per_step(void);
+
 extern "C" void h3_cuda_sol_cute_set_step(int step) {
     int s = step < 0 ? 0 : step;
     if (s != g_sol_cute_step) {
+        /* Freeze the hires layers-per-step learned from the step just done so
+         * use-and-release knows which layer is the last one next step. */
+        h3_sol_cute_freeze_layers_per_step();
         if (g_sol_cute_step >= 0 && g_sol_cute_want > 0)
             fprintf(stderr,
                     "[h3] sol_cute step_done=%d hits=%llu dense_skip=%llu "
@@ -3781,19 +6891,10 @@ extern "C" void h3_cuda_sol_cute_set_step(int step) {
     }
 }
 
-static int h3_sol_cute_dense_steps(void) {
-    const char *e = getenv("H3_SOL_FIRST_DENSE_STEPS");
-    if (!e || !e[0]) e = getenv("SOL_ATTN_FIRST_DENSE_STEPS");
-    /* Official 50-step recipe keeps 10 dense = 20%. 8-step → 2. */
-    if (!e || !e[0]) return 2;
-    return atoi(e);
-}
+static int h3_sol_cute_dense_steps(void) { return h3_sol_first_dense_steps(); }
 
 static int h3_sol_cute_dense_layers(void) {
-    const char *e = getenv("H3_SOL_FIRST_DENSE_LAYERS");
-    if (!e || !e[0]) e = getenv("SOL_ATTN_FIRST_DENSE_LAYERS");
-    if (!e || !e[0]) return 2;
-    return atoi(e);
+    return h3_sol_first_dense_layers();
 }
 
 static float h3_sol_cute_tau(void) {
@@ -3802,6 +6903,24 @@ static float h3_sol_cute_tau(void) {
     if (!e || !e[0]) return 1.0f;
     return (float)atof(e);
 }
+
+/* Hires use-and-release QKVO gate. H3_SOL_HIRES_QKVO=1 enables; only applies
+ * to the hires sol stage (large seq). 480p / mixed arm leave it off so their
+ * per-step QKVO stays cached (no realloc thrash). */
+static int h3_sol_cute_hires_qkvo_on(void) {
+    const char *e;
+    if (g_sol_cute_hires_qkvo >= 0) return g_sol_cute_hires_qkvo;
+    e = getenv("H3_SOL_HIRES_QKVO");
+    g_sol_cute_hires_qkvo = (e && e[0] && strcmp(e, "0") != 0 &&
+                             strcasecmp(e, "off") != 0)
+                                ? 1
+                                : 0;
+    return g_sol_cute_hires_qkvo;
+}
+
+/* Treat seq above the 480p sol shape as the hires stage. 480p seq ~15973;
+ * hires 768p packed seq ~38676. Use a threshold between the two. */
+static int h3_sol_cute_is_hires_seq(size_t seq) { return seq > 20000; }
 
 __global__ void h3_f16_to_bf16_kernel(const __half *__restrict__ in,
                                       __nv_bfloat16 *__restrict__ out,
@@ -3859,6 +6978,10 @@ static int h3_cuda_sdpa_sol_cute_dev(h3_cuda *cuda, const __half *d_q,
     double prep = 0.0, kern = 0.0, copy = 0.0, compile = 0.0, host = 0.0;
     (void)cuda;
     if (g_sol_cute_failed) return 0;
+    if (h3_sol_cute_should_skip_seq(seq)) {
+        snprintf(error, error_size, "sol_cute skip seq=%zu", seq);
+        return 0;
+    }
     if (dim != 128) {
         snprintf(error, error_size, "sol_cute requires D=128");
         return 0;
@@ -3884,6 +7007,16 @@ static int h3_cuda_sdpa_sol_cute_dev(h3_cuda *cuda, const __half *d_q,
                                 &g_sol_cute_k, &g_sol_cute_v, &g_sol_cute_o,
                                 g_sol_cute_backend, sizeof(g_sol_cute_backend),
                                 error, error_size)) {
+            if (h3_sol_err_is_oom(error)) {
+                fprintf(stderr,
+                        "[h3] sol_cute OOM seq=%zu: %s — skip this seq, "
+                        "keep INT8 window, hires cudnn\n",
+                        seq, error[0] ? error : "(no msg)");
+                g_sol_cute_skip_from = seq;
+                h3_cuda_sol_cute_drop_pool();
+                h3_cuda_sol_cute_trim_cache();
+                return 0;
+            }
             g_sol_cute_failed = 1;
             return 0;
         }
@@ -3925,6 +7058,19 @@ static int h3_cuda_sdpa_sol_cute_dev(h3_cuda *cuda, const __half *d_q,
         else
             ok_fwd = g_sol_cute_fwd_fn(error, error_size);
         if (!ok_fwd) {
+            if (h3_sol_err_is_oom(error)) {
+                fprintf(stderr,
+                        "[h3] sol_cute fwd OOM seq=%zu: %s — skip this seq, "
+                        "hires cudnn\n",
+                        seq, error[0] ? error : "(no msg)");
+                g_sol_cute_skip_from = seq;
+                h3_cuda_sol_cute_drop_pool();
+                h3_cuda_sol_cute_trim_cache();
+                (void)cudaGetLastError();
+                if (ev0) cudaEventDestroy(ev0);
+                if (ev1) cudaEventDestroy(ev1);
+                return 0;
+            }
             g_sol_cute_failed = 1;
             (void)cudaGetLastError();
             if (ev0) cudaEventDestroy(ev0);
@@ -3958,22 +7104,66 @@ static int h3_cuda_sdpa_sol_cute_dev(h3_cuda *cuda, const __half *d_q,
     }
     if (ev0) cudaEventDestroy(ev0);
     if (ev1) cudaEventDestroy(ev1);
+    /* Hires use-and-release QKVO: after the LAST sol hit of a DiT step, drop
+     * QKVO + trim the torch cache so this step's adaln/GEMM activations have
+     * headroom. Next step's first hit reallocates via the caching allocator.
+     * First hires step learns layers_per_step; later steps release on the
+     * final layer. Env-gated (H3_SOL_HIRES_QKVO) and hires-seq-only, so the
+     * 480p / mixed arm keep their cached QKVO (no realloc thrash). */
+    if (h3_sol_cute_hires_qkvo_on() && h3_sol_cute_is_hires_seq(seq)) {
+        int layer_now = g_sol_cute_layer; /* already incremented by caller */
+        g_sol_cute_hires_seen = 1;
+        /* Per-layer release: drop QKVO + trim the torch cache after EVERY
+         * hires sol hit so the adaln/GEMM activation that follows each layer
+         * has headroom. The persistent QKVO and sol's per-fwd temporaries
+         * (output/lse/kc/vc/threshold) otherwise pile up in the torch caching
+         * allocator on top of the INT8 window and OOM the hires adaln kernel
+         * (observed at hires step 3 with the pool held). Realloc happens via
+         * the caching allocator on the next layer's first hit. This is the
+         * "use-and-release" arm whose per-step realloc cost we are measuring
+         * against the cudnn mixed arm. */
+        h3_cuda_sol_cute_drop_pool();
+        h3_cuda_sol_cute_trim_cache();
+        if (layer_now <= 3 || (layer_now % 10) == 0)
+            fprintf(stderr,
+                    "[h3] sol_cute hires_qkvo: released QKVO after step=%d "
+                    "layer=%d seq=%zu (per-layer realloc)\n",
+                    g_sol_cute_step, layer_now, seq);
+    }
     return 1;
+}
+
+/* Step-boundary hook kept for symmetry; per-layer release makes the frozen
+ * layer count unnecessary, but reset the hires-seen flag each step. */
+static void h3_sol_cute_freeze_layers_per_step(void) {
+    if (g_sol_cute_hires_seen && g_sol_cute_layer > 0)
+        g_sol_cute_layers_per_step = g_sol_cute_layer;
+    g_sol_cute_hires_seen = 0;
+}
+
+static int h3_sol_cute_should_skip_seq(size_t seq) {
+    if (g_sol_cute_skip_from && seq >= g_sol_cute_skip_from) return 1;
+    if (!h3_sol_cute_seq_allowed(seq)) return 1;
+    return 0;
+}
+
+static int h3_sol_err_is_oom(const char *e) {
+    if (!e || !e[0]) return 0;
+    if (strstr(e, "out of memory")) return 1;
+    if (strstr(e, "OutOfMemory")) return 1;
+    if (strstr(e, "CUDA out of memory")) return 1;
+    return 0;
 }
 
 static void h3_cuda_sol_cute_maybe_warmup(void) {
     const char *be;
     const char *es;
-    const char *pkg;
-    int seq, heads, dim, sink;
-    char error[768];
-    typedef int (*h3_sol_cute_warmup_fn)(const char *, int, int, int, float,
-                                         int, int, char *, size_t);
-    h3_sol_cute_warmup_fn wfn;
+    int seq, heads, dim;
 
     be = getenv("H3_CUDA_SDPA_BACKEND");
     if (!be || (strcmp(be, "sol_cute") && strcmp(be, "sol-cute") &&
-                strcmp(be, "sol-engine") && strcmp(be, "cute_sm89")))
+                strcmp(be, "sol-engine") && strcmp(be, "cute_sm89") &&
+                strcmp(be, "cute_sm120")))
         return;
     es = getenv("H3_SOL_WARMUP_SEQ");
     seq = (es && es[0]) ? atoi(es) : 0;
@@ -3984,6 +7174,25 @@ static void h3_cuda_sol_cute_maybe_warmup(void) {
     if (es && es[0] && atoi(es) > 0) heads = atoi(es);
     es = getenv("H3_SOL_WARMUP_DIM");
     if (es && es[0] && atoi(es) > 0) dim = atoi(es);
+    h3_cuda_sol_cute_warmup_shape((size_t)seq, (size_t)heads, (size_t)dim);
+}
+
+extern "C" void h3_cuda_sol_cute_warmup_shape(size_t seq, size_t heads,
+                                              size_t dim) {
+    const char *pkg;
+    int sink;
+    char error[768];
+    typedef int (*h3_sol_cute_warmup_fn)(const char *, int, int, int, float,
+                                         int, int, char *, size_t);
+    h3_sol_cute_warmup_fn wfn;
+
+    if (seq < 4096 || heads == 0 || dim == 0) return;
+    if (h3_sol_cute_should_skip_seq(seq)) {
+        fprintf(stderr,
+                "[h3] sol_cute warmup skip seq=%zu (max_seq=%zu skip_from=%zu)\n",
+                seq, h3_sol_cute_max_seq(), g_sol_cute_skip_from);
+        return;
+    }
     error[0] = '\0';
     if (!h3_sol_cute_load_lib(error, sizeof(error))) {
         fprintf(stderr, "[h3] sol_cute warmup skip: %s\n", error);
@@ -4004,16 +7213,23 @@ static void h3_cuda_sol_cute_maybe_warmup(void) {
     }
     sink = h3_sol_sink_tokens_env();
     fprintf(stderr,
-            "[h3] sol_cute warmup compile seq=%d H=%d D=%d tau=%.2f sink=%d "
+            "[h3] sol_cute warmup compile seq=%zu H=%zu D=%zu tau=%.2f sink=%d "
             "root=%s\n",
             seq, heads, dim, (double)h3_sol_cute_tau(), sink, pkg);
-    if (!wfn(pkg, seq, heads, dim, h3_sol_cute_tau(), 0, sink, error,
-             sizeof(error))) {
+    if (!wfn(pkg, (int)seq, (int)heads, (int)dim, h3_sol_cute_tau(), 0, sink,
+             error, sizeof(error))) {
         fprintf(stderr, "[h3] sol_cute warmup failed: %s\n",
                 error[0] ? error : "(no msg)");
         (void)cudaGetLastError();
         return;
     }
+    /* The warm fwd ran with torch.empty garbage Q/K/V; that is fine for
+     * NVRTC/compile but it also runs the real CuTe kernel and may trip the
+     * embed's lazy state (e.g. _LOGGED). Fully reset the C-side pool so the
+     * first REAL hit does a clean init+fwd on actual data. Critical for the
+     * FIRST_DENSE_STEPS×FIRST_DENSE_LAYERS arm: the router defers the first
+     * sol call to a later (step,layer), and any half-warm embed state at
+     * that point produces NaN on the cold clip. */
     g_sol_cute_inited = 0;
     g_sol_cute_q = NULL;
     g_sol_cute_k = NULL;
@@ -4038,6 +7254,15 @@ static char g_sage3_backend[64] = "sage3_blackwell_fp4";
 static unsigned long long g_sage3_hits = 0;
 static unsigned long long g_sage3_fallback = 0;
 static unsigned long long g_sage3_want = 0;
+static unsigned long long g_cudnn_want = 0;
+static unsigned long long g_cudnn_hits = 0;
+static unsigned long long g_cudnn_fallback = 0;
+static char g_sdpa_last_backend[64] = "(none)";
+
+static void h3_sdpa_note_backend(const char *backend) {
+    if (!backend || !backend[0]) return;
+    snprintf(g_sdpa_last_backend, sizeof(g_sdpa_last_backend), "%s", backend);
+}
 
 typedef int (*h3_sage3_init_fn)(const char *, int, int, int, float, int, int,
                                 void **, void **, void **, void **, char *,
@@ -4045,9 +7270,19 @@ typedef int (*h3_sage3_init_fn)(const char *, int, int, int, float, int, int,
 typedef int (*h3_sage3_fwd_fn)(char *, size_t);
 typedef int (*h3_sage3_fwd_ex_fn)(char *, size_t, double *, double *, double *,
                                   double *, double *);
+typedef int (*h3_sage3_warmup_fn)(const char *, int, int, int, float, int, int,
+                                  char *, size_t);
 static h3_sage3_init_fn g_sage3_init_fn = NULL;
 static h3_sage3_fwd_fn g_sage3_fwd_fn = NULL;
 static h3_sage3_fwd_ex_fn g_sage3_fwd_ex_fn = NULL;
+static h3_sage3_warmup_fn g_sage3_warmup_fn = NULL;
+
+#define H3_SAGE3_POOL 8
+static struct {
+    size_t seq, heads, dim;
+    void *q, *k, *v, *o;
+} g_sage3_pool[H3_SAGE3_POOL];
+static int g_sage3_npool = 0;
 
 /* THD (T,H,D) → BHTD (1,H,T,D) for sage3; contiguous F16. */
 __global__ void h3_f16_thd_to_bhtd_kernel(const __half *__restrict__ in,
@@ -4089,6 +7324,66 @@ extern "C" void h3_cuda_sage3_dump_stats(void) {
     fflush(stderr);
 }
 
+extern "C" void h3_cuda_sage3_get_stats(unsigned long long *want,
+                                        unsigned long long *hits,
+                                        unsigned long long *fallback) {
+    if (want) *want = g_sage3_want;
+    if (hits) *hits = g_sage3_hits;
+    if (fallback) *fallback = g_sage3_fallback;
+}
+
+extern "C" void h3_cuda_sdpa_counters_get(h3_cuda_sdpa_counters *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->sage3_want = g_sage3_want;
+    out->sage3_hits = g_sage3_hits;
+    out->sage3_fallback = g_sage3_fallback;
+    out->sol_cute_want = g_sol_cute_want;
+    out->sol_cute_hits = g_sol_cute_hits;
+    out->sol_cute_fallback = g_sol_cute_fallback;
+    out->sol_cute_dense_skip = g_sol_cute_dense_skip;
+    out->cudnn_want = g_cudnn_want;
+    out->cudnn_hits = g_cudnn_hits;
+    out->cudnn_fallback = g_cudnn_fallback;
+}
+
+extern "C" const char *h3_cuda_sdpa_last_backend_name(void) {
+    return g_sdpa_last_backend;
+}
+
+extern "C" void h3_cuda_sage3_drop_pool(void) {
+    int pi;
+    for (pi = 0; pi < g_sage3_npool; pi++) {
+        if (g_sage3_pool[pi].q) cudaFree(g_sage3_pool[pi].q);
+        if (g_sage3_pool[pi].k) cudaFree(g_sage3_pool[pi].k);
+        if (g_sage3_pool[pi].v) cudaFree(g_sage3_pool[pi].v);
+        if (g_sage3_pool[pi].o) cudaFree(g_sage3_pool[pi].o);
+        memset(&g_sage3_pool[pi], 0, sizeof(g_sage3_pool[pi]));
+    }
+    g_sage3_npool = 0;
+    g_sage3_q = g_sage3_k = g_sage3_v = g_sage3_o = NULL;
+    g_sage3_inited = 0;
+    g_sage3_seq = g_sage3_heads = g_sage3_dim = 0;
+}
+
+extern "C" size_t h3_cuda_sage3_pool_bytes(void) {
+    size_t bytes = 0;
+    int pi;
+    for (pi = 0; pi < g_sage3_npool; pi++) {
+        size_t elems = g_sage3_pool[pi].seq * g_sage3_pool[pi].heads *
+                       g_sage3_pool[pi].dim;
+        if (g_sage3_pool[pi].q)
+            bytes += elems * 2u;
+        if (g_sage3_pool[pi].k)
+            bytes += elems * 2u;
+        if (g_sage3_pool[pi].v)
+            bytes += elems * 2u;
+        if (g_sage3_pool[pi].o)
+            bytes += elems * 2u;
+    }
+    return bytes;
+}
+
 static int h3_sage3_load_lib(char *error, size_t error_size) {
     const char *path;
     if (g_sage3_lib) return 1;
@@ -4106,6 +7401,8 @@ static int h3_sage3_load_lib(char *error, size_t error_size) {
     g_sage3_fwd_fn = (h3_sage3_fwd_fn)dlsym(g_sage3_lib, "h3_sage3_fwd");
     g_sage3_fwd_ex_fn =
         (h3_sage3_fwd_ex_fn)dlsym(g_sage3_lib, "h3_sage3_fwd_ex");
+    g_sage3_warmup_fn =
+        (h3_sage3_warmup_fn)dlsym(g_sage3_lib, "h3_sage3_warmup");
     if (!g_sage3_init_fn || !g_sage3_fwd_fn) {
         snprintf(error, error_size, "dlsym sage3 missing init/fwd");
         return 0;
@@ -4140,6 +7437,7 @@ static int h3_cuda_sdpa_sage3_dev(h3_cuda *cuda, const __half *d_q,
     elems = seq * heads * dim;
     if (!g_sage3_inited || g_sage3_seq != seq || g_sage3_heads != heads ||
         g_sage3_dim != dim) {
+        int pi, found = 0;
         pkg = getenv("H3_SAGE3_ROOT");
         if (!pkg || !pkg[0]) {
             snprintf(error, error_size,
@@ -4148,10 +7446,41 @@ static int h3_cuda_sdpa_sage3_dev(h3_cuda *cuda, const __half *d_q,
             g_sage3_failed = 1;
             return 0;
         }
-        if (!g_sage3_init_fn(pkg, (int)seq, (int)heads, (int)dim, scale, 0, 0,
-                             &g_sage3_q, &g_sage3_k, &g_sage3_v, &g_sage3_o,
-                             g_sage3_backend, sizeof(g_sage3_backend), error,
-                             error_size)) {
+        for (pi = 0; pi < g_sage3_npool; pi++) {
+            if (g_sage3_pool[pi].seq == seq && g_sage3_pool[pi].heads == heads &&
+                g_sage3_pool[pi].dim == dim) {
+                g_sage3_q = g_sage3_pool[pi].q;
+                g_sage3_k = g_sage3_pool[pi].k;
+                g_sage3_v = g_sage3_pool[pi].v;
+                g_sage3_o = g_sage3_pool[pi].o;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (!g_sage3_init_fn(pkg, (int)seq, (int)heads, (int)dim, scale, 0,
+                                 0, &g_sage3_q, &g_sage3_k, &g_sage3_v,
+                                 &g_sage3_o, g_sage3_backend,
+                                 sizeof(g_sage3_backend), error, error_size)) {
+                g_sage3_failed = 1;
+                return 0;
+            }
+            if (g_sage3_npool < H3_SAGE3_POOL) {
+                g_sage3_pool[g_sage3_npool].seq = seq;
+                g_sage3_pool[g_sage3_npool].heads = heads;
+                g_sage3_pool[g_sage3_npool].dim = dim;
+                g_sage3_pool[g_sage3_npool].q = g_sage3_q;
+                g_sage3_pool[g_sage3_npool].k = g_sage3_k;
+                g_sage3_pool[g_sage3_npool].v = g_sage3_v;
+                g_sage3_pool[g_sage3_npool].o = g_sage3_o;
+                g_sage3_npool++;
+            }
+        } else if (!g_sage3_init_fn(pkg, (int)seq, (int)heads, (int)dim, scale,
+                                    0, 0, &g_sage3_q, &g_sage3_k, &g_sage3_v,
+                                    &g_sage3_o, g_sage3_backend,
+                                    sizeof(g_sage3_backend), error,
+                                    error_size)) {
+            /* Re-bind Python _STATE to this seq's tensors. */
             g_sage3_failed = 1;
             return 0;
         }
@@ -4159,11 +7488,12 @@ static int h3_cuda_sdpa_sage3_dev(h3_cuda *cuda, const __half *d_q,
         g_sage3_seq = seq;
         g_sage3_heads = heads;
         g_sage3_dim = dim;
-        fprintf(stderr,
-                "[h3] official sage3 backend=%s seq=%zu H=%zu D=%zu "
-                "layout=F16_BHTD prep=cuda_thd_bhtd scale=%.6f "
-                "(thu-ml FP4; not in-repo sage2 reference)\n",
-                g_sage3_backend, seq, heads, dim, scale);
+        if (!found)
+            fprintf(stderr,
+                    "[h3] official sage3 backend=%s seq=%zu H=%zu D=%zu "
+                    "layout=F16_BHTD prep=cuda_thd_bhtd scale=%.6f "
+                    "(thu-ml FP4; not in-repo sage2 reference)\n",
+                    g_sage3_backend, seq, heads, dim, scale);
     }
     /* DiT scratch is F16 THD; plugin buffers are F16 BHTD. */
     nblk = (unsigned)((elems + (size_t)thr - 1) / (size_t)thr);
@@ -4234,9 +7564,95 @@ static int h3_cuda_sdpa_sage3_dev(h3_cuda *cuda, const __half *d_q,
     return 1;
 }
 
+int h3_cuda_sage3_warmup(h3_cuda *cuda, size_t seq, size_t heads,
+                         size_t head_dim, float scale, char *error,
+                         size_t error_size) {
+    const char *pkg;
+    char dummy[8];
+    double t0, t1;
+    (void)dummy;
+    if (!h3_cuda_sdpa_want_sage3())
+        return 1;
+    if (g_sage3_inited && g_sage3_seq == seq && g_sage3_heads == heads &&
+        g_sage3_dim == head_dim)
+        return 1;
+    if (seq == 0 || heads == 0 || head_dim != 128) {
+        if (error && error_size)
+            snprintf(error, error_size, "sage3 warmup bad shape");
+        return 0;
+    }
+    if (cuda && !h3_cuda_bind_device(cuda, error, error_size))
+        return 0;
+    if (g_sage3_failed)
+        return 0;
+    if (!h3_sage3_load_lib(error, error_size)) {
+        g_sage3_failed = 1;
+        return 0;
+    }
+    pkg = getenv("H3_SAGE3_ROOT");
+    if (!pkg || !pkg[0]) {
+        snprintf(error, error_size, "sage3 warmup needs H3_SAGE3_ROOT");
+        return 0;
+    }
+    t0 = 0.0;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0 = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    }
+    if (g_sage3_warmup_fn) {
+        if (!g_sage3_warmup_fn(pkg, (int)seq, (int)heads, (int)head_dim, scale,
+                               0, 0, error, error_size)) {
+            g_sage3_failed = 1;
+            return 0;
+        }
+    }
+    /* Bind C pool to the tensors warmup/init just created. */
+    if (!g_sage3_inited || g_sage3_seq != seq) {
+        void *q = NULL, *k = NULL, *v = NULL, *o = NULL;
+        if (!g_sage3_init_fn(pkg, (int)seq, (int)heads, (int)head_dim, scale, 0,
+                             0, &q, &k, &v, &o, g_sage3_backend,
+                             sizeof(g_sage3_backend), error, error_size)) {
+            g_sage3_failed = 1;
+            return 0;
+        }
+        g_sage3_q = q;
+        g_sage3_k = k;
+        g_sage3_v = v;
+        g_sage3_o = o;
+        g_sage3_inited = 1;
+        g_sage3_seq = seq;
+        g_sage3_heads = heads;
+        g_sage3_dim = head_dim;
+        if (g_sage3_npool < H3_SAGE3_POOL) {
+            g_sage3_pool[g_sage3_npool].seq = seq;
+            g_sage3_pool[g_sage3_npool].heads = heads;
+            g_sage3_pool[g_sage3_npool].dim = head_dim;
+            g_sage3_pool[g_sage3_npool].q = q;
+            g_sage3_pool[g_sage3_npool].k = k;
+            g_sage3_pool[g_sage3_npool].v = v;
+            g_sage3_pool[g_sage3_npool].o = o;
+            g_sage3_npool++;
+        }
+    }
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t1 = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    }
+    fprintf(stderr,
+            "[h3] sage3 warmup seq=%zu H=%zu D=%zu ms=%.1f pool=%d "
+            "(first kernel JIT; later NFE should be ~1ms/layer)\n",
+            seq, heads, head_dim, t1 - t0, g_sage3_npool);
+    return 1;
+}
+
 int h3_cuda_sdpa_prebuild(h3_cuda *cuda, size_t seq, size_t heads,
                           size_t head_dim, float scale, int causal,
                           char *error, size_t error_size) {
+    if (h3_cuda_sdpa_want_sage3())
+        return h3_cuda_sage3_warmup(cuda, seq, heads, head_dim, scale, error,
+                                    error_size);
 #if defined(H3_HAVE_CUDNN_FRONTEND)
     size_t padded;
     int want_pad;
@@ -4317,6 +7733,41 @@ void *h3_cuda_op_stream(const h3_cuda *cuda) {
     return cuda ? (void *)cuda->op_stream : NULL;
 }
 
+int h3_cuda_cublas_use_side(h3_cuda *cuda, int on, char *error,
+                            size_t error_size) {
+    if (!cuda) {
+        h3_cuda_set_error(error, error_size, "cuda handle is NULL");
+        return 0;
+    }
+    if (on) {
+        if (!cuda->cublas_side) {
+            h3_cuda_set_error(error, error_size, "cublas_side missing");
+            return 0;
+        }
+        if (cuda->cublas_saved) {
+            h3_cuda_set_error(error, error_size, "cublas_side nested");
+            return 0;
+        }
+        cuda->cublas_saved = cuda->cublas;
+        cuda->cublas = cuda->cublas_side;
+        return 1;
+    }
+    if (cuda->cublas_saved) {
+        cuda->cublas = cuda->cublas_saved;
+        cuda->cublas_saved = NULL;
+    }
+    return 1;
+}
+
+void *h3_cuda_cublas_stream(const h3_cuda *cuda) {
+    cudaStream_t st = NULL;
+    if (!cuda || !cuda->cublas)
+        return NULL;
+    if (cublasGetStream(cuda->cublas, &st) != CUBLAS_STATUS_SUCCESS)
+        return NULL;
+    return (void *)st;
+}
+
 int h3_cuda_quiet(const h3_cuda *cuda) {
     return cuda ? (cuda->quiet || cuda->graph_capture) : 0;
 }
@@ -4354,10 +7805,25 @@ int h3_cuda_event_record_default(h3_cuda *cuda, void **out_event, char *error,
     return 1;
 }
 
+int h3_cuda_event_record(void *stream, void *event, char *error,
+                         size_t error_size) {
+    cudaError_t st;
+    if (!event) {
+        h3_cuda_set_error(error, error_size, "invalid event_record");
+        return 0;
+    }
+    st = cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream);
+    if (st != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "cudaEventRecord", st);
+        return 0;
+    }
+    return 1;
+}
+
 int h3_cuda_stream_wait_event(void *stream, void *event, char *error,
                               size_t error_size) {
     cudaError_t st;
-    if (!stream || !event) {
+    if (!event) {
         h3_cuda_set_error(error, error_size, "invalid stream_wait_event");
         return 0;
     }
@@ -4597,8 +8063,8 @@ int h3_cuda_dist_attn_configure(h3_cuda *cuda, size_t seq, size_t video_start,
 /* Single-pass online softmax; scores tile in smem. attn_window==0 → global. */
 __global__ void h3_cuda_sdpa_flash_f16_d128_kernel(
     const __half *__restrict__ Q, const __half *__restrict__ K,
-    const __half *__restrict__ V, float *__restrict__ Out, int seq, int heads,
-    float scale, int attn_window) {
+    const __half *__restrict__ V, float *__restrict__ Out, int seq, int seq_k,
+    int heads, float scale, int attn_window) {
     const int D = H3_CUDA_SDPA_F16_D;
     const int Bc = H3_CUDA_SDPA_F16_BC;
     const int RQ = H3_CUDA_SDPA_F16_RQ;
@@ -4640,21 +8106,21 @@ __global__ void h3_cuda_sdpa_flash_f16_d128_kernel(
     __syncthreads();
 
     /* CTA-uniform KV range so __syncthreads stays aligned across warps. */
-    int cta_k_lo = 0, cta_k_hi = seq;
+    int cta_k_lo = 0, cta_k_hi = seq_k;
     if (attn_window > 0) {
         cta_k_lo = q_base - attn_window;
         cta_k_hi = q_base + RQ - 1 + attn_window + 1;
         if (cta_k_lo < 0) cta_k_lo = 0;
-        if (cta_k_hi > seq) cta_k_hi = seq;
+        if (cta_k_hi > seq_k) cta_k_hi = seq_k;
     }
     const int k_lo =
         (attn_window > 0 && q_valid) ? (qi - attn_window) : 0;
     const int k_hi =
-        (attn_window > 0 && q_valid) ? (qi + attn_window + 1) : seq;
+        (attn_window > 0 && q_valid) ? (qi + attn_window + 1) : seq_k;
     int k0_start = 0;
     if (attn_window > 0) k0_start = (cta_k_lo / Bc) * Bc;
 
-    for (int k0 = k0_start; k0 < seq; k0 += Bc) {
+    for (int k0 = k0_start; k0 < seq_k; k0 += Bc) {
         if (attn_window > 0) {
             if (k0 + Bc <= cta_k_lo) continue;
             if (k0 >= cta_k_hi) break;
@@ -4668,7 +8134,7 @@ __global__ void h3_cuda_sdpa_flash_f16_d128_kernel(
             const int ki = k0 + r;
             __half2 *ks2 = reinterpret_cast<__half2 *>(Ks + idx);
             __half2 *vs2 = reinterpret_cast<__half2 *>(Vs + idx);
-            if (ki < seq) {
+            if (ki < seq_k) {
                 const size_t base =
                     ((size_t)ki * (size_t)heads + (size_t)h) * (size_t)D +
                     (size_t)d;
@@ -4682,7 +8148,7 @@ __global__ void h3_cuda_sdpa_flash_f16_d128_kernel(
         __syncthreads();
 
         if (q_valid) {
-            const int kc = (k0 + Bc <= seq) ? Bc : (seq - k0);
+            const int kc = (k0 + Bc <= seq_k) ? Bc : (seq_k - k0);
             float row_max = -FLT_MAX;
             for (int j = 0; j < kc; j++) {
                 const int ki = k0 + j;
@@ -4750,8 +8216,8 @@ enum { H3_CUDA_SDPA_TC_BR = 64, H3_CUDA_SDPA_TC_BC = 64 };
 
 __global__ void __launch_bounds__(256, 2) h3_cuda_sdpa_flash_f16_tc_d128_kernel(
     const __half *__restrict__ Q, const __half *__restrict__ K,
-    const __half *__restrict__ V, float *__restrict__ Out, int seq, int heads,
-    float scale, int attn_window) {
+    const __half *__restrict__ V, float *__restrict__ Out, int seq, int seq_k,
+    int heads, float scale, int attn_window) {
     using namespace nvcuda::wmma;
     const int D = 128;
     const int Br = H3_CUDA_SDPA_TC_BR;
@@ -4787,7 +8253,7 @@ __global__ void __launch_bounds__(256, 2) h3_cuda_sdpa_flash_f16_tc_d128_kernel(
     }
     __syncthreads();
 
-    for (int k0 = 0; k0 < seq; k0 += Bc) {
+    for (int k0 = 0; k0 < seq_k; k0 += Bc) {
         /* Window skip for whole tile when all queries share a coarse bound. */
         if (attn_window > 0) {
             int any = 0;
@@ -4797,7 +8263,7 @@ __global__ void __launch_bounds__(256, 2) h3_cuda_sdpa_flash_f16_tc_d128_kernel(
                 int lo = qi - attn_window;
                 int hi = qi + attn_window + 1;
                 if (lo < 0) lo = 0;
-                if (hi > seq) hi = seq;
+                if (hi > seq_k) hi = seq_k;
                 if (!(k0 + Bc <= lo || k0 >= hi)) {
                     any = 1;
                     break;
@@ -4810,7 +8276,7 @@ __global__ void __launch_bounds__(256, 2) h3_cuda_sdpa_flash_f16_tc_d128_kernel(
             int r = i / D;
             int d = i % D;
             int ki = k0 + r;
-            if (ki < seq) {
+            if (ki < seq_k) {
                 size_t base =
                     ((size_t)ki * (size_t)heads + (size_t)h) * (size_t)D +
                     (size_t)d;
@@ -4854,15 +8320,15 @@ __global__ void __launch_bounds__(256, 2) h3_cuda_sdpa_flash_f16_tc_d128_kernel(
         for (int i = tid; i < Br; i += blockDim.x) {
             int qi = q0 + i;
             if (qi >= seq) continue;
-            int lo = 0, hi = seq;
+            int lo = 0, hi = seq_k;
             if (attn_window > 0) {
                 lo = qi - attn_window;
                 hi = qi + attn_window + 1;
                 if (lo < 0) lo = 0;
-                if (hi > seq) hi = seq;
+                if (hi > seq_k) hi = seq_k;
             }
             float row_max = -FLT_MAX;
-            const int kc = (k0 + Bc <= seq) ? Bc : (seq - k0);
+            const int kc = (k0 + Bc <= seq_k) ? Bc : (seq_k - k0);
             for (int j = 0; j < kc; j++) {
                 int ki = k0 + j;
                 float s = Ss[i * Bc + j] * scale;
@@ -5882,8 +9348,13 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
      * aligned seq so a raw→pad retry does not realloc under the kernel. */
     {
         size_t half_n = elems * 3;
+        int sol_only = 0;
 #if defined(H3_HAVE_CUDNN_FRONTEND)
-        if (h3_cuda_sdpa_want_cudnn()) {
+        sol_only = h3_cuda_sdpa_want_sol_cute() &&
+                   !h3_sol_cute_should_skip_seq(seq) &&
+                   h3_sol_cute_dense_steps() == 0 &&
+                   h3_sol_cute_dense_layers() == 0;
+        if (h3_cuda_sdpa_want_cudnn() && !sol_only) {
             size_t padded = h3_cuda_sdpa_cudnn_align_seq(seq);
             size_t pe = padded * heads * head_dim;
             half_n = pe * 4;
@@ -5892,18 +9363,18 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
         if (!h3_cuda_ensure_scratch(cuda, half_n * sizeof(__half), error,
                                     error_size))
             return 0;
-    }
-    {
-        char *base = (char *)cuda->d_sdpa_scratch;
-        size_t stride = elems;
+        {
+            char *base = (char *)cuda->d_sdpa_scratch;
+            size_t stride = elems;
 #if defined(H3_HAVE_CUDNN_FRONTEND)
-        if (h3_cuda_sdpa_want_cudnn() &&
-            h3_cuda_sdpa_cudnn_want_padded(seq, heads, head_dim, 0))
-            stride = h3_cuda_sdpa_cudnn_align_seq(seq) * heads * head_dim;
+            if (!sol_only && h3_cuda_sdpa_want_cudnn() &&
+                h3_cuda_sdpa_cudnn_want_padded(seq, heads, head_dim, 0))
+                stride = h3_cuda_sdpa_cudnn_align_seq(seq) * heads * head_dim;
 #endif
-        d_qh = (__half *)base;
-        d_kh = d_qh + stride;
-        d_vh = d_kh + stride;
+            d_qh = (__half *)base;
+            d_kh = d_qh + stride;
+            d_vh = d_kh + stride;
+        }
     }
 
     if (h3_cuda_want_events(cuda)) {
@@ -5953,7 +9424,17 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
         (void)thr;
 
         if (!h3_cuda_dist_attn_active() && h3_cuda_sdpa_want_sol_cute() &&
-            head_dim == (size_t)H3_CUDA_SDPA_F16_D && seq >= 4096) {
+            head_dim == (size_t)H3_CUDA_SDPA_F16_D && seq >= 4096 &&
+            h3_sol_cute_should_skip_seq(seq) && !g_sol_cute_skip_logged) {
+            fprintf(stderr,
+                    "[h3] sol_cute skip seq=%zu max_seq=%zu skip_from=%zu "
+                    "(hires cudnn mixed arm)\n",
+                    seq, h3_sol_cute_max_seq(), g_sol_cute_skip_from);
+            g_sol_cute_skip_logged = 1;
+        }
+        if (!h3_cuda_dist_attn_active() && h3_cuda_sdpa_want_sol_cute() &&
+            head_dim == (size_t)H3_CUDA_SDPA_F16_D && seq >= 4096 &&
+            !h3_sol_cute_should_skip_seq(seq)) {
             int layer = g_sol_cute_layer++;
             int dense = (g_sol_cute_step < h3_sol_cute_dense_steps()) ||
                         (layer < h3_sol_cute_dense_layers());
@@ -6047,14 +9528,17 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
             qkv_pad = h3_cuda_sdpa_cudnn_want_padded(seq, heads, head_dim, 0);
             blocked = h3_cuda_sdpa_cudnn_shape_blocked(seq, heads, head_dim, 0);
 #endif
+            g_cudnn_want++;
             if (h3_cuda_sdpa_cudnn_dev(cuda, d_qh, d_kh, d_vh, d_o, seq, heads,
                                        head_dim, scale, 0, qkv_pad, cudnn_ms,
                                        error, error_size)) {
                 backend = h3_cuda_dist_attn_active() ? "cuda_cudnn_sdpa_dist"
                                                      : "cuda_cudnn_sdpa";
+                g_cudnn_hits++;
                 ok = 1;
                 goto timed_done;
             }
+            g_cudnn_fallback++;
             /* First failure is logged inside the plan cache. Do not reprint
              * 400× for the same shape; still fall through to flash. */
             if (h3_cuda_dist_attn_active()) g_dist_cudnn_fail = 1;
@@ -6121,7 +9605,7 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
             }
             h3_cuda_sdpa_flash_f16_tc_d128_kernel<<<grid, 256, smem,
                                                     h3_cuda_op_st(cuda)>>>(
-                d_qh, d_kh, d_vh, d_o, (int)seq, (int)heads, scale,
+                d_qh, d_kh, d_vh, d_o, (int)seq, (int)seq, (int)heads, scale,
                 attn_window);
             backend = attn_window > 0 ? "cuda_flash_f16_tc_win"
                                       : "cuda_flash_f16_tc";
@@ -6149,7 +9633,7 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
             dim3 block(32, H3_CUDA_SDPA_F16_RQ, 1);
             h3_cuda_sdpa_flash_f16_d128_kernel<<<grid, block, smem,
                                                 h3_cuda_op_st(cuda)>>>(
-                d_qh, d_kh, d_vh, d_o, (int)seq, (int)heads, scale,
+                d_qh, d_kh, d_vh, d_o, (int)seq, (int)seq, (int)heads, scale,
                 attn_window);
             backend = attn_window > 0 ? "cuda_flash_f16_win" : "cuda_flash_f16";
         } else {
@@ -6213,6 +9697,7 @@ static int h3_cuda_sdpa_f16_launch_dev_ex(
         else
             snprintf(backend_out, backend_out_size, "%s", backend);
     }
+    h3_sdpa_note_backend(backend);
     ok = 1;
     goto cleanup;
 
@@ -6242,6 +9727,7 @@ timed_done:
         else
             snprintf(backend_out, backend_out_size, "%s", backend);
     }
+    h3_sdpa_note_backend(backend);
 
 cleanup:
     if (ev0) cudaEventDestroy(ev0);
@@ -6713,6 +10199,53 @@ __global__ void h3_cuda_gate_kernel(const float *__restrict__ residual,
     float g =
         modulation[(size_t)mrow * slots * width + gate_slot * width + c];
     out[idx] = residual[idx] + branch[idx] * g;
+}
+
+/* R31: write gated residual then AdaLN(gated) in one row-parallel launch. */
+__global__ void h3_cuda_gate_adaln_kernel(
+    const float *__restrict__ residual, const float *__restrict__ branch,
+    const float *__restrict__ norm_w, const float *__restrict__ modulation,
+    const uint32_t *__restrict__ row_map, float *__restrict__ gated,
+    float *__restrict__ normed, size_t rows, size_t width, size_t slots,
+    size_t gate_slot, size_t shift_slot, size_t scale_slot, float epsilon) {
+    size_t r = (size_t)blockIdx.x;
+    size_t c;
+    if (r >= rows) return;
+    uint32_t mrow = row_map ? row_map[r] : (uint32_t)r;
+    const float *mod_base = modulation + (size_t)mrow * slots * width;
+    const float *gate = mod_base + gate_slot * width;
+    const float *shift = mod_base + shift_slot * width;
+    const float *scale = mod_base + scale_slot * width;
+    const float *res = residual + r * width;
+    const float *br = branch + r * width;
+    float *gr = gated + r * width;
+    float *nr = normed + r * width;
+    float sum = 0.0f;
+    for (c = threadIdx.x; c < width; c += blockDim.x) {
+        float v = res[c] + br[c] * gate[c];
+        gr[c] = v;
+        sum += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    __shared__ float warp_sums[32];
+    __shared__ float ssum;
+    int warp = (int)(threadIdx.x >> 5);
+    int lane = (int)(threadIdx.x & 31);
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int nwarps = ((int)blockDim.x + 31) >> 5;
+        for (int w = 0; w < nwarps; w++) total += warp_sums[w];
+        ssum = total;
+    }
+    __syncthreads();
+    float inv = rsqrtf(ssum / (float)width + epsilon);
+    for (c = threadIdx.x; c < width; c += blockDim.x) {
+        float n = gr[c] * inv * norm_w[c];
+        nr[c] = n * (1.0f + scale[c]) + shift[c];
+    }
 }
 
 __global__ void h3_cuda_swiglu_kernel(const float *__restrict__ fused,
@@ -7432,6 +10965,48 @@ int h3_cuda_gate_f32_dev(h3_cuda *cuda, const float *d_residual,
     return 1;
 }
 
+int h3_cuda_gate_adaln_f32_dev(
+    h3_cuda *cuda, const float *d_residual, const float *d_branch,
+    const float *d_norm_w, const float *d_modulation,
+    const uint32_t *d_row_map, size_t rows, size_t width, size_t slots,
+    size_t gate_slot, size_t shift_slot, size_t scale_slot, float epsilon,
+    float *d_gated, float *d_normed, double *op_ms, char *error,
+    size_t error_size) {
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    if (op_ms) *op_ms = 0.0;
+    if (!cuda || !d_residual || !d_branch || !d_norm_w || !d_modulation ||
+        !d_gated || !d_normed || rows == 0 || width == 0 || slots == 0) {
+        h3_cuda_set_error(error, error_size, "invalid gate_adaln_dev args");
+        return 0;
+    }
+    if (!h3_cuda_op_begin(cuda, &ev0, &ev1, error, error_size)) return 0;
+    if (ev0 && cudaEventRecord(ev0, 0) != cudaSuccess) {
+        h3_cuda_set_error(error, error_size, "gate_adaln_dev event");
+        if (ev0) cudaEventDestroy(ev0);
+        if (ev1) cudaEventDestroy(ev1);
+        return 0;
+    }
+    h3_cuda_gate_adaln_kernel<<<(unsigned)rows, 256, 0, h3_cuda_op_st(cuda)>>>(
+        d_residual, d_branch, d_norm_w, d_modulation, d_row_map, d_gated,
+        d_normed, rows, width, slots, gate_slot, shift_slot, scale_slot,
+        epsilon);
+    if (cudaGetLastError() != cudaSuccess ||
+        !h3_cuda_op_end(ev0, ev1, op_ms, error, error_size)) {
+        h3_cuda_set_error(error, error_size, "gate_adaln_dev kernel");
+        if (ev0) cudaEventDestroy(ev0);
+        if (ev1) cudaEventDestroy(ev1);
+        return 0;
+    }
+    if (op_ms) {
+        h3_sp_add(&g_sp_step.gate, &g_sp_tot.gate, *op_ms);
+        h3_sp_add_n(&g_sp_step.adaln, &g_sp_tot.adaln, &g_sp_step.n_adaln,
+                    &g_sp_tot.n_adaln, *op_ms);
+    }
+    if (ev0) cudaEventDestroy(ev0);
+    if (ev1) cudaEventDestroy(ev1);
+    return 1;
+}
+
 int h3_cuda_swiglu_f32_dev(h3_cuda *cuda, const float *d_fused, size_t rows,
                            size_t width, float *d_out, double *op_ms,
                            char *error, size_t error_size) {
@@ -7481,13 +11056,12 @@ int h3_cuda_ffn_swiglu_i8_dev(
         backend_out, backend_out_size, error, error_size);
 }
 
-int h3_cuda_qkv_rope_f32_dev(h3_cuda *cuda, const float *d_qkv,
-                             const float *d_q_norm, const float *d_k_norm,
-                             const float *d_rope_cos, const float *d_rope_sin,
-                             size_t seq, size_t heads, size_t head_dim,
-                             size_t rope_half, float epsilon, float *d_query,
-                             float *d_key, float *d_value, double *op_ms,
-                             char *error, size_t error_size) {
+int h3_cuda_qkv_rope_f32_dev_layout(
+    h3_cuda *cuda, const float *d_qkv, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
+    int grouped, int split_half, float *d_query, float *d_key, float *d_value,
+    double *op_ms, char *error, size_t error_size) {
     cudaEvent_t ev0 = NULL, ev1 = NULL;
     if (op_ms) *op_ms = 0.0;
     if (!cuda || !d_qkv || !d_q_norm || !d_k_norm || !d_rope_cos ||
@@ -7508,8 +11082,6 @@ int h3_cuda_qkv_rope_f32_dev(h3_cuda *cuda, const float *d_qkv,
     }
     {
         dim3 grid((unsigned)heads, (unsigned)seq, 1);
-        int grouped = h3_cuda_dit_qkv_grouped();
-        int split_half = h3_cuda_dit_rope_split_half();
         h3_cuda_qkv_rope_kernel<<<grid, 128>>>(
             d_qkv, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, d_query, d_key,
             d_value, seq, heads, head_dim, rope_half, epsilon, grouped,
@@ -7525,6 +11097,20 @@ int h3_cuda_qkv_rope_f32_dev(h3_cuda *cuda, const float *d_qkv,
     if (ev0) cudaEventDestroy(ev0);
     if (ev1) cudaEventDestroy(ev1);
     return 1;
+}
+
+int h3_cuda_qkv_rope_f32_dev(h3_cuda *cuda, const float *d_qkv,
+                             const float *d_q_norm, const float *d_k_norm,
+                             const float *d_rope_cos, const float *d_rope_sin,
+                             size_t seq, size_t heads, size_t head_dim,
+                             size_t rope_half, float epsilon, float *d_query,
+                             float *d_key, float *d_value, double *op_ms,
+                             char *error, size_t error_size) {
+    return h3_cuda_qkv_rope_f32_dev_layout(
+        cuda, d_qkv, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, seq, heads,
+        head_dim, rope_half, epsilon, h3_cuda_dit_qkv_grouped(),
+        h3_cuda_dit_rope_split_half(), d_query, d_key, d_value, op_ms, error,
+        error_size);
 }
 
 __global__ void h3_cuda_qkv_rope_split_half_kernel(
@@ -7648,6 +11234,239 @@ int h3_cuda_qkv_rope_split_half_f32_dev(
     return 1;
 }
 
+/* ---- Layer-wise KV extras (TaoMate clean-KV; Q stays current seq) ---- */
+static const void *g_kvcat_k = NULL;
+static const void *g_kvcat_v = NULL;
+static size_t g_kvcat_n = 0;
+static void *g_kvsave_k = NULL;
+static void *g_kvsave_v = NULL;
+static const uint32_t *g_kvsave_idx = NULL;
+static size_t g_kvsave_n = 0;
+
+extern "C" void h3_cuda_sdpa_bind_kvcat(const void *d_k_hist, const void *d_v_hist,
+                                        size_t hist_n) {
+    g_kvcat_k = d_k_hist;
+    g_kvcat_v = d_v_hist;
+    g_kvcat_n = hist_n;
+}
+
+extern "C" void h3_cuda_sdpa_bind_kvsave(void *d_k_save, void *d_v_save,
+                                         const uint32_t *d_idx, size_t save_n) {
+    g_kvsave_k = d_k_save;
+    g_kvsave_v = d_v_save;
+    g_kvsave_idx = d_idx;
+    g_kvsave_n = save_n;
+}
+
+extern "C" void h3_cuda_sdpa_clear_kvext(void) {
+    g_kvcat_k = NULL;
+    g_kvcat_v = NULL;
+    g_kvcat_n = 0;
+    g_kvsave_k = NULL;
+    g_kvsave_v = NULL;
+    g_kvsave_idx = NULL;
+    g_kvsave_n = 0;
+}
+
+extern "C" void h3_cuda_sdpa_set_kvpad(size_t seq) { (void)seq; }
+
+__global__ void h3_f16_gather_thd_rows_kernel(
+    const __half *__restrict__ src, __half *__restrict__ dst,
+    const uint32_t *__restrict__ idx, size_t n_idx, size_t stride, size_t row) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t n = n_idx * row;
+    size_t r, c, src_r;
+    if (i >= n) return;
+    r = i / row;
+    c = i - r * row;
+    src_r = (size_t)idx[r];
+    dst[i] = src[src_r * stride + c];
+}
+
+__global__ void h3_f16_cat_pad_qkv_kernel(
+    const __half *__restrict__ q, const __half *__restrict__ k,
+    const __half *__restrict__ v, size_t seq, size_t stride,
+    const __half *__restrict__ k_hist, const __half *__restrict__ v_hist,
+    size_t hist_n, __half *__restrict__ q_dst, __half *__restrict__ k_dst,
+    __half *__restrict__ v_dst, size_t kv_seq, size_t row) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t n = kv_seq * row;
+    size_t t, c, hist_t;
+    if (i >= n) return;
+    t = i / row;
+    c = i - t * row;
+    if (t < seq) {
+        size_t s = t * stride + c;
+        q_dst[i] = q[s];
+        k_dst[i] = k[s];
+        v_dst[i] = v[s];
+        return;
+    }
+    q_dst[i] = __float2half(0.0f);
+    hist_t = t - seq;
+    if (hist_t < hist_n && k_hist && v_hist) {
+        k_dst[i] = k_hist[hist_t * row + c];
+        v_dst[i] = v_hist[hist_t * row + c];
+    } else {
+        k_dst[i] = __float2half(0.0f);
+        v_dst[i] = __float2half(0.0f);
+    }
+}
+
+/* Compact [current K/V | hist K/V]. Q stays length `seq` (no zero pad). */
+__global__ void h3_f16_cat_kv_kernel(
+    const __half *__restrict__ k, const __half *__restrict__ v, size_t seq,
+    size_t stride, const __half *__restrict__ k_hist,
+    const __half *__restrict__ v_hist, size_t hist_n, __half *__restrict__ k_dst,
+    __half *__restrict__ v_dst, size_t row) {
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t n = (seq + hist_n) * row;
+    size_t t, c, hist_t;
+    if (i >= n) return;
+    t = i / row;
+    c = i - t * row;
+    if (t < seq) {
+        size_t s = t * stride + c;
+        k_dst[i] = k[s];
+        v_dst[i] = v[s];
+        return;
+    }
+    hist_t = t - seq;
+    k_dst[i] = k_hist[hist_t * row + c];
+    v_dst[i] = v_hist[hist_t * row + c];
+}
+
+/* Rectangular flash: Q=seq, K/V=seq_k. Sage3 is square-only; do not pad Q. */
+static int h3_cuda_sdpa_rect_f16(
+    h3_cuda *cuda, const __half *d_qh, const __half *d_kh, const __half *d_vh,
+    __half *d_o_half, float *d_o, size_t seq, size_t seq_k, size_t heads,
+    size_t head_dim, float scale, int attn_window, double *sdpa_ms,
+    char *backend_out, size_t backend_out_size, char *error,
+    size_t error_size) {
+    cudaError_t status;
+    static int smem_tc[16];
+    static int cudnn_fail;
+    int smem_dev;
+    const char *backend = "cuda_flash_f16_tc_rect";
+    cudaEvent_t ev0 = NULL, ev1 = NULL;
+    float elapsed = 0.0f;
+    size_t smem;
+    unsigned q_tiles;
+    dim3 grid;
+
+    if (sdpa_ms) *sdpa_ms = 0.0;
+    if (!cuda || !d_qh || !d_kh || !d_vh || !d_o || seq == 0 || seq_k == 0 ||
+        heads == 0 || head_dim != (size_t)H3_CUDA_SDPA_F16_D) {
+        h3_cuda_set_error(error, error_size, "invalid rect sdpa args");
+        return 0;
+    }
+    if (attn_window < 0) attn_window = 0;
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    smem_dev = cuda->device_index;
+    if (smem_dev < 0 || smem_dev >= 16) smem_dev = 0;
+
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    if (!cudnn_fail && d_o_half && cuda->cudnn_ok && attn_window == 0) {
+        char local[256];
+        local[0] = '\0';
+        if (cudnnSetStream(cuda->cudnn, h3_cuda_op_st(cuda)) ==
+            CUDNN_STATUS_SUCCESS) {
+            if (h3_cuda_sdpa_cudnn_f16_run_rect(
+                    (void *)cuda->cudnn, d_qh, d_kh, d_vh, d_o_half, d_o, seq,
+                    seq_k, heads, head_dim, scale, sdpa_ms, local,
+                    sizeof(local))) {
+                backend = "cuda_cudnn_sdpa_rect";
+                if (backend_out && backend_out_size)
+                    snprintf(backend_out, backend_out_size, "%s", backend);
+                {
+                    static int logged;
+                    if (!logged) {
+                        fprintf(stderr,
+                                "[h3] layer-kv rect sdpa seq_q=%zu seq_k=%zu "
+                                "backend=%s (Q unpadded; sage3 skipped)\n",
+                                seq, seq_k, backend);
+                        logged = 1;
+                    }
+                }
+                return 1;
+            }
+        }
+        fprintf(stderr, "[h3] cudnn rect fallback seq_q=%zu seq_k=%zu: %s\n",
+                seq, seq_k, local[0] ? local : "(no msg)");
+        cudnn_fail = 1;
+        if (error && error_size) error[0] = '\0';
+        {
+            const char *allow_tc = getenv("H3_LAYER_KV_ALLOW_TC");
+            if (!allow_tc || allow_tc[0] != '1') {
+                h3_cuda_set_error(error, error_size,
+                                  local[0] ? local : "cudnn rect sdpa failed");
+                return 0;
+            }
+        }
+    }
+#else
+    (void)d_o_half;
+#endif
+
+    smem = (size_t)(H3_CUDA_SDPA_TC_BR + 2 * H3_CUDA_SDPA_TC_BC) *
+               (size_t)H3_CUDA_SDPA_F16_D * sizeof(__half) +
+           (size_t)H3_CUDA_SDPA_TC_BR * (size_t)H3_CUDA_SDPA_F16_D *
+               sizeof(float) +
+           (size_t)H3_CUDA_SDPA_TC_BR * 2 * sizeof(float) +
+           (size_t)H3_CUDA_SDPA_TC_BR * (size_t)H3_CUDA_SDPA_TC_BC *
+               sizeof(float);
+    if (!smem_tc[smem_dev]) {
+        status = cudaFuncSetAttribute(
+            h3_cuda_sdpa_flash_f16_tc_d128_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "rect tc smem", status);
+            return 0;
+        }
+        smem_tc[smem_dev] = 1;
+    }
+    if (h3_cuda_want_events(cuda)) {
+        cudaEventCreate(&ev0);
+        cudaEventCreate(&ev1);
+        if (ev0) cudaEventRecord(ev0, h3_cuda_op_st(cuda));
+    }
+    q_tiles = (unsigned)((seq + (size_t)H3_CUDA_SDPA_TC_BR - 1) /
+                         (size_t)H3_CUDA_SDPA_TC_BR);
+    grid = dim3((unsigned)heads, q_tiles, 1);
+    h3_cuda_sdpa_flash_f16_tc_d128_kernel<<<grid, 256, smem,
+                                            h3_cuda_op_st(cuda)>>>(
+        d_qh, d_kh, d_vh, d_o, (int)seq, (int)seq_k, (int)heads, scale,
+        attn_window);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        if (ev0) cudaEventDestroy(ev0);
+        if (ev1) cudaEventDestroy(ev1);
+        h3_cuda_set_error_cuda(error, error_size, "rect sdpa kernel", status);
+        return 0;
+    }
+    if (ev0 && ev1) {
+        cudaEventRecord(ev1, h3_cuda_op_st(cuda));
+        cudaEventSynchronize(ev1);
+        if (cudaEventElapsedTime(&elapsed, ev0, ev1) == cudaSuccess && sdpa_ms)
+            *sdpa_ms = (double)elapsed;
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+    }
+    if (backend_out && backend_out_size)
+        snprintf(backend_out, backend_out_size, "%s", backend);
+    {
+        static int logged;
+        if (!logged) {
+            fprintf(stderr,
+                    "[h3] layer-kv rect sdpa seq_q=%zu seq_k=%zu backend=%s "
+                    "(Q unpadded; sage3 skipped)\n",
+                    seq, seq_k, backend);
+            logged = 1;
+        }
+    }
+    return 1;
+}
+
 /* RoPE → FP16 scratch + SDPA (skips f32 QKV materialize + cast). */
 int h3_cuda_qkv_rope_sdpa_f16_dev_layout(
     h3_cuda *cuda, const float *d_qkv, const float *d_q_norm,
@@ -7659,6 +11478,7 @@ int h3_cuda_qkv_rope_sdpa_f16_dev_layout(
     __half *d_qh, *d_kh, *d_vh;
     size_t elems;
     size_t seq_padded = seq;
+    size_t tok_stride;
     cudaError_t status;
 
     if (rope_ms) *rope_ms = 0.0;
@@ -7673,6 +11493,7 @@ int h3_cuda_qkv_rope_sdpa_f16_dev_layout(
         return 0;
     }
     elems = seq * heads * head_dim;
+    tok_stride = heads * head_dim;
     {
         size_t half_n = elems * 3;
         size_t stride = elems;
@@ -7728,10 +11549,271 @@ int h3_cuda_qkv_rope_sdpa_f16_dev_layout(
         }
     }
 
+    if (g_kvsave_n && g_kvsave_idx && g_kvsave_k && g_kvsave_v) {
+        size_t row = heads * head_dim;
+        size_t n = g_kvsave_n * row;
+        unsigned nblk = (unsigned)((n + 255u) / 256u);
+        if (nblk == 0) nblk = 1;
+        h3_f16_gather_thd_rows_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_kh, (__half *)g_kvsave_k, g_kvsave_idx, g_kvsave_n, tok_stride,
+            row);
+        h3_f16_gather_thd_rows_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_vh, (__half *)g_kvsave_v, g_kvsave_idx, g_kvsave_n, tok_stride,
+            row);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "kvsave gather", status);
+            return 0;
+        }
+    }
+
+    if (g_kvcat_n > 0 && g_kvcat_k && g_kvcat_v) {
+        size_t row = heads * head_dim;
+        size_t kv_seq = seq + g_kvcat_n;
+        size_t kv_elems = kv_seq * row;
+        size_t q_elems = seq * row;
+        size_t cat_bytes =
+            kv_elems * 2u * sizeof(__half) + q_elems * sizeof(__half);
+        __half *k_cat, *v_cat, *o_half;
+        unsigned nblk;
+        /* Do not pad Q to kv_seq / sage3 square. Zero Q wrecks FP4. */
+        if (!h3_cuda_ensure_expand(cuda, cat_bytes, error, error_size))
+            return 0;
+        k_cat = (__half *)cuda->d_sdpa_expand;
+        v_cat = k_cat + kv_elems;
+        o_half = v_cat + kv_elems;
+        nblk = (unsigned)((kv_elems + 255u) / 256u);
+        if (nblk == 0) nblk = 1;
+        h3_f16_cat_kv_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_kh, d_vh, seq, tok_stride, (const __half *)g_kvcat_k,
+            (const __half *)g_kvcat_v, g_kvcat_n, k_cat, v_cat, row);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "kvcat kv", status);
+            return 0;
+        }
+        if (!h3_cuda_sdpa_rect_f16(cuda, d_qh, k_cat, v_cat, o_half, d_attn_out,
+                                   seq, kv_seq, heads, head_dim, scale,
+                                   attn_window, sdpa_ms, backend_out,
+                                   backend_out_size, error, error_size))
+            return 0;
+        return 1;
+    }
+
     return h3_cuda_sdpa_f16_launch_dev_ex(
         cuda, NULL, NULL, NULL, seq, heads, head_dim, scale, attn_window,
         d_attn_out, sdpa_ms, backend_out, backend_out_size, error, error_size,
         1);
+}
+
+static char g_vae_sdpa_backend[32] = "";
+
+extern "C" const char *h3_cuda_vae_sdpa_last_backend(void) {
+    return g_vae_sdpa_backend[0] ? g_vae_sdpa_backend : "unknown";
+}
+
+int h3_cuda_qkv_rope_sdpa_f16_dev_layout_nb(
+    h3_cuda *cuda, const float *d_qkv, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t n_batch, size_t heads, size_t head_dim, size_t rope_half,
+    float epsilon, float scale, int grouped, int split_half, float *d_attn_out,
+    char *error, size_t error_size) {
+    __half *d_qh, *d_kh, *d_vh, *d_oh;
+    size_t padded = seq;
+    size_t pe, half_n, bi;
+    size_t inner = heads * head_dim;
+    cudaError_t status;
+    int mask = 0;
+    static int logged_nb;
+
+    if (!cuda || !d_qkv || !d_q_norm || !d_k_norm || !d_rope_cos ||
+        !d_rope_sin || !d_attn_out || seq == 0 || n_batch == 0 || heads == 0 ||
+        head_dim == 0) {
+        h3_cuda_set_error(error, error_size, "invalid qkv_rope_sdpa_nb args");
+        return 0;
+    }
+    if (n_batch == 1) {
+        snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend), "cudnn");
+        return h3_cuda_qkv_rope_sdpa_f16_dev_layout(
+            cuda, d_qkv, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, seq, heads,
+            head_dim, rope_half, epsilon, scale, 0, grouped, split_half,
+            d_attn_out, NULL, NULL, NULL, 0, error, error_size);
+    }
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    if (!cuda->cudnn_ok || !h3_cuda_sdpa_want_cudnn())
+        goto fallback_loop;
+    if (!h3_cuda_bind(cuda, error, error_size))
+        goto fallback_loop;
+    if (cuda->cudnn &&
+        cudnnSetStream(cuda->cudnn, h3_cuda_op_st(cuda)) !=
+            CUDNN_STATUS_SUCCESS)
+        goto fallback_loop;
+    padded = h3_cuda_sdpa_cudnn_align_seq(seq);
+    mask = (padded > seq) ? 1 : 0;
+    pe = padded * inner;
+    half_n = n_batch * pe * 4;
+    if (!h3_cuda_ensure_scratch(cuda, half_n * sizeof(__half), error,
+                                error_size))
+        goto fallback_loop;
+    d_qh = (__half *)cuda->d_sdpa_scratch;
+    d_kh = d_qh + n_batch * pe;
+    d_vh = d_kh + n_batch * pe;
+    d_oh = d_vh + n_batch * pe;
+    for (bi = 0; bi < n_batch; bi++) {
+        const float *qkv_b = d_qkv + bi * seq * inner * 3;
+        dim3 grid((unsigned)heads, (unsigned)padded, 1);
+        h3_cuda_qkv_rope_f16_kernel<<<grid, 128, 0, h3_cuda_op_st(cuda)>>>(
+            qkv_b, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, d_qh + bi * pe,
+            d_kh + bi * pe, d_vh + bi * pe, seq, padded, heads, head_dim,
+            rope_half, epsilon, grouped, split_half);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "qkv_rope_f16_nb", status);
+            goto fallback_loop;
+        }
+    }
+    if (h3_cuda_sdpa_cudnn_f16_run_batched(
+            (void *)cuda->cudnn, d_qh, d_kh, d_vh, d_oh, d_attn_out, padded,
+            heads, head_dim, scale, 0, seq, mask, n_batch, NULL, error,
+            error_size)) {
+        snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend),
+                 "cudnn_batched");
+        if (!logged_nb) {
+            fprintf(stderr,
+                    "vae_sdpa: backend=cudnn_batched batch=%zu seq=%zu "
+                    "heads=%zu d=%zu pad=%zu (tile-local RoPE)\n",
+                    n_batch, seq, heads, head_dim, padded);
+            logged_nb = 1;
+        }
+        return 1;
+    }
+    if (h3_sdpa_vae_batched_fail_hard()) {
+        snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend), "fail");
+        fprintf(stderr,
+                "vae_sdpa_strict: FAIL reason=cudnn_batched batch=%zu seq=%zu "
+                "heads=%zu\n",
+                n_batch, seq, heads);
+        h3_cuda_set_error(error, error_size,
+                          "vae_sdpa_strict: cudnn_batched failed");
+        return 0;
+    }
+    if (error && error_size) error[0] = '\0';
+    snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend), "cudnn_loop");
+    if (!logged_nb) {
+        fprintf(stderr, "vae_sdpa: backend=cudnn_loop batch=%zu seq=%zu\n",
+                n_batch, seq);
+        logged_nb = 1;
+    }
+fallback_loop:
+    cudaStreamSynchronize(h3_cuda_op_st(cuda));
+#endif
+    snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend), "cudnn_loop");
+    for (bi = 0; bi < n_batch; bi++) {
+        const float *qkv_b = d_qkv + bi * seq * inner * 3;
+        float *attn_b = d_attn_out + bi * seq * inner;
+        if (!h3_cuda_qkv_rope_sdpa_f16_dev_layout(
+                cuda, qkv_b, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, seq,
+                heads, head_dim, rope_half, epsilon, scale, 0, grouped,
+                split_half, attn_b, NULL, NULL, NULL, 0, error, error_size))
+            return 0;
+    }
+    return 1;
+}
+
+extern "C" int h3_cuda_vae_qkv_rope_sdpa_f16io_dev_layout_nb(
+    h3_cuda *cuda, const void *d_qkv_half, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t n_batch, size_t heads, size_t head_dim, size_t rope_half,
+    float epsilon, float scale, int grouped, int split_half, void *d_attn_half,
+    char *error, size_t error_size) {
+    __half *d_qh, *d_kh, *d_vh, *d_oh;
+    size_t padded = seq;
+    size_t pe, half_n, bi;
+    size_t inner = heads * head_dim;
+    static int logged_nb;
+    void *st;
+
+    if (!cuda || !d_qkv_half || !d_q_norm || !d_k_norm || !d_rope_cos ||
+        !d_rope_sin || !d_attn_half || seq == 0 || n_batch == 0 || heads == 0 ||
+        head_dim == 0) {
+        h3_cuda_set_error(error, error_size, "invalid vae sdpa f16io");
+        return 0;
+    }
+    st = (void *)h3_cuda_op_st(cuda);
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+    if (!cuda->cudnn_ok || !h3_cuda_sdpa_want_cudnn())
+        goto fail_hard;
+    if (!h3_cuda_bind(cuda, error, error_size))
+        goto fail_hard;
+    if (cuda->cudnn &&
+        cudnnSetStream(cuda->cudnn, h3_cuda_op_st(cuda)) != CUDNN_STATUS_SUCCESS)
+        goto fail_hard;
+    padded = h3_cuda_sdpa_cudnn_align_seq(seq);
+    pe = padded * inner;
+    half_n = n_batch * pe * 4;
+    if (!h3_cuda_ensure_scratch(cuda, half_n * sizeof(__half), error,
+                                error_size))
+        goto fail_hard;
+    d_qh = (__half *)cuda->d_sdpa_scratch;
+    d_kh = d_qh + n_batch * pe;
+    d_vh = d_kh + n_batch * pe;
+    d_oh = d_vh + n_batch * pe;
+    for (bi = 0; bi < n_batch; bi++) {
+        const void *qkv_b =
+            (const char *)d_qkv_half + bi * seq * inner * 3 * 2;
+        if (!h3_cuda_vae_launch_qkv_rope_f16_in(
+                qkv_b, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin,
+                d_qh + bi * pe, d_kh + bi * pe, d_vh + bi * pe, seq, padded,
+                heads, head_dim, rope_half, epsilon, grouped, split_half, st,
+                error, error_size))
+            goto fail_hard;
+    }
+    if (h3_cuda_sdpa_cudnn_f16_run_batched(
+            (void *)cuda->cudnn, d_qh, d_kh, d_vh, d_oh, NULL, padded, heads,
+            head_dim, scale, 0, seq, (padded > seq) ? 1 : 0, n_batch, NULL,
+            error, error_size)) {
+        if (!h3_cuda_vae_launch_f16_unpad(d_oh, d_attn_half, n_batch, seq,
+                                          padded, inner, st, error,
+                                          error_size))
+            return 0;
+        snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend),
+                 "cudnn_batched");
+        if (!logged_nb) {
+            fprintf(stderr,
+                    "vae_sdpa: backend=cudnn_batched batch=%zu seq=%zu "
+                    "heads=%zu d=%zu pad=%zu (tile-local RoPE f16io)\n",
+                    n_batch, seq, heads, head_dim, padded);
+            logged_nb = 1;
+        }
+        return 1;
+    }
+fail_hard:
+    if (h3_sdpa_vae_batched_fail_hard()) {
+        snprintf(g_vae_sdpa_backend, sizeof(g_vae_sdpa_backend), "fail");
+        fprintf(stderr,
+                "vae_sdpa_strict: FAIL reason=cudnn_batched batch=%zu seq=%zu "
+                "heads=%zu\n",
+                n_batch, seq, heads);
+        h3_cuda_set_error(error, error_size,
+                          "vae_sdpa_strict: cudnn_batched failed");
+        return 0;
+    }
+    h3_cuda_set_error(error, error_size, "vae sdpa f16io requires cudnn_batched");
+    return 0;
+#else
+    (void)st;
+    (void)d_qh;
+    (void)d_kh;
+    (void)d_vh;
+    (void)d_oh;
+    (void)pe;
+    (void)half_n;
+    (void)bi;
+    (void)padded;
+    (void)logged_nb;
+    h3_cuda_set_error(error, error_size, "vae sdpa f16io needs cuDNN");
+    return 0;
+#endif
 }
 
 int h3_cuda_qkv_rope_sdpa_f16_dev(
@@ -7891,9 +11973,13 @@ int h3_cuda_rms_norm_f32_dev(h3_cuda *cuda, const float *d_x, const float *d_w,
     }
     h3_cuda_rms_norm_kernel<<<(unsigned)rows, 256>>>(d_x, d_w, d_out, rows,
                                                      width, eps);
-    if (cudaGetLastError() != cudaSuccess) {
-        h3_cuda_set_error(error, error_size, "rms_norm_dev kernel");
-        return 0;
+    /* During CUDA graph capture GetLastError is not a launch-fail signal. */
+    if (!cuda->graph_capture) {
+        cudaError_t st = cudaGetLastError();
+        if (st != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "rms_norm_dev kernel", st);
+            return 0;
+        }
     }
     return 1;
 }
@@ -8035,7 +12121,8 @@ extern "C" int h3_cuda_f32_to_f16_dev(h3_cuda *cuda, const float *d_in,
     {
         const int thr = 256;
         const unsigned nblk = (unsigned)((n + (size_t)thr - 1) / (size_t)thr);
-        h3_cuda_f32_to_f16_kernel<<<nblk, thr>>>(d_in, (__half *)d_out_half, n);
+        h3_cuda_f32_to_f16_kernel<<<nblk, thr, 0, h3_cuda_op_st(cuda)>>>(
+            d_in, (__half *)d_out_half, n);
     }
     if (cudaGetLastError() != cudaSuccess) {
         h3_cuda_set_error(error, error_size, "f32_to_f16_dev kernel");
@@ -8410,4 +12497,32 @@ done:
     if (d_bidx) cudaFree(d_bidx);
     if (d_parents) cudaFree(d_parents);
     return ok;
+}
+
+extern "C" int h3_cuda_vae_unpatch_rgb(h3_cuda *cuda, const float *d_projected,
+                                      float *d_rgb, int out_frames, int pixel_h,
+                                      int pixel_w, int latent_t, int latent_h,
+                                      int latent_w, int metal_22, char *error,
+                                      size_t error_size) {
+    size_t n;
+    unsigned nblk;
+    cudaError_t status;
+    if (!cuda || !d_projected || !d_rgb || out_frames < 1 || pixel_h < 1 ||
+        pixel_w < 1 || latent_t < 1 || latent_h < 1 || latent_w < 1) {
+        h3_cuda_set_error(error, error_size, "invalid vae_unpatch_rgb args");
+        return 0;
+    }
+    n = (size_t)out_frames * (size_t)pixel_h * (size_t)pixel_w;
+    nblk = (unsigned)((n + 255u) / 256u);
+    if (nblk == 0)
+        nblk = 1;
+    h3_cuda_vae_unpatch_rgb_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+        d_projected, d_rgb, out_frames, pixel_h, pixel_w, latent_t, latent_h,
+        latent_w, metal_22 ? 1 : 0);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "vae_unpatch_rgb", status);
+        return 0;
+    }
+    return 1;
 }
