@@ -224,47 +224,33 @@ static bool run_shape(const ShapeCfg &s) {
   fprintf(stderr, "  SFD extent: cutlass cosize=%zu h3 sf_bytes=%zu %s\n",
           sfd_bytes, ref_bytes, sfd_bytes == ref_bytes ? "(match)" : "(MISMATCH!)");
 
-  // HostTensor device_data() yields exactly the pointer types the Arguments
-  // fields expect (mirror 79b). Stage the h3p0-quantized bytes into them.
-  cutlass::HostTensor<typename ElementA::DataType, cutlass::layout::PackedVectorLayout> block_A;
-  cutlass::HostTensor<typename ElementA::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFA;
-  cutlass::HostTensor<typename ElementB::DataType, cutlass::layout::PackedVectorLayout> block_B;
-  cutlass::HostTensor<typename ElementB::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_SFB;
-  cutlass::HostTensor<ElementD, cutlass::layout::PackedVectorLayout> block_D;
-  cutlass::HostTensor<ElementSFD, cutlass::layout::PackedVectorLayout> block_SFD;
-  cutlass::HostTensor<ElementCompute, cutlass::layout::PackedVectorLayout> block_Normconst;
-
+  // Inputs are already h3p0-quantized in DeviceBuf (d_x_fp4/d_w_fp4/d_sf_*),
+  // whose layout matches the CUTLASS SF swizzle (design doc §1.3). We pass
+  // them directly via reinterpret_cast to the CUTLASS element pointer types —
+  // exactly what HostTensor::device_data() does internally.
   size_t m_pad = (m + 127u) & ~(size_t)127u;
-  block_A.reset(cutlass::make_Coord(h3p0::fp4_bytes(m_pad, k)));
-  block_B.reset(cutlass::make_Coord(h3p0::fp4_bytes(n, k)));
-  block_SFA.reset(cutlass::make_Coord(h3p0::sf_bytes(m, k)));
-  block_SFB.reset(cutlass::make_Coord(h3p0::sf_bytes(n, k)));
-  block_D.reset(cutlass::make_Coord(m * (n / 2)));
-  block_SFD.reset(cutlass::make_Coord(sfd_bytes));
-  block_Normconst.reset(cutlass::make_Coord(1));
-
-  CK(cudaMemcpy(block_A.device_data(), d_x_fp4.p, h3p0::fp4_bytes(m_pad, k), cudaMemcpyDeviceToDevice));
-  CK(cudaMemcpy(block_B.device_data(), d_w_fp4.p, h3p0::fp4_bytes(n, k), cudaMemcpyDeviceToDevice));
-  CK(cudaMemcpy(block_SFA.device_data(), d_sf_x.p, h3p0::sf_bytes(m, k), cudaMemcpyDeviceToDevice));
-  CK(cudaMemcpy(block_SFB.device_data(), d_sf_w.p, h3p0::sf_bytes(n, k), cudaMemcpyDeviceToDevice));
-  CK(cudaMemset(block_D.device_data(), 0xEE, m * (n / 2))); // poison: detect unwritten bytes
-  CK(cudaMemset(block_SFD.device_data(), 0xEE, sfd_bytes));
-  block_Normconst.at(cutlass::make_Coord(0)) = 1.0f;
-  block_Normconst.sync_device();
+  (void)m_pad;
+  DeviceBuf d_d_fp4(m * (n / 2)), d_sfd(sfd_bytes), d_norm(sizeof(float));
+  CK(cudaMemset(d_d_fp4.p, 0xEE, m * (n / 2))); // poison: detect unwritten bytes
+  CK(cudaMemset(d_sfd.p, 0xEE, sfd_bytes));
+  float h_norm = 1.0f;
+  CK(cudaMemcpy(d_norm.p, &h_norm, sizeof(float), cudaMemcpyHostToDevice));
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       {(int)m, (int)n, (int)k, 1},
-      {block_A.device_data(), stride_A,
-       block_B.device_data(), stride_B,
-       block_SFA.device_data(), layout_SFA,
-       block_SFB.device_data(), layout_SFB},
+      {reinterpret_cast<cutlass::float_e2m1_t const *>(d_x_fp4.p), stride_A,
+       reinterpret_cast<cutlass::float_e2m1_t const *>(d_w_fp4.p), stride_B,
+       reinterpret_cast<cutlass::float_ue4m3_t const *>(d_sf_x.p), layout_SFA,
+       reinterpret_cast<cutlass::float_ue4m3_t const *>(d_sf_w.p), layout_SFB},
       {{1.0f, 0.0f},
        nullptr, stride_C,
-       block_D.device_data(), stride_D}};
+       reinterpret_cast<cutlass::float_e2m1_t *>(d_d_fp4.p), stride_D}};
   if constexpr (IsBlockScaleSupported) {
-    arguments.epilogue.thread.block_scale_factor_ptr = block_SFD.device_data();
-    arguments.epilogue.thread.norm_constant_ptr = block_Normconst.device_data();
+    arguments.epilogue.thread.block_scale_factor_ptr =
+        reinterpret_cast<cutlass::float_ue4m3_t *>(d_sfd.p);
+    arguments.epilogue.thread.norm_constant_ptr =
+        reinterpret_cast<float const *>(d_norm.p);
   }
 
   Gemm gemm;
@@ -278,7 +264,7 @@ static bool run_shape(const ShapeCfg &s) {
   // Byte-compare SFD over the common extent (should be identical sizes).
   size_t cmp = sfd_bytes < ref_bytes ? sfd_bytes : ref_bytes;
   std::vector<uint8_t> h_sfd(cmp), h_ref(cmp);
-  CK(cudaMemcpy(h_sfd.data(), block_SFD.device_data(), cmp, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(h_sfd.data(), d_sfd.p, cmp, cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(h_ref.data(), d_ref_sf.p, cmp, cudaMemcpyDeviceToHost));
 
   size_t ncb = (n / 16) / 4;
