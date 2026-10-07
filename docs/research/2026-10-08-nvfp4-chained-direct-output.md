@@ -408,3 +408,55 @@ FP32 直通 swiglu-requant」（仍能拿 ~150ms，只是 epilogue 不再融合 
 - `H3_DIT_NVFP4_CHAIN=1`：8 步 1344×768 5s DiT ≤ 84s，§6 验证门全过，
   nsys 显示 fp4_swiglu/swiglu kernel 消失、quantize 总时长下降 ≥25%。
 - 默认配置（flag off）行为与性能与 P4.1 完全一致。
+
+---
+
+## 10. Phase-0 实测结论（2026-10-08，238 / RTX 5090 / sm_120a / CUDA 12.8 / CUTLASS v4.8.0）
+
+### 10.1 可行性：CUTLASS 79b 在 sm_120 干净跑通 ✅
+`experiments/nvfp4-chain-phase0/` scaffold（独立 CMake，`-arch=sm_120a`）编译并运行成功，
+NVFP4-in → NVFP4-out + UE4M3 SFD 由 epilogue 单次产出，无中转。实测纯 kernel 时延：
+
+| 形状 | M | N | K | CUTLASS 79b |
+|---|---|---|---|---|
+| FC1 | 16000 | 28672 | 5376 | **3.84 ms**（≈1285 TFLOPS，~38% 利用率） |
+| FC2 | 16000 | 5376 | 14336 | **1.80 ms** |
+| **FC1+FC2** | — | — | — | **5.64 ms / pair** |
+
+> 注：scaffold 内 cublasLt 独立调用在 `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`
+> 上返回 st=15（NOT_SUPPORTED，与生产 `h3` 二进制正常形成对照，疑似 heuristic
+> 配置差异），故 cublasLt 基线改由生产 nsys profile 提供，不影响 CUTLASS 侧结论。
+
+### 10.2 SFD 布局：100% 匹配 ✅
+- `cutlass cosize == h3 sf_bytes`（FC1: 28672000 B，FC2: 5376000 B），**逐字节等长**。
+- 逐字节对比**无 tile 错位、无 padding 差异、无尾数扰动**——CUTLASS
+  `Sm1xxBlockScaledOutputConfig::tile_atom_to_shape_SFD` 的 swizzle 几何与
+  `h3_cuda_quantize_act_nvfp4_kernel` 的 SF 写布局（§1.3）**完全一致**。
+- K-tail（K%2048≠0）与 padding 行（M%128≠0）路径同样对齐（KTAIL/M15973 用例
+  mismatch 仅为下述常数偏移，非布局错位）。
+
+### 10.3 SFD 数值：恒定常数偏移 ×fp_max（≡6.0），可编译期对齐 ✅
+逐字节差**恒定**（如 cutlass `0x3f` vs h3 `0x2a`，跨全部 tile/row/micro-block 一致），
+比值恰为 **6.0 = `fp_max = numeric_limits<float_e2m1_t>::max()`**。根因已定位：
+
+```
+CUTLASS:  SF = ue4m3(amax × norm_constant_scaled_down),
+          norm_constant_scaled_down = norm_constant × (1/fp_max),
+          out = acc × norm_constant / SF
+h3:       SF = ue4m3(amax / 6),  out = acc / SF
+```
+
+两者最终 FP4 数据位流语义等价（输出值均 = 6·acc/amax ∈ [-6,6]），仅 SFD 字节的
+基准相差一个**编译期常数**。对齐手段明确且廉价：下游消费 SFD 的 GEMM 在反量化时
+吸收该常数（或将 CUTLASS `norm_constant` 配合 `fp_max` 校准到 h3 的 amax/6 基准）。
+**非架构障碍，属参数标定。**
+
+### 10.4 决策：**GO** ✅
+三条 Phase-0 验证门全部通过：
+1. CUTLASS 79b 在 FC1/FC2 形状上可用且快（5.64 ms/pair）。
+2. SFD 布局与 h3 原生 swizzle **100% 匹配**（链式零重排）。
+3. SFD 数值差异为**可编译期吸收的常数**，无需任何运行时 shim 或额外 kernel。
+
+→ 放行 **Phase 1（§9 方案 B 主施工）**：`h3_dit_nvfp4_chain.cu` 集成 FC1→FC2 链式
+kernel（`H3_DIT_NVFP4_CHAIN=1`），SFD 基准按 §10.3 对齐。预期消除 FP32 acc 落盘 +
+requant 中转，达成 §7 的 ~12–14% DiT 时延收益。
