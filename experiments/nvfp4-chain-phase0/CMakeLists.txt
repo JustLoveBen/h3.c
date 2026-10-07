@@ -58,6 +58,7 @@ add_executable(sfd_compare sfd_compare.cu)
 foreach(tgt bench_gemm sfd_compare)
   target_include_directories(${tgt} PRIVATE
     ${CUTLASS_INCLUDE_DIR}
+    ${CUTLASS_DIR}/tools/util/include
     ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${tgt} PRIVATE CUDA::cudart CUDA::cublasLt)
 endforeach()

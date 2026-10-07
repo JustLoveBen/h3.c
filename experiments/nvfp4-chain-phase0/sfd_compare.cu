@@ -52,6 +52,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/util/packed_stride.hpp"
 
 #include "quant_act_extracted.cuh"
 
@@ -124,7 +125,7 @@ using StrideA = typename Gemm::GemmKernel::StrideA;
 using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideC = typename Gemm::GemmKernel::StrideC;
 using StrideD = typename Gemm::GemmKernel::StrideD;
-using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig;
+using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
 
 struct DeviceBuf {
   void *p = nullptr;

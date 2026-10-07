@@ -50,6 +50,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/util/packed_stride.hpp"
 
 #include "quant_act_extracted.cuh"
 
@@ -153,7 +154,7 @@ using StrideC = typename Gemm::GemmKernel::StrideC;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
 using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFB;
-using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig;
+using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
 using LayoutSFD = typename SfdOutputCfg::LayoutSF;
 using FusionOp = typename Gemm::EpilogueOutputOp;
 constexpr bool IsBlockScaleSupported = FusionOp::IsBlockScaleSupported;
