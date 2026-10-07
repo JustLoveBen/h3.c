@@ -225,11 +225,12 @@ struct LtFp4Gemm {
   DeviceBuf workspace;
   DeviceBuf ab; // persistent device [alpha,beta], POINTER_MODE_DEVICE
   size_t m = 0, n = 0, k = 0;
+  bool ok = true;
 
   void init(size_t m_, size_t n_, size_t k_, const void *d_sf_w,
             const void *d_sf_x) {
     m = m_; n = n_; k = k_;
-    workspace = DeviceBuf(32u << 20); // same order as production lt workspace
+    workspace = DeviceBuf(256u << 20); // match production h3_dit_int8_lt_workspace_bytes default
     ab = DeviceBuf(2 * sizeof(float));
     float h_ab[2] = {1.0f, 0.0f};
     CK(cudaMemcpy(ab.p, h_ab, sizeof(h_ab), cudaMemcpyHostToDevice));
@@ -281,11 +282,14 @@ struct LtFp4Gemm {
 
     cublasLtMatmulHeuristicResult_t heurs[8];
     int returned = 0;
-    CKL(cublasLtMatmulAlgoGetHeuristic(lt, desc, a, b, c, c, pref, 8, heurs,
-                                       &returned));
-    if (returned <= 0) {
-      fprintf(stderr, "[fp4] heuristic NO-GO m=%zu n=%zu k=%zu\n", m, n, k);
-      exit(1);
+    cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(lt, desc, a, b, c, c,
+                                                        pref, 8, heurs, &returned);
+    fprintf(stderr, "[fp4] heuristic st=%d returned=%d m=%zu n=%zu k=%zu\n",
+            (int)hst, returned, m, n, k);
+    if (hst != CUBLAS_STATUS_SUCCESS || returned <= 0) {
+      fprintf(stderr, "[fp4] heuristic NO-GO m=%zu n=%zu k=%zu (skipping lt)\n", m, n, k);
+      ok = false;
+      return;
     }
     int pick = -1;
     for (int i = 0; i < returned; i++)
@@ -486,6 +490,11 @@ int main(int argc, char **argv) {
     DeviceBuf d_y_bf16(m * n * sizeof(__nv_bfloat16));
     LtFp4Gemm lt;
     lt.init(m, n, k, d_sf_w.p, d_sf_x.p);
+    if (!lt.ok) {
+      printf("cublaslt_fp4,%s,%zu,%zu,%zu,SKIP_NOGO\n", s.name, m, n, k);
+      fflush(stdout);
+      continue;
+    }
     double lt_ms = bench_ms(
         [&] {
           lt.run(d_w_fp4.p, d_x_fp4.p, d_sf_w.p, d_sf_x.p, d_y_bf16.p);

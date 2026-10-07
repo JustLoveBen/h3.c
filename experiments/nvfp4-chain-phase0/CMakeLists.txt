@@ -61,4 +61,8 @@ foreach(tgt bench_gemm sfd_compare)
     ${CUTLASS_DIR}/tools/util/include
     ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${tgt} PRIVATE CUDA::cudart CUDA::cublasLt)
+  # Force the CUDA 12.8 runtime cublasLt (12.4 lacks VEC16_UE4M3 / sm_120 FP4).
+  set_target_properties(${tgt} PROPERTIES
+    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endforeach()
