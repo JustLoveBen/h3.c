@@ -3530,6 +3530,7 @@ out_done:
     {
         float *d_fc1 = d_wide;
         float *d_act = d_qkv;
+        int fc1_fused = 0;
 
         prep = gemm = 0.0;
         uly_klog("fc1_gemm", "enter");
@@ -3574,6 +3575,7 @@ out_done:
                                     NULL, NULL, 0u,
                                     ctx->lora ? d_fc1 : NULL, &prep, &gemm,
                                     detail, sizeof(detail))) {
+                fc1_fused = 1; /* d_act already holds SwiGLU(FC1) */
                 goto fc1_done;
             }
             fprintf(stderr,
@@ -3668,7 +3670,9 @@ fc1_done:
                      backend);
         }
 
-        if (!gemm_epi) {
+        /* FP4 FC1 already wrote SwiGLU into d_act; a standalone swiglu here would
+         * re-read the stale d_fc1 and overwrite d_act (FC2 then consumed garbage). */
+        if (!gemm_epi && !fc1_fused) {
             prep = gemm = 0.0;
             uly_klog("swiglu", "enter");
             if (!h3_cuda_swiglu_f32_dev(ctx->cuda, d_fc1, seq, ffn, d_act, &op,
