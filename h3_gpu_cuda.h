@@ -487,6 +487,51 @@ int h3_cuda_gemm_fp4_w_act_dev_gate(h3_cuda *cuda,
                                     char *error, size_t error_size,
                                     const char *tag);
 
+/* --- NVFP4 P4.2 Phase-1: FC1→FC2 chained direct-output (sm_120a) ---
+ * Implemented in h3_dit_nvfp4_chain.cu (built only when H3_ENABLE_NVFP4_CHAIN).
+ * Design: docs/research/2026-10-08-nvfp4-chained-direct-output.md §9 Phase-1.
+ *
+ * h3_cutlass_nvfp4_fc1_f32_run: CUTLASS 79b-style block-scaled NVFP4 GEMM with
+ *   FP32 accumulator DIRECT output (no BF16 rounding). Inputs are pre-quantized
+ *   FP4+SF (d_x_fp4/d_sf_x act, d_w_fp4/d_sf_w weight); writes acc[m,n] FP32.
+ *   For FC1, n = 2*ffn. K%64==0 required.
+ * h3_nvfp4_swiglu_requant_dev: fused SwiGLU + NVFP4 requantize. Reads
+ *   acc[m,2*ffn] FP32, computes silu(g)*u -> [m,ffn], emits packed E2M1 +
+ *   128x4-swizzled UE4M3 SF in the exact h3_cuda_quantize_act_nvfp4 layout so
+ *   the FC2 GEMM consumes it with zero reformatting. acc_scale folds the FC1
+ *   weight scale2 (act_scale=1.0 for the dynamic-SF path). ffn%64==0. */
+int h3_cutlass_nvfp4_fc1_f32_run(h3_cuda *cuda, const uint8_t *d_w_fp4,
+                                 const uint8_t *d_sf_w, const uint8_t *d_x_fp4,
+                                 const uint8_t *d_sf_x, size_t m, size_t n,
+                                 size_t k, float *d_acc_f32, double *gemm_ms,
+                                 char *error, size_t error_size);
+int h3_nvfp4_swiglu_requant_dev(h3_cuda *cuda, const float *d_acc_f32,
+                                float acc_scale, const float *d_lora,
+                                size_t m, size_t ffn, uint8_t *d_act_fp4,
+                                uint8_t *d_sf_act, char *error,
+                                size_t error_size);
+
+/* Scratch bytes for the chained FC1→FC2 path (Phase-1 方案 B). Layout:
+ *   fc1_in_fp4 [m_pad*kdim/2] + fc1_in_sf + fc1_acc [m_pad*2*ffn*4] +
+ *   act_fp4 [m_pad*ffn/2] + act_sf. kdim = FC1-input width (DiT dim),
+ *   ffn = FC2-input width (= H3_DIT_W4A8_FFN). */
+size_t h3_cuda_nvfp4_chain_scratch_bytes(size_t m, size_t kdim, size_t ffn);
+
+/* FC2 pre-quantized entry: skip memset+quantize (the activation is already
+ * FP4+SF from the swiglu-requant above) and run GEMM + AdaLN-gate epilogue
+ * directly. d_x_fp4/d_sf_x are the FC2-input activation [m, k=ffn]; the GEMM
+ * pads M to 128 internally via the caller-supplied padded buffers. */
+int h3_cuda_gemm_fp4_pre_q_dev(h3_cuda *cuda,
+                               const h3_cuda_nvfp4_weight *weight,
+                               const uint8_t *d_x_fp4, const uint8_t *d_sf_x,
+                               size_t m, const float *d_residual,
+                               const float *d_modulation,
+                               const uint32_t *d_row_map, size_t slots,
+                               size_t gate_slot, const float *d_lora,
+                               float *d_y_f32, void *d_bf16_scratch,
+                               double *gemm_ms, char *error, size_t error_size,
+                               const char *tag);
+
 /* H3_NVFP4_DEBUG_NAN=1 helpers: env gate + synchronous NaN/Inf scan of a
  * device F32 buffer (prints "[nvfp4_dbg] <tag> <stage>: ..." on hits).
  * No-ops when the env is unset. Used by h3_dit_w4a8.c FP4 dispatch. */

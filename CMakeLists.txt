@@ -224,6 +224,59 @@ set_target_properties(h3_gpu_cuda PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   POSITION_INDEPENDENT_CODE ON)
 
+# --- NVFP4 P4.2 Phase-1: FC1→FC2 chained direct-output (CUTLASS, sm_120a) ---
+# Separate STATIC lib so the CUTLASS headers (slow to compile) and the sm_120a
+# arch requirement stay isolated from the main translation units. Auto-OFF when
+# CUTLASS headers are unavailable, keeping CUTLASS-less builds working.
+option(H3_ENABLE_NVFP4_CHAIN
+  "Build the NVFP4 FC1->FC2 chained direct-output kernel (needs CUTLASS + sm_120a)" ON)
+set(H3_CUTLASS_DIR "" CACHE PATH
+  "Path to a CUTLASS checkout (>= v4.x, needs Sm1xxBlockScaledOutputConfig)")
+if(H3_ENABLE_NVFP4_CHAIN AND NOT H3_CUTLASS_DIR AND DEFINED ENV{CUTLASS_DIR})
+  set(H3_CUTLASS_DIR "$ENV{CUTLASS_DIR}")
+endif()
+if(H3_ENABLE_NVFP4_CHAIN AND NOT H3_CUTLASS_DIR)
+  foreach(_cand
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass"
+      "${CMAKE_CURRENT_SOURCE_DIR}/deps/cutlass")
+    if(EXISTS "${_cand}/include/cutlass/cutlass.h")
+      set(H3_CUTLASS_DIR "${_cand}")
+      break()
+    endif()
+  endforeach()
+endif()
+set(_h3_chain_ok OFF)
+if(H3_ENABLE_NVFP4_CHAIN AND H3_CUTLASS_DIR AND
+   EXISTS "${H3_CUTLASS_DIR}/include/cutlass/cutlass.h")
+  set(_h3_chain_ok ON)
+endif()
+if(_h3_chain_ok)
+  message(STATUS "NVFP4 chain (P4.2): CUTLASS at ${H3_CUTLASS_DIR}")
+  add_library(h3_dit_nvfp4_chain STATIC h3_dit_nvfp4_chain.cu)
+  target_include_directories(h3_dit_nvfp4_chain PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${H3_CUTLASS_DIR}/include
+    ${H3_CUTLASS_DIR}/tools/util/include)
+  target_compile_definitions(h3_dit_nvfp4_chain PUBLIC H3_ENABLE_NVFP4_CHAIN=1)
+  target_compile_options(h3_dit_nvfp4_chain PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  # sm_120a exposes CUTLASS_ARCH_MMA_SM120_SUPPORTED / UMMA (79b needs it).
+  set_target_properties(h3_dit_nvfp4_chain PROPERTIES
+    CUDA_ARCHITECTURES "120a"
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(h3_dit_nvfp4_chain PUBLIC CUDA::cudart)
+  target_link_libraries(h3_gpu_cuda PUBLIC h3_dit_nvfp4_chain)
+  # Propagate the macro so h3_dit_w4a8.c can gate the chain dispatch.
+  target_compile_definitions(h3_gpu_cuda PUBLIC H3_ENABLE_NVFP4_CHAIN=1)
+else()
+  message(STATUS "NVFP4 chain (P4.2): OFF (CUTLASS not found; set H3_CUTLASS_DIR)")
+endif()
+
 if(H3_ENABLE_CUDNN)
   # Prefer conda cuDNN 9 over system cuDNN 8.
   find_path(H3_CUDNN_INCLUDE cudnn.h

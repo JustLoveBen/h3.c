@@ -6213,6 +6213,97 @@ int h3_cuda_gemm_fp4_bs_dev(h3_cuda *cuda, const uint8_t *d_w_fp4,
     return 1;
 }
 
+/* NVFP4 P4.2 Phase-1: scratch bytes for the chained FC1→FC2 path (方案 B).
+ * Layout (single slab, offsets computed by the caller):
+ *   fc1_in_fp4 [m_pad * kdim/2]        quantized FC1 input act (kdim = DiT dim)
+ *   fc1_in_sf  [sf_rb * sf_ncb(kdim) * 512]
+ *   fc1_acc    [m_pad * 2*ffn * 4]     FP32 direct output of the FC1 GEMM
+ *   act_fp4    [m_pad * ffn/2]         requantized FC2 input (packed E2M1)
+ *   act_sf     [sf_rb * sf_ncb(ffn) * 512]
+ * ffn is the FC2-input width (= H3_DIT_W4A8_FFN); kdim is the FC1-input width
+ * (= H3_DIT_W4A8_DIM). Both K%64==0. */
+size_t h3_cuda_nvfp4_chain_scratch_bytes(size_t m, size_t kdim, size_t ffn) {
+    size_t m_pad = (m + 127u) & ~(size_t)127u;
+    size_t sf_rb = m_pad / 128u;
+    size_t sf_ncb_kdim = (((kdim / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    size_t sf_ncb_ffn = (((ffn / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    return m_pad * (kdim / 2u)             /* fc1_in_fp4 */
+           + sf_rb * sf_ncb_kdim * 512u    /* fc1_in_sf */
+           + m_pad * (2u * ffn) * 4u       /* fc1_acc FP32 */
+           + m_pad * (ffn / 2u)            /* act_fp4 */
+           + sf_rb * sf_ncb_ffn * 512u;    /* act_sf */
+}
+
+/* NVFP4 P4.2 Phase-1: FC2 pre-quantized GEMM entry. The activation is
+ * already FP4+SF (produced by h3_nvfp4_swiglu_requant_dev), so this skips the
+ * memset+quantize stage of h3_cuda_fp4_gemm_run and runs GEMM + AdaLN-gate
+ * epilogue directly. d_bf16_scratch is the GEMM output region (sized
+ * m_pad*n*2 by the caller). */
+int h3_cuda_gemm_fp4_pre_q_dev(h3_cuda *cuda,
+                               const h3_cuda_nvfp4_weight *weight,
+                               const uint8_t *d_x_fp4, const uint8_t *d_sf_x,
+                               size_t m, const float *d_residual,
+                               const float *d_modulation,
+                               const uint32_t *d_row_map, size_t slots,
+                               size_t gate_slot, const float *d_lora,
+                               float *d_y_f32, void *d_bf16_scratch,
+                               double *gemm_ms, char *error, size_t error_size,
+                               const char *tag) {
+    size_t n, k, m_pad;
+    float acc_scale;
+    cudaError_t status;
+    int ok = 0;
+
+    if (gemm_ms) *gemm_ms = 0.0;
+    if (!cuda || !weight || !d_x_fp4 || !d_sf_x || !d_y_f32 ||
+        !d_bf16_scratch || !d_residual || !d_modulation || m == 0) {
+        h3_cuda_set_error(error, error_size, "invalid fp4 pre_q args");
+        return 0;
+    }
+    n = weight->n;
+    k = weight->k;
+    if ((k & 63u) != 0) {
+        h3_cuda_set_error(error, error_size, "fp4 pre_q needs K%64==0");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    if (!h3_cuda_nvfp4_weight_ensure_ready((h3_cuda_nvfp4_weight *)weight,
+                                           error, error_size))
+        return 0;
+
+    m_pad = (m + 127u) & ~(size_t)127u;
+    /* GEMM over padded M (the activation buffers are already padded by the
+     * producer); epilogue writes back only rows [0,m). */
+    if (!h3_cuda_gemm_fp4_bs_dev(cuda, weight->d_w_fp4, weight->d_sf_w,
+                                 d_x_fp4, d_sf_x, m_pad, n, k, d_bf16_scratch,
+                                 gemm_ms, error, error_size))
+        return 0;
+
+    /* acc_scale = weight scale2 * act_scale(=1 for dynamic-SF act path). */
+    acc_scale = weight->scale2;
+    {
+        const __nv_bfloat16 *acc = (const __nv_bfloat16 *)d_bf16_scratch;
+        dim3 grid((unsigned)((n + 255u) / 256u), (unsigned)m, 1);
+        h3_cuda_fp4_gate_bf16_kernel<<<grid, 256, 0, h3_cuda_op_st(cuda)>>>(
+            acc, acc_scale, d_residual, d_modulation, d_row_map, d_lora,
+            d_y_f32, m, n, 0u, slots, gate_slot);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "fp4 pre_q gate epi",
+                                   status);
+            goto cleanup;
+        }
+        if (h3_nvfp4_debug_nan()) {
+            h3_nvfp4_debug_scan(cuda, d_y_f32, m * n, "f32", tag,
+                                "pre_q_epi_out");
+        }
+    }
+    ok = 1;
+
+cleanup:
+    return ok;
+}
+
 int h3_cuda_gemm_i8_dequant_f32_w_act(
     h3_cuda *cuda, const h3_cuda_w4a8_weight *weight, const float *x_f32,
     int convrot_groupsize, size_t m, float *y_f32, double *prep_ms,

@@ -31,6 +31,17 @@ static int env_flag_is_one(const char *name) {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+/* P4.2 Phase-1: FC1→FC2 chained direct-output. Requires H3_DIT_NVFP4=1 AND
+ * the chain build (H3_ENABLE_NVFP4_CHAIN). Env H3_DIT_NVFP4_CHAIN=1 enables. */
+static int h3_dit_nvfp4_chain_on(void) {
+#ifdef H3_ENABLE_NVFP4_CHAIN
+    return env_flag_is_one("H3_DIT_NVFP4") &&
+           env_flag_is_one("H3_DIT_NVFP4_CHAIN");
+#else
+    return 0;
+#endif
+}
+
 /* U>1 only: uly_do_phase sets these so block_phase_* can name the kernel
  * that IMA'd. U=1 leaves rank<0 (no logs, no extra sync). */
 static int g_uly_log_rank = -1;
@@ -298,12 +309,18 @@ struct h3_dit_w4a8 {
      * .weight_sf / .weight_scale2, swizzled-SF layout identical to the
      * runtime act quantizer). INT8 track stays the fallback per-block. */
     int nvfp4_on;
+    int nvfp4_chain_on;
     int nvfp4_ready;
     h3_st_header nvfp4_hdr;
     h3_cuda_nvfp4_weight *nvfp4_w[H3_DIT_W4A8_N_BLOCKS][4];
     uint8_t *d_nvfp4_scratch;
     size_t d_nvfp4_scratch_bytes;
     size_t nvfp4_scratch_cap_seq;
+    /* Chained FC1→FC2 (P4.2 Phase-1): separate scratch so the non-chain FP4
+     * path layout is untouched when the chain toggles off. */
+    uint8_t *d_nvfp4_chain_scratch;
+    size_t d_nvfp4_chain_scratch_bytes;
+    size_t nvfp4_chain_scratch_cap_seq;
 };
 
 static uint32_t dit_text_row_mod(const h3_dit_w4a8 *ctx, size_t i,
@@ -457,6 +474,12 @@ h3_dit_w4a8 *h3_dit_w4a8_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
                         "miss)\n");
         fflush(stderr);
     }
+    ctx->nvfp4_chain_on = h3_dit_nvfp4_chain_on();
+    if (ctx->nvfp4_chain_on) {
+        fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4_CHAIN=1 — FC1->FC2 chained "
+                        "direct-output (CUTLASS sm_120a)\n");
+        fflush(stderr);
+    }
     return ctx;
 }
 
@@ -510,6 +533,12 @@ h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
         fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
                         "(INT8 weights load lazily only on FP4 dispatch "
                         "miss)\n");
+        fflush(stderr);
+    }
+    ctx->nvfp4_chain_on = h3_dit_nvfp4_chain_on();
+    if (ctx->nvfp4_chain_on) {
+        fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4_CHAIN=1 — FC1->FC2 chained "
+                        "direct-output (CUTLASS sm_120a)\n");
         fflush(stderr);
     }
     return ctx;
@@ -570,6 +599,7 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
                     h3_cuda_nvfp4_weight_free(ctx->cuda, ctx->nvfp4_w[b][p]);
     }
     if (ctx->d_nvfp4_scratch) cudaFree(ctx->d_nvfp4_scratch);
+    if (ctx->d_nvfp4_chain_scratch) cudaFree(ctx->d_nvfp4_chain_scratch);
     if (ctx->nvfp4_ready) h3_st_free_header(&ctx->nvfp4_hdr);
     free(ctx);
     dit_rope_memo_free_all();
@@ -2972,6 +3002,151 @@ static int nvfp4_ensure_scratch(h3_dit_w4a8 *ctx, size_t seq, char *error,
     return 1;
 }
 
+/* P4.2 Phase-1: ensure the chained FC1→FC2 scratch slab. Separate from
+ * d_nvfp4_scratch so toggling the chain never disturbs the fallback layout. */
+static int nvfp4_chain_ensure_scratch(h3_dit_w4a8 *ctx, size_t seq,
+                                      char *error, size_t error_size) {
+    size_t need;
+    if (ctx->d_nvfp4_chain_scratch && seq <= ctx->nvfp4_chain_scratch_cap_seq)
+        return 1;
+    need = h3_cuda_nvfp4_chain_scratch_bytes(seq, H3_DIT_W4A8_HIDDEN,
+                                             H3_DIT_W4A8_FFN);
+    if (need > ctx->d_nvfp4_chain_scratch_bytes) {
+        if (ctx->d_nvfp4_chain_scratch) {
+            cudaFree(ctx->d_nvfp4_chain_scratch);
+            ctx->d_nvfp4_chain_scratch = NULL;
+        }
+        if (cudaMalloc((void **)&ctx->d_nvfp4_chain_scratch, need) !=
+            cudaSuccess) {
+            ctx->d_nvfp4_chain_scratch_bytes = 0;
+            ctx->nvfp4_chain_scratch_cap_seq = 0;
+            fail(error, error_size, "nvfp4 chain scratch OOM");
+            return 0;
+        }
+        ctx->d_nvfp4_chain_scratch_bytes = need;
+    }
+    ctx->nvfp4_chain_scratch_cap_seq = seq;
+    return 1;
+}
+
+/* P4.2 Phase-1 (方案 B): chained FC1→SwiGLU→requant→FC2 with the FP32 acc
+ * never leaving the device in BF16/quantized-transit form.
+ *
+ *   quantize(d_a) -> fc1_in FP4+SF           (reuse the standard act quant)
+ *   CUTLASS FC1 GEMM -> fc1_acc FP32 [seq, 2*ffn]   (no BF16 rounding)
+ *   swiglu+requant -> act FP4+SF [seq, ffn]  (fused, no FP32 transit)
+ *   FC2 pre_q GEMM + AdaLN gate -> d_y FP32  (skips re-quantize)
+ *
+ * Returns 1 on success (chain ran), 0 on hard failure (caller falls back to
+ * the standard per-linear nvfp4_gemm_dispatch path). */
+static int nvfp4_chain_fc1_fc2(h3_dit_w4a8 *ctx, unsigned block,
+                               const float *d_a, const float *d_b,
+                               const float *d_mod, const uint32_t *d_map,
+                               const float *d_lora_fc1, const float *d_lora_fc2,
+                               float *d_y, size_t seq, double *prep_ms,
+                               double *gemm_ms, char *error,
+                               size_t error_size) {
+    const size_t kdim = H3_DIT_W4A8_HIDDEN;
+    const size_t ffn = H3_DIT_W4A8_FFN;
+    const h3_cuda_nvfp4_weight *w_fc1, *w_fc2;
+    uint8_t *base, *fc1_in_fp4, *fc1_in_sf, *act_fp4, *act_sf;
+    float *fc1_acc;
+    size_t m_pad, sf_rb, sf_ncb_kdim, sf_ncb_ffn;
+    size_t off_in_fp4, off_in_sf, off_acc, off_act_fp4, off_act_sf;
+    double g1 = 0.0, g2 = 0.0;
+    char detail[384];
+
+    if (prep_ms) *prep_ms = 0.0;
+    if (gemm_ms) *gemm_ms = 0.0;
+    if (!nvfp4_load_block_weights(ctx, block, error, error_size))
+        return 0;
+    if (!nvfp4_chain_ensure_scratch(ctx, seq, error, error_size))
+        return 0;
+    w_fc1 = ctx->nvfp4_w[block][2];
+    w_fc2 = ctx->nvfp4_w[block][3];
+    if (!w_fc1 || !w_fc2) {
+        fail(error, error_size, "nvfp4 chain: fc1/fc2 weight missing");
+        return 0;
+    }
+
+    /* Carve the slab. */
+    m_pad = (seq + 127u) & ~(size_t)127u;
+    sf_rb = m_pad / 128u;
+    sf_ncb_kdim = (((kdim / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    sf_ncb_ffn = (((ffn / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    base = ctx->d_nvfp4_chain_scratch;
+    off_in_fp4 = 0;
+    off_in_sf = off_in_fp4 + m_pad * (kdim / 2u);
+    off_acc = off_in_sf + sf_rb * sf_ncb_kdim * 512u;
+    off_act_fp4 = off_acc + m_pad * (2u * ffn) * 4u;
+    off_act_sf = off_act_fp4 + m_pad * (ffn / 2u);
+    fc1_in_fp4 = base + off_in_fp4;
+    fc1_in_sf = base + off_in_sf;
+    fc1_acc = (float *)(base + off_acc);
+    act_fp4 = base + off_act_fp4;
+    act_sf = base + off_act_sf;
+
+    /* 1. Quantize the FC1 input activation (d_a, [seq, kdim]) -> FP4+SF. */
+    if (!h3_cuda_quantize_act_nvfp4_dev(ctx->cuda, d_a, seq, kdim, fc1_in_fp4,
+                                        fc1_in_sf, detail, sizeof(detail))) {
+        snprintf(error, error_size, "nvfp4 chain fc1 quant: %s", detail);
+        return 0;
+    }
+    if (m_pad > seq) {
+        size_t x_tail = (m_pad - seq) * (kdim / 2u);
+        if (x_tail)
+            cudaMemsetAsync(fc1_in_fp4 + seq * (kdim / 2u), 0, x_tail,
+                            (cudaStream_t)h3_cuda_op_stream(ctx->cuda));
+    }
+
+    /* 2. CUTLASS FC1 GEMM -> FP32 acc [seq, 2*ffn] (direct output). */
+    if (!h3_cutlass_nvfp4_fc1_f32_run(
+            ctx->cuda, h3_cuda_nvfp4_weight_packed(w_fc1),
+            h3_cuda_nvfp4_weight_sf(w_fc1), fc1_in_fp4, fc1_in_sf, seq,
+            2u * ffn, kdim, fc1_acc, &g1, detail, sizeof(detail))) {
+        snprintf(error, error_size, "nvfp4 chain fc1 gemm: %s", detail);
+        return 0;
+    }
+
+    /* 3. Fused SwiGLU + requant -> act FP4+SF [seq, ffn]. */
+    if (!h3_nvfp4_swiglu_requant_dev(ctx->cuda, fc1_acc,
+                                     h3_cuda_nvfp4_weight_scale2(w_fc1),
+                                     d_lora_fc1, seq, ffn, act_fp4, act_sf,
+                                     detail, sizeof(detail))) {
+        snprintf(error, error_size, "nvfp4 chain swiglu_requant: %s", detail);
+        return 0;
+    }
+    if (m_pad > seq) {
+        size_t x_tail = (m_pad - seq) * (ffn / 2u);
+        if (x_tail)
+            cudaMemsetAsync(act_fp4 + seq * (ffn / 2u), 0, x_tail,
+                            (cudaStream_t)h3_cuda_op_stream(ctx->cuda));
+    }
+
+    /* 4. FC2 pre_q GEMM + AdaLN gate (slot 5, residual d_b) -> d_y. Reuse the
+     * bf16 region of the standard FP4 scratch as the FC2 GEMM output. */
+    if (!nvfp4_ensure_scratch(ctx, seq, error, error_size))
+        return 0;
+    {
+        size_t sf_ncb_w = (((ffn / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+        size_t sf_rb_w = m_pad / 128u;
+        void *d_bf16 = ctx->d_nvfp4_scratch + m_pad * (ffn / 2u) +
+                       sf_rb_w * sf_ncb_w * 512u;
+        if (!h3_cuda_gemm_fp4_pre_q_dev(ctx->cuda, w_fc2, act_fp4, act_sf, seq,
+                                        d_b, d_mod, d_map,
+                                        (size_t)H3_DIT_W4A8_SLOTS, 5u,
+                                        d_lora_fc2, d_y, d_bf16, &g2, detail,
+                                        sizeof(detail), "chain.fc2")) {
+            snprintf(error, error_size, "nvfp4 chain fc2: %s", detail);
+            return 0;
+        }
+    }
+
+    if (prep_ms) *prep_ms = 0.0; /* quantize is folded; no separate prep timer */
+    if (gemm_ms) *gemm_ms = g1 + g2;
+    return 1;
+}
+
 /* Per-linear FP4 dispatch. kind: 0=QKV 1=OUT 2=FC1 3=FC2. Handles the act
  * quant + FP4 GEMM + BF16 epilogue (swiglu for FC1, AdaLN gate for
  * OUT/FC2). Returns 0 only on hard error; caller keeps stats. */
@@ -3358,6 +3533,39 @@ out_done:
 
         prep = gemm = 0.0;
         uly_klog("fc1_gemm", "enter");
+        if (ctx->nvfp4_chain_on) {
+            /* P4.2 Phase-1: chained FC1→SwiGLU→requant→FC2. Runs BOTH FC1 and
+             * FC2 (writes d_y), so on success we skip the standalone swiglu
+             * and the FC2 dispatch below. Falls back to the per-linear FP4
+             * path (then INT8) on any chain failure. */
+            snprintf(backend, sizeof(backend), "%s", "cutlass_fp4_chain");
+            if (nvfp4_chain_fc1_fc2(ctx, block, d_a, d_b, d_mod, d_map,
+                                    ctx->lora ? d_fc1 : NULL,
+                                    ctx->lora ? d_a : NULL, d_y, seq,
+                                    &prep, &gemm, detail, sizeof(detail))) {
+                if (stats) {
+                    stats->fc1_ms = gemm;
+                    stats->act_prep_ms += prep;
+                    snprintf(stats->fc1_backend, sizeof(stats->fc1_backend),
+                             "%s", backend);
+                    stats->swiglu_ms = 0.0;
+                    stats->fc2_ms = 0.0;
+                    snprintf(stats->fc2_backend, sizeof(stats->fc2_backend),
+                             "%s", backend);
+                }
+                if (!uly_ksync("fc1_gemm", error, error_size))
+                    return 0;
+                if (!uly_ksync("fc2_gemm", error, error_size))
+                    return 0;
+                return 1; /* whole MLP (fc1+swiglu+fc2) done */
+            }
+            fprintf(stderr,
+                    "dit_nvfp4: fc1 b%u chain failed (%s); per-linear FP4\n",
+                    block, detail);
+            fflush(stderr);
+            backend[0] = '\0';
+            prep = gemm = 0.0;
+        }
         if (ctx->nvfp4_on) {
             /* FP4 FC1: GEMM [seq,2*ffn] + fused SwiGLU (+lora) on BF16 acc;
              * d_act holds the gated half [seq,ffn]. */
