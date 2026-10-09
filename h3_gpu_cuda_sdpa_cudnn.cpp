@@ -58,7 +58,9 @@ enum {
 
 /* cuDNN frontend CUDA-graph slot. Q/K/V/O live in DiT sdpa scratch at
  * fixed offsets for a given seq, so populate once and launch across
- * blocks. Rollback: H3_SDPA_CUDNN_CUDA_GRAPH=0. */
+ * blocks. Replay is not run-to-run deterministic on sm_120 (INT8 DiT
+ * step-1 velocity diverges; eager execute() is bit-stable). Default off.
+ * Opt in: H3_SDPA_CUDNN_CUDA_GRAPH=1. */
 struct h3_sdpa_cugraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -143,9 +145,10 @@ static int sdpa_cugraph_wanted(void) {
     if (!inited) {
         const char *e = getenv("H3_SDPA_CUDNN_CUDA_GRAPH");
         inited = 1;
-        want = 1;
-        if (e && e[0] == '0' && e[1] == '\0')
-            want = 0;
+        /* Default off: cudaGraphLaunch of the populated cuDNN SDPA graph
+         * is nondeterministic on sm_120. Eager execute() is bit-stable.
+         * H3_SDPA_CUDNN_CUDA_GRAPH=1 opts back in. */
+        want = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
         fprintf(stderr, "sdpa_graph: wanted=%d (H3_SDPA_CUDNN_CUDA_GRAPH)\n",
                 want);
         fflush(stderr);
