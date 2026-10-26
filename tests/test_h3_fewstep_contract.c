@@ -1,5 +1,6 @@
 /* Host-only fewstep contract tests (no CUDA). */
 #include "h3_fewstep_contract.h"
+#include "tests/fixtures/fewstep_student_grid_golden.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -151,22 +152,86 @@ int main(void) {
            "pdmd2 strict fail");
     unsetenv("H3_FEWSTEP_STRICT");
 
-    /* sigma golden: pdmd4 */
+    /* sigma golden fixtures: fill ≡ frozen tables */
+    {
+        float g[8];
+        int i;
+        h3_fewstep_student_grid_fill(4, 12.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12[i],
+                   "fill≡pdmd4 video golden");
+        h3_fewstep_student_grid_fill(4, 3.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_PDMD4_AUDIO_S3_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_PDMD4_AUDIO_S3[i],
+                   "fill≡pdmd4 audio golden");
+        h3_fewstep_student_grid_fill(4, 2.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_DMAD4_AUDIO_S2_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_DMAD4_AUDIO_S2[i],
+                   "fill≡dmad4 audio golden");
+        h3_fewstep_student_grid_fill(2, 12.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_PDMD2_VIDEO_S12_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_PDMD2_VIDEO_S12[i],
+                   "fill≡pdmd2 video golden");
+        h3_fewstep_student_grid_fill(2, 3.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S3_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S3[i],
+                   "fill≡pdmd2 audio3 golden");
+        h3_fewstep_student_grid_fill(2, 6.0f, g);
+        for (i = 0; i < H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S6_LEN; i++)
+            expect(g[i] == H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S6[i],
+                   "fill≡pdmd2 audio6 golden");
+    }
+
+    /* sigma golden: pdmd4 against frozen table */
     memset(&in, 0, sizeof in);
     in.id = H3_FEWSTEP_PDMD4;
     in.steps = 4;
     in.audio_shift = 3.0f;
-    fill_grid(4, 12.0f, v);
-    fill_grid(4, 3.0f, a);
-    in.video_sigmas = v;
-    in.audio_sigmas = a;
+    in.video_sigmas = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12;
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_PDMD4_AUDIO_S3;
     expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 1,
            "pdmd4 sigma ok");
     /* Corrupt mid video sigma (turbo-lookalike mismatch simulation) */
+    fill_grid(4, 12.0f, v);
+    fill_grid(4, 3.0f, a);
     v[1] = 0.5f;
+    in.video_sigmas = v;
+    in.audio_sigmas = a;
     expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 0,
            "pdmd4 sigma mismatch");
     expect(strstr(err, "student_grid") != NULL, "sigma msg");
+
+    /* pdmd2 audio=3 and audio=6 both accept golden */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_PDMD2;
+    in.steps = 2;
+    in.audio_shift = 3.0f;
+    in.video_sigmas = H3_FEWSTEP_GOLDEN_PDMD2_VIDEO_S12;
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S3;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 1,
+           "pdmd2 sigma audio3 ok");
+    in.audio_shift = 6.0f;
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S6;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 1,
+           "pdmd2 sigma audio6 ok");
+    /* wrong audio table under shift=3 */
+    in.audio_shift = 3.0f;
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S6;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 0,
+           "pdmd2 sigma wrong audio table");
+
+    /* dmad4 golden */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_DMAD4;
+    in.steps = 4;
+    in.audio_shift = 2.0f;
+    in.video_sigmas = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12;
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_DMAD4_AUDIO_S2;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 1,
+           "dmad4 sigma ok");
+    in.audio_sigmas = H3_FEWSTEP_GOLDEN_PDMD4_AUDIO_S3;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 0,
+           "dmad4 sigma wrong audio");
 
     /* kijai path → WARN only (still ok) */
     memset(&in, 0, sizeof in);

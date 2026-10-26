@@ -11,7 +11,9 @@ outputs/
 *.metallib
 h3
 h3_*test
-h3_*tests
+dump_fewstep_student_grid
+h3_*test
+dump_fewstep_student_grids
 h3_*bench
 h3_dit_bench_864
 h3_tests

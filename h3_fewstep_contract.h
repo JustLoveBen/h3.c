@@ -60,6 +60,12 @@ const char *h3_fewstep_contract_name(h3_fewstep_id id);
 int h3_fewstep_contract_check_early(const h3_fewstep_contract_in *in, char *err,
                                     size_t err_size);
 
+/* Host student_grid: linspace(1,0,nfe+1) then SD3 shift; out[nfe]=0.
+ * out must hold nfe+1 floats. Used by dump tool + tests; contract check
+ * compares against frozen tables in tests/fixtures/fewstep_student_grid_golden.h.
+ */
+void h3_fewstep_student_grid_fill(int nfe, float shift, float *out);
+
 /* After sigma[] printed. Checks student_grid golden vectors. */
 int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err,
                                      size_t err_size);

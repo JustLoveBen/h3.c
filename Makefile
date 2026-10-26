@@ -19,7 +19,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
 	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
-	h3_fewstep_contract_test h3_sampler_test
+	h3_fewstep_contract_test h3_sampler_test dump_fewstep_student_grid
 
 all: h3 libh3.a
 
@@ -52,8 +52,14 @@ h3_w4a8_blocks_probe: tools/h3_w4a8_blocks_probe.c h3_safetensors.c h3_w4a8.c \
 		h3_safetensors.c h3_w4a8.c h3_w4a8_dequant.c -lm
 # Host-only fewstep contract self-check (no Metal/CUDA).
 h3_fewstep_contract_test: tests/test_h3_fewstep_contract.c h3_fewstep_contract.c \
-		h3_fewstep_contract.h
+		h3_fewstep_contract.h tests/fixtures/fewstep_student_grid_golden.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_fewstep_contract.c \
+		h3_fewstep_contract.c -lm
+
+# Print frozen student_grid σ tables; also asserts fill≡golden.
+dump_fewstep_student_grid: tools/dump_fewstep_student_grid.c h3_fewstep_contract.c \
+		h3_fewstep_contract.h tests/fixtures/fewstep_student_grid_golden.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/dump_fewstep_student_grid.c \
 		h3_fewstep_contract.c -lm
 
 # Host-only LCM+re-noise sampler math (no Metal/CUDA).

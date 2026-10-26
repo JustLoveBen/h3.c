@@ -1,5 +1,7 @@
 #include "h3_fewstep_contract.h"
 
+#include "tests/fixtures/fewstep_student_grid_golden.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,8 +270,10 @@ static int sigmas_match(const float *got, const float *want, int n, float tol) {
     return 1;
 }
 
-static void fill_student_grid(int nfe, float shift, float *out) {
+void h3_fewstep_student_grid_fill(int nfe, float shift, float *out) {
     int i;
+    if (!out || nfe < 1)
+        return;
     for (i = 0; i <= nfe; i++) {
         float base = 1.0f - (float)i / (float)nfe;
         out[i] = shifted_sigma(base, shift);
@@ -279,9 +283,10 @@ static void fill_student_grid(int nfe, float shift, float *out) {
 
 int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err,
                                      size_t err_size) {
-    float want_v[16];
-    float want_a[16];
+    const float *want_v = NULL;
+    const float *want_a = NULL;
     int nfe;
+    int n;
     float a_shift;
     char buf[512];
     const float tol = 0.0025f; /* ~0.25% abs; printed logs use ~4g */
@@ -297,18 +302,29 @@ int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err
     case H3_FEWSTEP_PDMD4:
         nfe = 4;
         a_shift = 3.0f;
+        want_v = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12;
+        want_a = H3_FEWSTEP_GOLDEN_PDMD4_AUDIO_S3;
+        n = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12_LEN;
         break;
     case H3_FEWSTEP_PDMD2:
         nfe = 2;
+        want_v = H3_FEWSTEP_GOLDEN_PDMD2_VIDEO_S12;
+        n = H3_FEWSTEP_GOLDEN_PDMD2_VIDEO_S12_LEN;
         /* Accept either paper (3) or look-feel (6) grid. */
-        if (fabsf(in->audio_shift - 6.0f) <= 0.051f)
+        if (fabsf(in->audio_shift - 6.0f) <= 0.051f) {
             a_shift = 6.0f;
-        else
+            want_a = H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S6;
+        } else {
             a_shift = 3.0f;
+            want_a = H3_FEWSTEP_GOLDEN_PDMD2_AUDIO_S3;
+        }
         break;
     case H3_FEWSTEP_DMAD4:
         nfe = 4;
         a_shift = 2.0f;
+        want_v = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12; /* same video grid */
+        want_a = H3_FEWSTEP_GOLDEN_DMAD4_AUDIO_S2;
+        n = H3_FEWSTEP_GOLDEN_PDMD4_VIDEO_S12_LEN;
         break;
     default:
         return 1;
@@ -320,13 +336,10 @@ int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err
                  h3_fewstep_contract_name(in->id), in->steps, nfe);
         return fail_msg(err, err_size, buf);
     }
-    if (nfe + 1 > (int)(sizeof(want_v) / sizeof(want_v[0])))
-        return fail_msg(err, err_size, "fewstep_contract: nfe too large");
+    if (n != nfe + 1 || !want_v || !want_a)
+        return fail_msg(err, err_size, "fewstep_contract: golden table missing");
 
-    fill_student_grid(nfe, 12.0f, want_v);
-    fill_student_grid(nfe, a_shift, want_a);
-
-    if (!sigmas_match(in->video_sigmas, want_v, nfe + 1, tol)) {
+    if (!sigmas_match(in->video_sigmas, want_v, n, tol)) {
         snprintf(buf, sizeof(buf),
                  "fewstep_contract=%s video sigma 与 student_grid(%d,12) 不一致 "
                  "（拒 turbo4/错表冒充；期望首中末≈%.4g / %.4g / 0）",
@@ -334,7 +347,7 @@ int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err
                  (double)want_v[nfe / 2]);
         return fail_msg(err, err_size, buf);
     }
-    if (!sigmas_match(in->audio_sigmas, want_a, nfe + 1, tol)) {
+    if (!sigmas_match(in->audio_sigmas, want_a, n, tol)) {
         snprintf(buf, sizeof(buf),
                  "fewstep_contract=%s audio sigma 与 student_grid(%d,%.3g) 不一致 "
                  "（检查 H3_AUDIO_SIGMA_SHIFT）",
