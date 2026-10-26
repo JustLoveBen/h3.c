@@ -140,11 +140,33 @@
 | [`2026-10-09-dev-plan-and-progress.md`](2026-10-09-dev-plan-and-progress.md) | 总目标上游 |
 | [`2026-10-05-acceleration-mechanisms.md`](2026-10-05-acceleration-mechanisms.md) | 视频扩散机理族 |
 | [`2026-10-07-llm-to-dit-transfer.md`](2026-10-07-llm-to-dit-transfer.md) | 算子同构裁决（≠ 策略否决） |
+| [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md) | 增量机会扫掠（E2/VRAM/TE/…） |
 
 ---
+
 
 ## 8. 修订记录
 
 | 日期 | 说明 |
 |---|---|
 | 2026-10-26 | 初稿：整合 P0–P3 优化轴 + DeepInfer 策略落点；与 followup-dev-plan 对齐、不改其优先级。 |
+| 2026-10-27 | 增 §9 指针 → [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md)（E2/显存账本/TE cache 等增量，不改 P0）。 |
+
+---
+
+## 9. 增量机会指针（2026-10-27）
+
+主线（§3 P0–P3）不变。另见扫掠文档 [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md)：把 10-05/10-07 已论证、却未进入 10-26 执行表（或只写了一句「融合」）的项重新排序。
+
+**最值得并行于主线、且不替代 NVFP4 视觉门的五条：**
+
+| ID | 项 | 为何现在提 |
+|---|---|---|
+| A1 | `H3_DIT_EPI_FUSE`（E2）真机 A/B | 代码与 `ab.sh` 已在仓；同精度链路秒级；S5 实体 |
+| A2 | 768p 显存账本插桩 | streaming/减窗/FP16 中转的决策前提 |
+| A3 | TE `te_cache`/常驻产品化 | TE 7–58s 摆动污染加速比 |
+| A4 | 激活 FP16 中转（账本后） | 768p 能力备胎 |
+| A5 | sol autotune 是否 per-clip | 可能 cold −1s，或诚实关闭 |
+
+完整 A1–A15、与 S1–S12 对照、否定清单见该文。**仍不跑 GPU 则优先可开发项：A10（generate 内联 env 合同）。**
+
