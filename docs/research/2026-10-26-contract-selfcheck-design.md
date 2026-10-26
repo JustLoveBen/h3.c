@@ -2,7 +2,7 @@
 
 > **日期：** 2026-10-26。  
 > **上游：** followup §4「合同自检」、[`2026-10-09-pdmd-dmad-loras.md`](2026-10-09-pdmd-dmad-loras.md)。  
-> **性质：** 设计说明 + Phase-1 已落地（`h3_fewstep_contract.*`）。不改脏 NVFP4 chain / 无关 WIP。  
+> **性质：** 设计说明；**Phase-1 代码已落地**（`7fe119c`，`h3_fewstep_contract.*`）；Phase-2 采样器见 `e037d42`。不改脏 NVFP4 chain / 无关 WIP。  
 > **目标：** 错 preset / 错 shift / 错 sampler / 错 LoRA 身份时 **FAIL 或硬警告**，避免 turbo4 sigma 冒充 PDMD/DMAD 通过。
 
 ---
@@ -54,19 +54,24 @@ PDMD-4 期望视频格点（serving `linspace` + shift 12）应与发布 `studen
 
 ---
 
-## 4. 最小实现切片（后续代码，非本提交）
+## 4. 实现状态
 
-1. **文档 / 日志（已有）**：继续保证打印 `sigma[]` 与 `adaln_dual_sigma`（已在 `h3_cuda_generate.c`）。  
-2. **离线检：** `tools/p0_protocol_check_log.py` 可扩 `--expect-audio-shift 3` 等（少步用，不塞进 P0 视觉门默认）。  
-3. **进程内：** 在 `h3_generate_preset_apply` 之后、建 sigma 之后增加 `h3_fewstep_contract_check(...)`；FAIL 走现有 `fprintf` + `return 1`。  
-4. **不要**在本轮改脏的 `h3_lora.c` 大 diff；合同检查放新文件 `h3_fewstep_contract.c` 更干净。
+| 切片 | 状态 |
+| --- | --- |
+| 打印 `sigma[]` / `adaln_dual_sigma` | 已有（`h3_cuda_generate.c`） |
+| 离线协议检 `tools/p0_protocol_check_log.py` | 已有（`5949d37`）；少步 shift 扩项可选 |
+| 进程内 `h3_fewstep_contract_check` + CLI/env | **已落地** `7fe119c`（`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`） |
+| `lcm_renoise` 与 dmad4 自动选 | **已落地** `e037d42` |
+| GPU 少步 / DMAD 视觉验收 | **未做**（等授权上 238） |
+
+仍不在本文件范围：改脏 `h3_lora.c`、NVFP4 chain、push。
 
 ---
 
 ## 5. 与 P0 的关系
 
 P0 视觉门 **不启用** 少步合同（无 LoRA、8-step、shift 12/默认 audio）。  
-本设计服务 followup §6 第 5 项与 P1 PDMD-4 验收，避免重蹈 turbo4 错合同。
+本设计已服务 followup §6 第 5 项（勾选完成）；P1 PDMD-4 / P2 DMAD GPU 验收时务必打开合同旋钮，避免重蹈 turbo4 错合同。
 
 ---
 
@@ -77,3 +82,4 @@ P0 视觉门 **不启用** 少步合同（无 LoRA、8-step、shift 12/默认 au
 | 2026-10-26 | 初稿：矩阵 + 实现切片；代码未落地。 |
 | 2026-10-26 | Phase-1：`h3_fewstep_contract.c` + `--fewstep-contract` / `H3_FEWSTEP_CONTRACT`；early+sigma 金向量；dmad4 无 lcm 硬拒；Mac `make h3_fewstep_contract_test`。 |
 | 2026-10-26 | Phase-2：`h3_sampler` + `--sampler lcm_renoise`；dmad4 自动选 lcm；见 `2026-10-26-dmad-lcm-renoise-sampler.md`。GPU 验收看该文。 |
+| 2026-10-26 | §4 改为实现状态表；钉 commit `7fe119c` / `e037d42`；明确 GPU 未跑。 |

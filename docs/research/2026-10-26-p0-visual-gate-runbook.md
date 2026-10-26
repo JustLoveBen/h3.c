@@ -3,7 +3,8 @@
 > **日期：** 2026-10-26。  
 > **上游：** [`2026-10-26-followup-dev-plan.md`](2026-10-26-followup-dev-plan.md) P0；[`2026-10-09-dev-plan-and-progress.md`](2026-10-09-dev-plan-and-progress.md)；P2.2 协议见 [`2026-10-07-nvfp4-w4a4-path.md`](2026-10-07-nvfp4-w4a4-path.md) §P2.2（旧片子作废）。  
 > **性质：** 可执行对照模板 + 命令骨架。投产门 = **目检 + 同配置 waffle**，不是 cosine / SSIM / bit-identical。  
-> **授权边界：** 本 runbook **不** push origin、**不**清盘、**不**开 nsys/EVT、**不**提交链式 WIP。
+> **授权边界：** 本 runbook **不** push origin、**不**清盘、**不**开 nsys/EVT、**不**提交链式 WIP。  
+> **执行状态（2026-10-26 Asia/Singapore）：** 文档与 `tools/p0_protocol_check_log.py`（`675e878` / `5949d37`）已就绪；**238 上 Phase A/B 尚未开跑**（用户暂停测机）。与开发侧已落地项对照见 followup §2.1。
 
 ---
 
@@ -223,3 +224,12 @@ python3 tools/p0_protocol_check_log.py --arm nvfp4 "$OUT/generate.log"
 6. 写结论；可选再开 768 目录。
 
 **下一条在 238 上应敲的第一句（在 §2 变量设好之后）：** Phase A 的 INT8 命令（`ARM=int8_1`）。
+
+---
+
+## 8. 修订
+
+| 日期 | 说明 |
+| --- | --- |
+| 2026-10-26 | 初稿。 |
+| 2026-10-26 | 注明 238 Phase A/B 未开跑；链到 followup §2.1。 |

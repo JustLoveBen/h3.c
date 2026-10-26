@@ -20,12 +20,24 @@
 
 ## 2. 当前基线快照
 
-- `main` @ `321538a`（`fix(sdpa): default cuDNN SDPA CUDA graph off on sm_120`），**ahead origin 15**，未推送。  
-- 默认路径仍是 **INT8 DiT**；`H3_DIT_NVFP4=1` 可切实验臂；基线 `fc1_fused` 守卫已修（`fcd930c`）。INT8 1-step velocity md5 在 graph 关下可复现。  
-- NVFP4：**能跑完、latent 有限**；公平 1-step 相对稳定 INT8 轨迹差大（velocity rel ~0.94）；**P2.2 视觉门未按现基线重验**；链式 WIP 在工作区（端到端 latent rel ~0.33 未解释），**未提交，等视觉门 + 用户确认**。  
-- T3（PDMD/DMAD）：**仍标未验证**。PDMD-2NFE 合同复验过（无网格噪，发糊属 2NFE σ 大跳固有）；**PDMD-4NFE 原件正式验收未做**；DMAD `lcm_renoise` **代码已落地**（未见 GPU 视觉验收），禁止用 Euler/turbo4 冒充通过。  
+- `main` @ `e037d42`（`feat(sampler): lcm_renoise for DMAD 4NFE`），含此前 `7fe119c` 合同自检与 P0 文档工具提交；**ahead origin 20**，**未推送**。  
+- 默认路径仍是 **INT8 DiT**；`H3_DIT_NVFP4=1` 可切实验臂；基线 `fc1_fused` 守卫已修（`fcd930c`）。INT8 1-step velocity md5 在 graph 关下可复现（`321538a` graph 默认关）。  
+- NVFP4：**能跑完、latent 有限**；公平 1-step 相对稳定 INT8 轨迹差大（velocity rel ~0.94）；**P2.2 视觉门仍未在 238 按现基线重验**；链式 WIP 在工作区（端到端 latent rel ~0.33 未解释），**未提交，等视觉门 + 用户确认**。  
+- T3（PDMD/DMAD）：**仍标未验证（无 GPU 视觉验收）**。PDMD-2NFE 合同复验过；**PDMD-4NFE 原件正式验收未做**。开发侧：`h3_fewstep_contract`（`7fe119c`）与 `lcm_renoise`（`e037d42`）已落地；禁止用 Euler/turbo4 冒充 DMAD 通过。  
 - DeepInfer：只取可复现门禁 + 可选异步重叠审计；**不新增算力主线**（见 `2026-10-26-deepinfer-to-h3c-takeaways.md`）。  
-- 工作区脏：链式源码、`h3_lora.c` 等 + 多份 10-09/10-26 研究文档未入库；238 盘接近满，nsys/清理等授权。
+- 工作区脏：链式源码、`h3_lora.c` 等 + 多份 10-09 研究文档未入库；238 盘接近满；**清盘 / nsys / push / 链式提交均未做**。
+
+### 2.1 已落地（开发，Asia/Singapore）
+
+| 提交 | 时间（UTC+8） | 内容 |
+| --- | --- | --- |
+| `ef5f732` | 2026-10-26 21:36 | DeepInfer 取舍 + follow-up 开发计划 |
+| `675e878` | 2026-10-26 21:40 | P0 视觉门 runbook + 合同自检设计 |
+| `5949d37` | 2026-10-26 21:40 | `tools/p0_protocol_check_log.py`（离线协议检） |
+| `7fe119c` | 2026-10-26 21:44 | `h3_fewstep_contract`：`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`，错合同 FAIL；host 单测 |
+| `e037d42` | 2026-10-26 21:51 | `h3_sampler`：`--sampler lcm_renoise`（DMAD）；dmad4 自动选 lcm；host 单测 |
+
+**仍未做：** 238 上 P0 视觉门跑数、`git push` origin、链式 WIP 提交、磁盘清理 / nsys。
 
 ---
 
@@ -51,9 +63,9 @@
 | 臂 | 内容 | 停手条件 |
 | --- | --- | --- |
 | **T3 · PDMD-4NFE** | 原件转换（QKV 合成 / refiner 标记）→ 480p 合同跑 → 目检 | 错合同或 OOM 未按 r2 类预热修复前，不标通过 |
-| **T3 · DMAD** | `lcm_renoise` 已实现；再 `full_critic` GPU 验收 | 未视觉验收则整臂暂停 |
+| **T3 · DMAD** | `lcm_renoise` 已实现（`e037d42`）；再 `full_critic` GPU 验收 | 未视觉验收则整臂暂停 |
 | **工程 · 异步审计** | 生命周期与显存峰值笔记（DeepInfer 取舍 B） | 只出审计笔记，不改热路径分支 |
-| **合同自检** | 错 preset / 错 shift / 错 sampler 加载 FAIL 或硬警告 | 与 P1/P2 一起落地 |
+| **合同自检** | 错 preset / 错 shift / 错 sampler 加载 FAIL（`7fe119c`） | **代码已落地**；GPU 少步验收时务必打开合同旋钮 |
 
 量化臂（NVFP4）与少步臂（LoRA）**禁止**首轮交叉验收。
 
@@ -75,7 +87,7 @@
 | --- | --- |
 | 磁盘清理（238 `/mnt/nvme1n1` ~99%、根分区紧） | 未授权不删资产 |
 | nsys / EVT 剖析 | 盘满时不写 trace；需授权 |
-| `git push` origin（ahead 15） | 未推送；含 SDPA/NVFP4 基线等 |
+| `git push` origin（ahead **20**） | 未推送；含 SDPA/NVFP4 基线 + P0 docs + fewstep/lcm |
 | 提交链式源码与脏工作区（`h3_dit_nvfp4_chain.cu` 等） | 视觉门 + 明确确认 |
 | 把 NVFP4 升为默认或并入 golden | 视觉门通过后的产品决策 |
 
@@ -89,10 +101,10 @@
 2. [ ] **P0 视觉门**：graph 关、chain 关，NVFP4 vs 稳定 INT8，P2.2 协议重做目检 + 同配置 waffle；结论写入进展文档（通过 / 不可用 / 需改核），**作废** graph 修复前旧片子。  
 3. [ ] **P1 耗时**：仅追加 timing 文档缺项（同协议重复、标明冷启动）；不挡视觉结论。  
 4. [ ] **∥ T3 PDMD-4NFE**：原件 → h3repo → 864×480、4-step Euler、shift 12/3、cfg 1、INT8；记录 sigma 与 `refiner_pairs`；目检。  
-5. [ ] **∥ 合同自检草稿**：错合同（如 turbo4 + DMAD 权重）应失败或警告的设计说明（可先文档后代码）。  
-6. [x] **P2 DMAD 采样器**：`h3_sampler` / `--sampler lcm_renoise`（2026-10-26）；[ ] `full_critic` GPU 验收（仅在你点头后）。  
+5. [x] **∥ 合同自检**：设计 [`2026-10-26-contract-selfcheck-design.md`](2026-10-26-contract-selfcheck-design.md) + 代码 `7fe119c`（`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`）；host 单测过。GPU 少步跑时务必启用。  
+6. [x] **P2 DMAD 采样器**：`h3_sampler` / `--sampler lcm_renoise`（`e037d42`，2026-10-26）；[ ] `full_critic` GPU 验收（仅在你点头后；238 未跑）。  
 7. [ ] **P2 可选**：TE/VAE/DiT 生命周期与预热显存审计一页笔记。  
-8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push 15 commits、是否清盘/nsys。  
+8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push（现 ahead 20）、是否清盘/nsys。  
 9. [ ] **生产债（不插队）**：`c_te_raw` 偶发不确定单独开修；修完前速度场对照继续优先 refine/`H3_TEXT_H_LOAD`。
 
 ---
@@ -105,6 +117,8 @@
 | [`2026-10-09-generation-timing.md`](2026-10-09-generation-timing.md) | 唯一耗时账本 |
 | [`2026-10-09-pdmd-dmad-loras.md`](2026-10-09-pdmd-dmad-loras.md) | T3 合同、2NFE 复验、T3 未验证 |
 | [`2026-10-26-deepinfer-to-h3c-takeaways.md`](2026-10-26-deepinfer-to-h3c-takeaways.md) | DeepInfer 取舍（纪律 / 否定清单） |
+| [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md) | P0 INT8/NVFP4 对照命令与纪律 |
+| [`2026-10-26-contract-selfcheck-design.md`](2026-10-26-contract-selfcheck-design.md) | 少步合同 FAIL 矩阵；Phase-1 已落地 |
 | [`2026-10-07-llm-to-dit-transfer.md`](2026-10-07-llm-to-dit-transfer.md) | LLM→DiT 迁移裁决表 |
 | [`2026-10-07-nvfp4-w4a4-path.md`](2026-10-07-nvfp4-w4a4-path.md) | NVFP4 P2.2 视觉协议 |
 | [`2026-10-26-dmad-lcm-renoise-sampler.md`](2026-10-26-dmad-lcm-renoise-sampler.md) | DMAD lcm+simple 公式与 API |
@@ -121,3 +135,4 @@
 | 2026-10-26 | 初稿：收束 10-09 主线 + PDMD/DMAD + DeepInfer 取舍为 P0–P3 与近两周 checklist。 |
 | 2026-10-26 | P2：CUDA `lcm_renoise` 采样器落地；GPU `full_critic` 验收仍待授权。 |
 | 2026-10-26 | 勾 §6.1；链到 P0 runbook + 合同自检设计 + `tools/p0_protocol_check_log.py`。 |
+| 2026-10-26 | 勾 §6.5（`7fe119c`）；§6.6 采样器 hash `e037d42`；新增 §2.1 已落地表；基线改为 ahead 20；明确 238 视觉门 / push / 链式 / 清盘仍未做。 |
