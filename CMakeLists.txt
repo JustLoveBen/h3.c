@@ -1060,6 +1060,12 @@ target_include_directories(h3_nvfp4_act_convrot_test PRIVATE ${CMAKE_CURRENT_SOU
 target_compile_features(h3_nvfp4_act_convrot_test PRIVATE c_std_11)
 target_link_libraries(h3_nvfp4_act_convrot_test PRIVATE m)
 
+add_executable(h3_nvfp4_sf_bytes_test
+  tests/test_h3_nvfp4_sf_bytes.c)
+target_include_directories(h3_nvfp4_sf_bytes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_nvfp4_sf_bytes_test PRIVATE c_std_11)
+target_compile_definitions(h3_nvfp4_sf_bytes_test PRIVATE TEST_H3_NVFP4_SF_BYTES_STANDALONE)
+
 add_executable(h3_w4a8_window_test
   tests/test_h3_w4a8_window.c)
 target_include_directories(h3_w4a8_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

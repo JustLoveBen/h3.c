@@ -229,3 +229,12 @@ Code: `nvfp4_act_maybe_convrot` in `h3_dit_w4a8.c` (default ON when
 Host proof: `tests/test_h3_nvfp4_act_convrot.c` ALL PASS.
 **238 rebuild + P0 NVFP4 vs INT8 + OR re-review still required** before
 lifting BLOCK. Chain remains unset / auto-skipped when ConvRot required.
+
+
+## Addendum — C001 NVFP4 SF K-extent pad (2026-10-27)
+
+`h3_cuda_nvfp4_weight_create` copied `rb*ncb*512` while sidecar/act/cuBLASLt
+use `ncb_rd=(ncb+31)&~31`. For DiT K=5376 (ncb=84→96) this truncated ~12.5% of
+SF and **scrambled every row-block after the first** on qkv/out/fc1. fc2
+(K=14336, ncb=224) was unaffected. Combined with prior act-ConvRot fix; 238
+P0 re-run pending this commit.

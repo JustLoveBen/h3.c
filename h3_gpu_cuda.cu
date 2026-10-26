@@ -4608,7 +4608,7 @@ static int h3_cuda_quantize_act_nvfp4(h3_cuda *cuda, const float *d_x,
 
 /* Public wrapper (P1.2/P1.3 shared): quantize an F32 [m,k] tensor to NVFP4
  * packed E2M1 + swizzled UE4M3 SF. Caller allocates d_x_fp4 (m*k/2 bytes) and
- * d_sf (sf_elems(m, k/16) = ceil(m/128)*ceil(k/16/4)*512 bytes). */
+ * d_sf (ceil(m/128)*ceil(ncb/32)*32*512 bytes, ncb=(k/16)/4). */
 int h3_cuda_quantize_act_nvfp4_dev(h3_cuda *cuda, const float *d_x, size_t m,
                                    size_t k, uint8_t *d_x_fp4, uint8_t *d_sf,
                                    char *error, size_t error_size) {
@@ -5655,6 +5655,15 @@ fail_slot:
  * host staging owned until ready).
  * ----------------------------------------------------------------------- */
 
+size_t h3_cuda_nvfp4_sf_bytes(size_t rows, size_t k) {
+    size_t ncb, ncb_rd, rb;
+    if (rows == 0 || k == 0 || (k & 63u) != 0) return 0;
+    ncb = (k / 16u) / 4u;                 /* == k/64; K%64==0 */
+    ncb_rd = (ncb + 31u) & ~(size_t)31u;  /* cuBLASLt 2048-K tile-col pad */
+    rb = (rows + 127u) / 128u;
+    return rb * ncb_rd * 512u;
+}
+
 int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
                                 const uint8_t *sf_swizzled_host, float scale2,
                                 size_t n, size_t k,
@@ -5676,7 +5685,15 @@ int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
         return 0;
     }
     w_bytes = n * (k / 2);
-    sf_bytes = ((n + 127u) / 128u) * (((k / 16u) + 3u) / 4u) * 512u;
+    /* MUST match tools/quant_dit_nvfp4.py + act quant (ncb_rd pad). The old
+     * unpadded rb*ncb*512 truncated K=5376 sidecars (ncb=84→need 96) and
+     * scrambled SF for every linear with rb>1 → full-frame mosaic. */
+    sf_bytes = h3_cuda_nvfp4_sf_bytes(n, k);
+    if (sf_bytes == 0) {
+        h3_cuda_set_error(error, error_size,
+                          "nvfp4 weight SF size: need K%64==0 and n,k>0");
+        return 0;
+    }
     status = cudaSetDevice(cuda->device_index);
     if (status != cudaSuccess) {
         h3_cuda_set_error_cuda(error, error_size, "cudaSetDevice", status);

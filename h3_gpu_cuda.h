@@ -433,6 +433,11 @@ int h3_cuda_quantize_act_nvfp4_dev(h3_cuda *cuda, const float *d_x, size_t m,
  * ensure_ready / weight_free); on failure the caller retains them. */
 typedef struct h3_cuda_nvfp4_weight h3_cuda_nvfp4_weight;
 
+/* cuBLASLt NVFP4 SF bytes for `rows` x K: ceil(rows/128) * ceil(ncb/32)*32 * 512
+ * where ncb=(K/16)/4. K-extent pad is mandatory when ncb%32!=0 (e.g. K=5376
+ * ncb=84 → ncb_rd=96); omitting it truncates/scrambles multi-row-block SF. */
+size_t h3_cuda_nvfp4_sf_bytes(size_t rows, size_t k);
+
 int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
                                 const uint8_t *sf_swizzled_host, float scale2,
                                 size_t n, size_t k,
