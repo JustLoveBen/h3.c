@@ -102,6 +102,7 @@
 3. [ ] **P1 耗时**：仅追加 timing 文档缺项（同协议重复、标明冷启动）；不挡视觉结论。  
 4. [ ] **∥ T3 PDMD-4NFE**：原件 → h3repo → 864×480、4-step Euler、shift 12/3、cfg 1、INT8；记录 sigma 与 `refiner_pairs`；目检。  
 5. [x] **∥ 合同自检**：设计 [`2026-10-26-contract-selfcheck-design.md`](2026-10-26-contract-selfcheck-design.md) + 代码 `7fe119c`（`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`）；host 单测过。GPU 少步跑时务必启用。  
+5b. [x] **∥ 少步一键 preset**：`--fewstep-preset` / `H3_FEWSTEP_PRESET`（[`2026-10-26-fewstep-preset.md`](2026-10-26-fewstep-preset.md)）；绑 steps/cfg/shift/sampler/contract；勿叠 turbo4。  
 6. [x] **P2 DMAD 采样器**：`h3_sampler` / `--sampler lcm_renoise`（`e037d42`，2026-10-26）；[ ] `full_critic` GPU 验收（仅在你点头后；238 未跑）。  
 7. [ ] **P2 可选**：TE/VAE/DiT 生命周期与预热显存审计一页笔记。  
 8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push（现 ahead 20）、是否清盘/nsys。  
@@ -122,6 +123,7 @@
 | [`2026-10-07-llm-to-dit-transfer.md`](2026-10-07-llm-to-dit-transfer.md) | LLM→DiT 迁移裁决表 |
 | [`2026-10-07-nvfp4-w4a4-path.md`](2026-10-07-nvfp4-w4a4-path.md) | NVFP4 P2.2 视觉协议 |
 | [`2026-10-26-dmad-lcm-renoise-sampler.md`](2026-10-26-dmad-lcm-renoise-sampler.md) | DMAD lcm+simple 公式与 API |
+| [`2026-10-26-fewstep-preset.md`](2026-10-26-fewstep-preset.md) | `--fewstep-preset` 一键绑 PDMD/DMAD 合同 |
 | [`2026-10-08-nvfp4-chained-direct-output.md`](2026-10-08-nvfp4-chained-direct-output.md) | 链式；§12 降为调试尺 |
 | [`../superpowers/plans/2026-10-05-h3-optimization-roadmap.md`](../superpowers/plans/2026-10-05-h3-optimization-roadmap.md) | T1–T4 SKU |
 | [`../nvidia_optimization_plan.md`](../nvidia_optimization_plan.md) | INT8 主路径 / 主题禁项 |
@@ -136,3 +138,4 @@
 | 2026-10-26 | P2：CUDA `lcm_renoise` 采样器落地；GPU `full_critic` 验收仍待授权。 |
 | 2026-10-26 | 勾 §6.1；链到 P0 runbook + 合同自检设计 + `tools/p0_protocol_check_log.py`。 |
 | 2026-10-26 | 勾 §6.5（`7fe119c`）；§6.6 采样器 hash `e037d42`；新增 §2.1 已落地表；基线改为 ahead 20；明确 238 视觉门 / push / 链式 / 清盘仍未做。 |
+| 2026-10-26 | 勾 §6.5b：`--fewstep-preset` 一键合同；GPU 验收仍未做。 |

@@ -1792,6 +1792,7 @@ int main(int argc, char **argv) {
     const char *preset_name = NULL;
     const char *lora_path = NULL;
     const char *fewstep_contract_cli = NULL;
+    const char *fewstep_preset_cli = NULL;
     h3_fewstep_id fewstep_id = H3_FEWSTEP_NONE;
     const char *sampler_cli = NULL;
     int sampler_explicit = 0;
@@ -2249,6 +2250,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[iarg], "--fewstep-contract") &&
                    iarg + 1 < argc)
             fewstep_contract_cli = argv[++iarg];
+        else if (!strcmp(argv[iarg], "--fewstep-preset") &&
+                   iarg + 1 < argc)
+            fewstep_preset_cli = argv[++iarg];
         else if (!strcmp(argv[iarg], "--sampler") && iarg + 1 < argc) {
             sampler_cli = argv[++iarg];
             sampler_explicit = 1;
@@ -2379,6 +2383,12 @@ int main(int argc, char **argv) {
                     "      dmad4 需要 --sampler lcm_renoise（未显式设时自动选）。\n"
                     "      H3_AUDIO_SIGMA_SHIFT=2；H3_FEWSTEP_STRICT=1；\n"
                     "      H3_FEWSTEP_ALLOW_NVFP4=1。\n"
+                    "  --fewstep-preset pdmd4|pdmd2|dmad4\n"
+                    "      一键绑合同：steps/cfg/shift/sampler/--fewstep-contract。\n"
+                    "      或 H3_FEWSTEP_PRESET=。勿与 --preset turbo4/taomate 叠。\n"
+                    "      pdmd4: 4-step Euler shift 12/3 cfg1；pdmd2: 2-step；\n"
+                    "      dmad4: 4-step lcm_renoise shift 12/2 cfg1。\n"
+                    "      仍须 --lora 原件；显式 --steps/--cfg/--sampler 优先。\n"
                     "  --sampler velocity_euler|lcm_renoise\n"
                     "      或 H3_SAMPLER=。默认 velocity_euler。\n"
                     "      lcm_renoise = Comfy lcm+simple（DMAD 合同）。\n"
@@ -2568,6 +2578,69 @@ int main(int argc, char **argv) {
                     "h3: preset=%s 非金线（MAE 金线不适用）\n",
                     preset_name && preset_name[0] ? preset_name : "fast");
     }
+    /* One-shot fewstep preset: expand steps/cfg/audio shift/contract/sampler. */
+    {
+        char perr[384];
+        h3_fewstep_preset_in pin;
+        h3_fewstep_preset_out pout;
+        h3_fewstep_id contract_pre = H3_FEWSTEP_NONE;
+        int contract_pre_set = 0;
+        perr[0] = '\0';
+        if (fewstep_contract_cli && fewstep_contract_cli[0]) {
+            contract_pre = h3_fewstep_contract_parse(fewstep_contract_cli, perr,
+                                                     sizeof(perr));
+            if (perr[0]) {
+                fprintf(stderr, "h3: %s\n", perr);
+                return 1;
+            }
+            contract_pre_set = 1;
+        } else if (getenv("H3_FEWSTEP_CONTRACT") &&
+                   getenv("H3_FEWSTEP_CONTRACT")[0]) {
+            contract_pre = h3_fewstep_contract_resolve(NULL, perr, sizeof(perr));
+            if (perr[0]) {
+                fprintf(stderr, "h3: %s\n", perr);
+                return 1;
+            }
+            contract_pre_set = 1;
+        }
+        memset(&pin, 0, sizeof(pin));
+        pin.name = fewstep_preset_cli;
+        pin.steps_explicit = steps_explicit;
+        pin.steps = steps;
+        pin.cfg_explicit = cfg_explicit;
+        pin.cfg_scale = cfg_scale;
+        pin.sampler_explicit = sampler_explicit;
+        pin.contract_already_set = contract_pre_set;
+        pin.contract_already = contract_pre;
+        if (!h3_fewstep_preset_apply(&pin, &pout, perr, sizeof(perr))) {
+            fprintf(stderr, "h3: %s\n", perr);
+            return 1;
+        }
+        if (pout.applied) {
+            if (preset_out.id == H3_PRESET_TURBO4 ||
+                preset_out.id == H3_PRESET_TAOMATE) {
+                fprintf(stderr,
+                        "h3: --fewstep-preset %s 与 --preset %s 互斥"
+                        "（会改写 sigma；请无 speed preset + serving shift）\n",
+                        h3_fewstep_contract_name(pout.id),
+                        preset_name && preset_name[0] ? preset_name : "?");
+                return 1;
+            }
+            steps = pout.steps;
+            cfg_scale = pout.cfg_scale;
+            if (!cfg_explicit)
+                cfg_explicit = 1; /* treat as bound so later F2VA default skips */
+            if (pout.set_audio_env && pout.audio_env_value)
+                setenv("H3_AUDIO_SIGMA_SHIFT", pout.audio_env_value, 0);
+            if (!fewstep_contract_cli || !fewstep_contract_cli[0])
+                fewstep_contract_cli = h3_fewstep_contract_name(pout.id);
+            if (!sampler_explicit && pout.want_lcm_renoise) {
+                sampler_cli = "lcm_renoise";
+                /* still not "explicit" so dmad auto path also works */
+            }
+            h3_fewstep_preset_print(&pout);
+        }
+    }
     {
         char serr[256];
         serr[0] = '\0';
@@ -2626,6 +2699,16 @@ int main(int argc, char **argv) {
         printf("sampler: selected=%s (explicit=%d fewstep=%s)\n",
                h3_sampler_name(sampler_id), sampler_explicit,
                h3_fewstep_contract_name(fewstep_id));
+        if (fewstep_id != H3_FEWSTEP_NONE) {
+            printf("fewstep_bound: contract=%s steps=%d cfg=%.3g "
+                   "video_shift=%.3g audio_shift=%.3g sampler=%s "
+                   "speed_preset=%s\n",
+                   h3_fewstep_contract_name(fewstep_id), steps,
+                   (double)cfg_scale, (double)H3_CUDA_VIDEO_SIGMA_SHIFT,
+                   (double)audio_sigma_shift_effective(),
+                   h3_sampler_name(sampler_id),
+                   preset_name && preset_name[0] ? preset_name : "none");
+        }
         fflush(stdout);
     }
     if (ulysses < 1)

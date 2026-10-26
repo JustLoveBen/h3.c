@@ -348,3 +348,106 @@ int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err
     fflush(stdout);
     return 1;
 }
+
+int h3_fewstep_preset_apply(const h3_fewstep_preset_in *in,
+                            h3_fewstep_preset_out *out, char *err,
+                            size_t err_size) {
+    const char *name;
+    h3_fewstep_id id;
+    char perr[192];
+
+    if (err && err_size)
+        err[0] = '\0';
+    if (!in || !out)
+        return fail_msg(err, err_size, "fewstep_preset: null args");
+    memset(out, 0, sizeof(*out));
+    out->steps = in->steps;
+    out->cfg_scale = in->cfg_scale;
+    out->video_shift = 12.0f;
+    out->audio_shift = 3.0f;
+    out->id = H3_FEWSTEP_NONE;
+    out->applied = 0;
+
+    name = in->name;
+    if (!name || !name[0]) {
+        name = getenv("H3_FEWSTEP_PRESET");
+        if (!name || !name[0])
+            return 1;
+    }
+
+    perr[0] = '\0';
+    id = h3_fewstep_contract_parse(name, perr, sizeof(perr));
+    if (id == H3_FEWSTEP_NONE) {
+        snprintf(perr, sizeof(perr),
+                 "unknown --fewstep-preset '%s' (pdmd4|pdmd2|dmad4)", name);
+        return fail_msg(err, err_size, perr);
+    }
+
+    if (in->contract_already_set && in->contract_already != H3_FEWSTEP_NONE &&
+        in->contract_already != id) {
+        snprintf(perr, sizeof(perr),
+                 "fewstep_preset=%s 与 --fewstep-contract %s 冲突",
+                 h3_fewstep_contract_name(id),
+                 h3_fewstep_contract_name(in->contract_already));
+        return fail_msg(err, err_size, perr);
+    }
+
+    out->applied = 1;
+    out->id = id;
+    out->video_shift = 12.0f;
+    out->want_lcm_renoise = (id == H3_FEWSTEP_DMAD4) ? 1 : 0;
+    out->set_audio_env = 1;
+
+    switch (id) {
+    case H3_FEWSTEP_PDMD4:
+        if (!in->steps_explicit)
+            out->steps = 4;
+        if (!in->cfg_explicit)
+            out->cfg_scale = 1.0f;
+        out->audio_shift = 3.0f;
+        out->audio_env_value = "3";
+        break;
+    case H3_FEWSTEP_PDMD2:
+        if (!in->steps_explicit)
+            out->steps = 2;
+        if (!in->cfg_explicit)
+            out->cfg_scale = 1.0f;
+        out->audio_shift = 3.0f;
+        out->audio_env_value = "3";
+        break;
+    case H3_FEWSTEP_DMAD4:
+        if (!in->steps_explicit)
+            out->steps = 4;
+        if (!in->cfg_explicit)
+            out->cfg_scale = 1.0f;
+        out->audio_shift = 2.0f;
+        out->audio_env_value = "2";
+        break;
+    case H3_FEWSTEP_NONE:
+    default:
+        return fail_msg(err, err_size, "fewstep_preset: internal id");
+    }
+
+    /* Keep explicit CLI values (contract check may FAIL later). */
+    if (in->steps_explicit)
+        out->steps = in->steps;
+    if (in->cfg_explicit)
+        out->cfg_scale = in->cfg_scale;
+
+    (void)in->sampler_explicit; /* sampler chosen by caller from want_lcm */
+    return 1;
+}
+
+void h3_fewstep_preset_print(const h3_fewstep_preset_out *out) {
+    const char *sampler;
+    if (!out || !out->applied)
+        return;
+    sampler = out->want_lcm_renoise ? "lcm_renoise" : "velocity_euler";
+    printf("fewstep_preset: id=%s steps=%d cfg=%.3g video_shift=%.3g "
+           "audio_shift=%.3g sampler=%s contract=%s\n",
+           h3_fewstep_contract_name(out->id), out->steps,
+           (double)out->cfg_scale, (double)out->video_shift,
+           (double)out->audio_shift, sampler,
+           h3_fewstep_contract_name(out->id));
+    fflush(stdout);
+}

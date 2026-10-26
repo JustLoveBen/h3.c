@@ -13,6 +13,8 @@ extern "C" {
  * docs/research/2026-10-26-contract-selfcheck-design.md
  *
  * 旋钮：--fewstep-contract pdmd4|pdmd2|dmad4 或 H3_FEWSTEP_CONTRACT=
+ * 一键：--fewstep-preset pdmd4|pdmd2|dmad4 或 H3_FEWSTEP_PRESET=
+ *       （绑 steps/cfg/shift/sampler/contract；勿与 turbo4 叠）
  * 可选：H3_FEWSTEP_STRICT=1（pdmd2 audio∉{3,6} 升 FAIL）
  *       H3_FEWSTEP_ALLOW_NVFP4=1（允许合同×NVFP4 交叉，默认拒）
  */
@@ -64,6 +66,44 @@ int h3_fewstep_contract_check_sigmas(const h3_fewstep_contract_in *in, char *err
 
 /* Log: fewstep_contract: id=... steps=... sampler=... shifts=... */
 void h3_fewstep_contract_print(const h3_fewstep_contract_in *in);
+
+/*
+ * One-shot fewstep preset (--fewstep-preset / H3_FEWSTEP_PRESET):
+ * expands steps + cfg + audio shift + sampler preference + contract id.
+ * Does NOT touch --preset turbo4/taomate (caller must refuse that combo).
+ * Explicit steps/cfg/sampler from CLI are kept; contract check may still FAIL.
+ */
+typedef struct h3_fewstep_preset_in {
+    const char *name; /* CLI; NULL → H3_FEWSTEP_PRESET env */
+    int steps_explicit;
+    int steps;
+    int cfg_explicit;
+    float cfg_scale;
+    int sampler_explicit;
+    /* 1 if user/env already named --fewstep-contract / H3_FEWSTEP_CONTRACT */
+    int contract_already_set;
+    h3_fewstep_id contract_already;
+} h3_fewstep_preset_in;
+
+typedef struct h3_fewstep_preset_out {
+    int applied; /* 1 if a named preset expanded */
+    h3_fewstep_id id;
+    int steps;
+    float cfg_scale;
+    float video_shift;
+    float audio_shift;
+    int want_lcm_renoise; /* 1 → dmad4 */
+    /* 1 → caller should setenv(H3_AUDIO_SIGMA_SHIFT, audio_env_value, 0) */
+    int set_audio_env;
+    const char *audio_env_value; /* static "2" or "3"; may be NULL */
+} h3_fewstep_preset_out;
+
+/* 1 = ok. applied=0 when name/env empty. Unknown name → 0 + err. */
+int h3_fewstep_preset_apply(const h3_fewstep_preset_in *in,
+                            h3_fewstep_preset_out *out, char *err,
+                            size_t err_size);
+
+void h3_fewstep_preset_print(const h3_fewstep_preset_out *out);
 
 #ifdef __cplusplus
 }

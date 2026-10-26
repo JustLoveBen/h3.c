@@ -62,6 +62,7 @@ PDMD-4 期望视频格点（serving `linspace` + shift 12）应与发布 `studen
 | 离线协议检 `tools/p0_protocol_check_log.py` | 已有（`5949d37`）；少步 shift 扩项可选 |
 | 进程内 `h3_fewstep_contract_check` + CLI/env | **已落地** `7fe119c`（`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`） |
 | `lcm_renoise` 与 dmad4 自动选 | **已落地** `e037d42` |
+| `--fewstep-preset` 一键绑合同 | **已落地**（见 `2026-10-26-fewstep-preset.md`） |
 | GPU 少步 / DMAD 视觉验收 | **未做**（等授权上 238） |
 
 仍不在本文件范围：改脏 `h3_lora.c`、NVFP4 chain、push。
@@ -83,3 +84,4 @@ P0 视觉门 **不启用** 少步合同（无 LoRA、8-step、shift 12/默认 au
 | 2026-10-26 | Phase-1：`h3_fewstep_contract.c` + `--fewstep-contract` / `H3_FEWSTEP_CONTRACT`；early+sigma 金向量；dmad4 无 lcm 硬拒；Mac `make h3_fewstep_contract_test`。 |
 | 2026-10-26 | Phase-2：`h3_sampler` + `--sampler lcm_renoise`；dmad4 自动选 lcm；见 `2026-10-26-dmad-lcm-renoise-sampler.md`。GPU 验收看该文。 |
 | 2026-10-26 | §4 改为实现状态表；钉 commit `7fe119c` / `e037d42`；明确 GPU 未跑。 |
+| 2026-10-26 | `--fewstep-preset pdmd4|pdmd2|dmad4` 一键展开；不改 turbo4。 |
