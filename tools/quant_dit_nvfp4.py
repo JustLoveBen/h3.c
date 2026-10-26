@@ -13,8 +13,9 @@ Hadamard-rotated weights, so act-side rotation is unchanged).
 SF swizzle = layout measured empirically on sm_120 cuBLASLt
 (bench/nvfp4_phase0/diag_sf_layout.cu single-marker probe), MUST match the
 runtime quantize kernel h3_cuda_quantize_act_nvfp4_kernel:
-  tile = (r//128)*ncb + (c//4);  off = tile*512 + (r%128)*4 + (c%4)
-  (ncb = (K/16)//4; K%64==0). 128 rows major, 4 mblock cols minor.
+  tile = (r//128)*ncb_rd + (c//4)
+  off  = tile*512 + 16*((r%128)%32) + 4*((r%128)//32) + (c%4)
+  (ncb_rd=ceil(ncb/32)*32; ncb=(K/16)//4; K%64==0). 32x4 row swizzle in-tile.
 
 Usage:
   python quant_dit_nvfp4.py SRC.safetensors DST.safetensors [--blocks N]
@@ -93,7 +94,7 @@ def quant_linear(w_i8, per_row_scale):
     odd = nib[:, 1::2]
     packed = ((even << 4) | (odd & 0xF)).astype(np.uint8)   # [N,K/2] hi_first
     # swizzle SF [N,nc] -> blocked, measured sm_120 layout:
-    # off = tile*512 + (r%128)*4 + (c%4), tile = (r//128)*ncb_rd + c//4
+    # off = tile*512 + 16*((r%128)%32) + 4*((r%128)//32) + (c%4), tile = (r//128)*ncb_rd + c//4
     # cuBLASLt reads a padded K-extent of ceil(ncb/32)*32 tile-cols per 128-row
     # tile (2048 K elems each); for K%2048!=0 the tail must exist and be 0
     # (a stale byte >= 0xFE is UE4M3 NaN and poisons the accumulator).
@@ -105,7 +106,10 @@ def quant_linear(w_i8, per_row_scale):
     r_idx = np.arange(rb * 128)
     c_idx = np.arange(ncb_rd * 4)
     tile = (r_idx // 128)[:, None] * ncb_rd + (c_idx // 4)[None, :]
-    off = tile * 512 + (r_idx % 128)[:, None] * 4 + (c_idx % 4)[None, :]
+    r128 = r_idx % 128
+    off = (tile * 512
+           + (16 * (r128 % 32) + 4 * (r128 // 32))[:, None]
+           + (c_idx % 4)[None, :])
     out[off.ravel()] = sf_pad.ravel()
     return packed, out
 

@@ -4419,10 +4419,13 @@ __global__ void h3_cuda_quantize_act_per_row_kernel(const float *x, int8_t *y,
  * SF written in the layout measured empirically on sm_120 cuBLASLt
  * (bench/nvfp4_phase0/diag_sf_layout.cu single-marker probe, both row and
  * column decoded): logical (row r, micro-block c) maps to
- *   tile = (r/128)*ncb + c/4   (ncb = (K/16)/4, K%64==0)
- *   off  = tile*512 + (r%128)*4 + (c%4)
- * i.e. within a 512B tile the 128 rows are the major axis (4 bytes each) and
- * the 4 micro-block columns are the minor axis. One block per row; 256
+ *   tile = (r/128)*ncb_rd + c/4   (ncb_rd = ceil(ncb/32)*32, ncb=(K/16)/4)
+ *   off  = tile*512 + 16*((r%128)%32) + 4*((r%128)/32) + (c%4)
+ * i.e. within a 512B tile, rows are 32x4-swizzled (NOT linear r*4+cc).
+ * Empirically confirmed by bench/nvfp4_phase0/diag_sf_layout.cu on sm_120
+ * (phys=3->row0, phys=7->row32, phys=19->row1, ...). Linear (r%128)*4+cc
+ * mismatches 504/512 slots and was the C001 NVFP4 mosaic root cause.
+ * One block per row; 256
  * threads; 16-wide __shfl_xor butterfly amax; lane0 writes SF, even lane packs.
  * ----------------------------------------------------------------------- */
 __device__ __forceinline__ float h3_e2m1_round(float q) {
@@ -4490,6 +4493,12 @@ __device__ __forceinline__ float h3_ue4m3_to_f32(uint8_t b) {
  * K-tail: cuBLASLt's per-row-tile SF extent is ceil(ncb/32)*32 tile-columns
  * (2048 K elems), so for K%2048!=0 the kernel covers tile-cols up to that
  * padded extent with sf 0 (their nibbles were memset to 0 by the caller). */
+
+/* In-tile SF byte offset for cuBLASLt VEC16_UE4M3 on sm_120 (32x4 swizzle). */
+__device__ __forceinline__ size_t h3_nvfp4_sf_off_in_tile(size_t r128, size_t cc) {
+    return (size_t)16u * (r128 & 31u) + (size_t)4u * (r128 >> 5) + cc;
+}
+
 __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
                                                   uint8_t *__restrict__ x_fp4,
                                                   uint8_t *__restrict__ sf,
@@ -4517,7 +4526,7 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
             int cc;
             for (tc = (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
                 for (cc = 0; cc < 4; cc++)
-                    sf[(tile_base + tc) * 512 + r128 * 4 + (size_t)cc] = 0;
+                    sf[(tile_base + tc) * 512 + h3_nvfp4_sf_off_in_tile(r128, (size_t)cc)] = 0;
         }
         return;
     }
@@ -4548,7 +4557,8 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
             if (lane_in_mb == 0) {
                 size_t cc = (size_t)g & 3u;
                 size_t off_sf =
-                    (tile_base + ((size_t)g >> 2)) * 512 + r128 * 4 + cc;
+                    (tile_base + ((size_t)g >> 2)) * 512 +
+                    h3_nvfp4_sf_off_in_tile(r128, cc);
                 sf[off_sf] = sf_b;
             }
             /* gather lo nibble from odd lane to even lane */
@@ -4567,7 +4577,7 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
             int cc;
             for (tc = ncb + (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
                 for (cc = 0; cc < 4; cc++)
-                    sf[(tile_base + tc) * 512 + r128 * 4 + (size_t)cc] = 0;
+                    sf[(tile_base + tc) * 512 + h3_nvfp4_sf_off_in_tile(r128, (size_t)cc)] = 0;
         }
     }
 }

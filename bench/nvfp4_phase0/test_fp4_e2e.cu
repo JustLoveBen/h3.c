@@ -69,7 +69,8 @@ __global__ void quant_nvfp4_kernel(const float *__restrict__ x,
     const float *xr = x + row * k;
     uint8_t *xr_fp4 = x_fp4 + row * (k >> 1);
     size_t ncb = nc >> 2;
-    size_t tile_base = (row >> 7) * ncb;
+    size_t ncb_rd = (ncb + 31u) & ~(size_t)31u;
+    size_t tile_base = (row >> 7) * ncb_rd;
     size_t r128 = row & 127u;
     int nblk = (int)(nc / 16);
     for (int blk = 0; blk < nblk; blk++) {
@@ -87,7 +88,10 @@ __global__ void quant_nvfp4_kernel(const float *__restrict__ x,
         uint8_t nib = h3_e2m1_nibble(v * inv);
         if (lane_in_mb == 0) {
             size_t cc = (size_t)g & 3u;
-            sf[(tile_base + ((size_t)g >> 2)) * 512 + r128 * 4 + cc] = sf_b;
+            {
+                size_t rsw = (size_t)16u * (r128 & 31u) + (size_t)4u * (r128 >> 5) + cc;
+                sf[(tile_base + ((size_t)g >> 2)) * 512 + rsw] = sf_b;
+            }
         }
         uint8_t nib_lo = (uint8_t)__shfl_down_sync(0xffffffffu, nib, 1);
         if ((lane_in_mb & 1) == 0) {
@@ -98,7 +102,9 @@ __global__ void quant_nvfp4_kernel(const float *__restrict__ x,
 }
 
 static size_t sf_elems(size_t rows, size_t nc) {
-    return ((rows + 127) / 128) * ((nc + 3) / 4) * 512;
+    size_t ncb = (nc + 3) / 4;
+    size_t ncb_rd = (ncb + 31) & ~31u;
+    return ((rows + 127) / 128) * ncb_rd * 512;
 }
 static void quant_host(float *d_x, size_t m, size_t k, uint8_t *d_fp4, uint8_t *d_sf) {
     unsigned gx = m > 65535u ? 65535u : (unsigned)m;
@@ -107,7 +113,7 @@ static void quant_host(float *d_x, size_t m, size_t k, uint8_t *d_fp4, uint8_t *
 }
 
 int main() {
-    const size_t m = 256, n = 384, k = 320;
+    const size_t m = 256, n = 384, k = 512; /* was 320: nc%16!=0 left K-tail unquantized */
     float *hx = (float *)malloc(m * k * 4), *hw = (float *)malloc(n * k * 4);
     srand(7);
     for (size_t i = 0; i < m * k; i++) hx[i] = ((rand() % 2000) - 1000) / 250.f;

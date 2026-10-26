@@ -238,3 +238,10 @@ use `ncb_rd=(ncb+31)&~31`. For DiT K=5376 (ncb=84→96) this truncated ~12.5% of
 SF and **scrambled every row-block after the first** on qkv/out/fc1. fc2
 (K=14336, ncb=224) was unaffected. Combined with prior act-ConvRot fix; 238
 P0 re-run pending this commit.
+
+
+## C001 NVFP4 SF swizzle fix — pending 238 re-gate
+
+After reswizzle of `minimax_h3_fl2va_nvfp4_w4a4.safetensors` + rebuild with 32×4 SF writes:
+re-run P0 INT8 vs NVFP4, same-config waffle, OR free VL. Prior NVFP4 latent checksum
+`0x37f14b6cfc58dced` must change if the fix is live. Chain remains unset/BLOCK.

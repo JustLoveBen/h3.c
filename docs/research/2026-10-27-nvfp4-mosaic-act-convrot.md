@@ -68,3 +68,8 @@ Host unit `tests/test_h3_nvfp4_sf_bytes.c` locks the sizes.
 ### Status
 Re-run C001 P0 NVFP4 vs INT8 + OR VL after 238 rebuild. Keep chain OFF /
 BLOCK until visual PASS.
+
+
+## Update 2026-10-27 later
+SF ncb_rd pad and act ConvRot were necessary but **not** residual mosaic causes.
+True residual: wrong in-tile SF swizzle (linear vs 32x4). See `2026-10-27-nvfp4-mosaic-sf-swizzle.md`.

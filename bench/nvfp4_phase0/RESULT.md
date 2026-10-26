@@ -41,11 +41,13 @@ INT8 臂配置与生产逐字节一致（`CUBLAS_COMPUTE_32I`，复用 `bench/cu
   - 远超 1100 TFLOP/s 量级 → **原生 m16n8k64 block-scaled 核命中确认**
   - 非 dequant→BF16 fallback（fallback 只会有 ~1.0× 且无吞吐翻倍）
 
-## 4. SF 布局验证（待回填）
+## 4. SF 布局验证（2026-10-27 回填）
 
-- 本 bench 的 128×4 swizzle 配方（CUTLASS `Sm1xxBlockScaledBasicChunk` 约定）在 cuBLASLt 下数值是否正确 = __
-  - 方法：SF 全 1.0 + FP4 全常量输入，输出应等于 CPU 参考值；吞吐测量不依赖布局正确性，但 Phase 1 需要。
-  - 若不正确，对照 `torch._scaled_mm`（BlockWise1x16, SWIZZLE_32_4_4）或 CUTLASS `sm100_blockscaled_layout.hpp` 修正。
+- **结论：生产曾用的线性 `(r%128)*4+(c%4)` 在 cuBLASLt sm_120 下不正确。**
+- `diag_sf_layout.cu` 单点探针：`phys=3→row0, phys=7→row32, phys=19→row1` → **32×4 swizzle**
+  `off = tile*512 + 16*((r%128)%32) + 4*((r%128)/32) + (c%4)`（tile 仍按 ncb_rd 铺）。
+- 线性配方与实测差 504/512 槽 → C001 NVFP4 mosaic 根因；已修（见 `docs/research/2026-10-27-nvfp4-mosaic-sf-swizzle.md`）。
+- Phase 0 吞吐 GO 仍成立（吞吐不依赖布局正确性）。
 
 ## 5. 对 roadmap 的影响（已判定 GO）
 

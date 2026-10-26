@@ -416,3 +416,12 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 近 2–8 周排序项（§6） | **18** 步（含并行） |
 
 *「主动条目」含 blocked/partial/idea；landed 纪律项仍列以便审计。*
+
+
+## 2026-10-27 — C001 NVFP4 mosaic SF swizzle (non-chain)
+
+- **Status:** fix landed (default path); chain still BLOCK / no WIP commit.
+- **Root cause:** SF in-tile layout was linear `(r%128)*4+cc`; cuBLASLt sm_120 expects 32×4 `16*((r%128)%32)+4*((r%128)/32)+(c%4)`.
+- **Patch:** `h3_nvfp4_sf_off_in_tile` in `h3_gpu_cuda.cu`; `tools/quant_dit_nvfp4.py`; `tools/reswizzle_nvfp4_sf.py` for existing sidecars.
+- **Doc:** `docs/research/2026-10-27-nvfp4-mosaic-sf-swizzle.md`.
+- **Not residual:** act ConvRot alone, SF ncb_rd byte-count pad alone (checksum unchanged).
