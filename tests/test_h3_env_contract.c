@@ -79,6 +79,10 @@ int main(void) {
                   strstr(buf, "env H3_TE_PROMPT_CACHE=") != NULL);
         expect_ok("te require_hit env",
                   strstr(buf, "env H3_TE_CACHE_REQUIRE_HIT=") != NULL);
+        expect_ok("lifecycle trace env",
+                  strstr(buf, "env H3_LIFECYCLE_TRACE=") != NULL);
+        expect_ok("dump latent env",
+                  strstr(buf, "env H3_DUMP_LATENT=") != NULL);
     }
 
     setenv("H3_EXPECT_P0_VISUAL", "1", 1);

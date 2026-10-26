@@ -123,6 +123,7 @@ DiT steps…
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：锚到 `h3_cuda_generate.c` / `h3_vae_prewarm.*` / `h3_te_cache.*`；收录 PDMD 2NFE 预热 OOM 检查清单。 |
+| 2026-10-27 | C064：白名单落成 `h3_lifecycle_whitelist.h`；说明 [`2026-10-27-lifecycle-deferred-release.md`](2026-10-27-lifecycle-deferred-release.md)；`H3_LIFECYCLE_TRACE` 仅调试打印，**不改重叠**。 |
 
 ---
 
@@ -130,7 +131,7 @@ DiT steps…
 
 来源：[`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md) §1.3 / §1.12。
 
-**DeferredRelease 白名单（概念）：** 允许「多活到下一阶段 event 之后再 free」的对象须显式列出，避免过早 free（UAF）或过晚 free（顶 resident）。当前建议：
+**DeferredRelease 白名单：** 代码表见 `h3_lifecycle_whitelist.h`（C064）；说明 [`2026-10-27-lifecycle-deferred-release.md`](2026-10-27-lifecycle-deferred-release.md)。允许「多活到下一阶段 event 之后再 free」的对象须显式列出，避免过早 free（UAF）或过晚 free（顶 resident）。审计建议（与代码表对齐）：
 
 | 对象 | 释放时机 | 可否延后到 DiT step0 launch 后 |
 |---|---|---|

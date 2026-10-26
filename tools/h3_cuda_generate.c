@@ -42,6 +42,7 @@
 #include "h3_tae.h"
 #include "h3_taomate.h"
 #include "h3_te_cache.h"
+#include "h3_lifecycle_whitelist.h"
 #include "h3_ulysses.h"
 #include "h3_ulysses_comm.h"
 #include "h3_w4a8_window.h"
@@ -423,6 +424,8 @@ static int kick_vae_prewarm(pthread_t *th, h3_vae_prewarm_job *job,
     job->at_step = at_step;
     if (pthread_create(th, NULL, h3_vae_prewarm_th, job) != 0) return 0;
     printf("vae_th: created at=dit_step%d want_dev=%d\n", at_step, want_dev);
+    h3_lifecycle_trace(want_dev ? "VAE prewarm device-W" : "VAE prewarm host",
+                       "dit_step", "kick", want_dev ? "want_dev=1" : "host_only");
     fflush(stdout);
     return 1;
 }
@@ -2782,6 +2785,11 @@ int main(int argc, char **argv) {
         ecl.sdpa = sdpa;
         ecl.arm = want_nvfp4_arm ? "nvfp4" : "int8";
         h3_env_contract_fprint(stdout, &ecl);
+        if (h3_lifecycle_trace_wanted()) {
+            printf("lifecycle_trace: enabled (H3_LIFECYCLE_TRACE=1; "
+                   "debug only, no overlap change)\n");
+            h3_lifecycle_whitelist_fprint(stdout);
+        }
         if (h3_env_contract_expect_p0_visual()) {
             char eerr[512];
             if (!h3_env_contract_check_p0(ecl.arm, eerr, sizeof(eerr))) {
@@ -2894,6 +2902,9 @@ int main(int argc, char **argv) {
         printf("replay_latent: %s → %dx%dx%d (W=%d H=%d frames=%d; "
                "VAE-only A/B, not generation)\n",
                replay_latent_path, lt, lh, lw, width, height, frames_req);
+        printf("dump_once_score_many: mode=replay_geometry path=%s "
+               "latent=%dx%dx%d do_not_retune_gold=1\n",
+               replay_latent_path, lt, lh, lw);
     }
     if (skip_dit && !init_latent_path && !first_frame_path &&
         !last_frame_path && !replay_latent) {
@@ -4383,6 +4394,14 @@ int main(int argc, char **argv) {
                "(bit-fixed VAE input; async off/on must match)\n",
                n_lat,
                (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat));
+        printf("# H3_SCORE_MANY mode=replay path=%s checksum=0x%016llx "
+               "n=%zu\n",
+               replay_latent_path,
+               (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat),
+               n_lat);
+        printf("dump_once_score_many: mode=replay path=%s "
+               "do_not_retune_gold=1\n",
+               replay_latent_path);
     }
     if (lock_first_frame) {
         frame0_lock = (float *)malloc(frame0_elems * sizeof(float));
@@ -5449,6 +5468,8 @@ int main(int argc, char **argv) {
         h3_nvfp4_cuda_disable();
         printf("released TE after encode (before DiT; context=%zu)\n",
                context);
+        h3_lifecycle_trace("TE text_emb+store", "post_refine", "release",
+                           "before_DiT");
     }
     if (host_stage_th_ok && dit_is_nvfp4) {
         /* NVFP4 host dequant reallocs the same host slots the DiT upload
@@ -5457,6 +5478,8 @@ int main(int argc, char **argv) {
         pthread_join(host_stage_th, NULL);
         host_stage_th_ok = 0;
         printf("dit_host_stage: NVFP4 joined before DiT (no overlap；非金线)\n");
+        h3_lifecycle_trace("DiT host_stage pin buf (NVFP4)", "pre_DiT",
+                           "join", "no_overlap");
         fflush(stdout);
     } else if (host_stage_th_ok) {
         /* Do not join all 50 before DiT. Wait for the first 2 blocks so
@@ -5480,6 +5503,8 @@ int main(int argc, char **argv) {
                want,
                hc ? h3_w4a8_cache_host_ready_blocks(hc) : 0,
                now_ms() - tw0);
+        h3_lifecycle_trace("DiT host_stage pin buf (INT8)", "pre_DiT",
+                           "wait_first", "overlap_tail_ok");
         fflush(stdout);
     }
 
@@ -6986,6 +7011,14 @@ clip_denoise:
         printf("dump_latent: clip=%d wrote %zu f32 (%dx%dx%d) checksum=0x%016llx → %s\n",
                clip_i + 1, n_lat, latent_t, latent_h, latent_w,
                (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat),
+               dump_latent_path);
+        printf("# H3_DUMP_ONCE path=%s tokens_n/a checksum=0x%016llx "
+               "shape=%dx%dx%d layout=THW96\n",
+               dump_latent_path,
+               (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat),
+               latent_t, latent_h, latent_w);
+        printf("dump_once_score_many: mode=dump path=%s "
+               "do_not_retune_gold=1\n",
                dump_latent_path);
         fflush(stdout);
         /* Exit right after this clip's final latent is dumped, before VAE.

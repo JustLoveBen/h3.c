@@ -47,6 +47,9 @@ CONTRACT: List[Entry] = [
     ("H3_DIAG_BLK0", "block0 diag", "unset"),
     ("H3_DUMP_LATENT", "dump latent once (gen/score split)", "info"),
     ("H3_REPLAY_LATENT", "replay dumped latent", "info"),
+    ("H3_DUMP_DIR", "oracle dump dir (TE/velocity; not gold retune)", "info"),
+    ("H3_DUMP_ONLY", "1=stop after step0 forward dump", "info"),
+    ("H3_LIFECYCLE_TRACE", "1=print C064 lifecycle whitelist/transitions", "info"),
 ]
 
 

@@ -204,7 +204,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **partial**（内联 landed；GPU 日志未验） | S9/S11 | GPU 跑强制过 `# H3_ENV_CONTRACT` |
 | **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache；[productization](2026-10-27-te-cache-productization.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial**（opt-in 产品化 landed；默认仍 off；GPU HIT 未验） | S1/S9/S12 | GPU 验 HIT；默认策略保持 off |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
-| **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；DeepInfer B | VRAM/WC | 真机峰值 | **partial** | S1 | 安全条件满足再重叠 H2D |
+| **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h` | VRAM/WC | 真机峰值 | **partial**（白名单+trace landed；真重叠仍门控） | S1 | 安全条件满足再重叠 H2D |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
 | **C066** | 测量 | P0 日志协议 | `p0_protocol_check_log.py` | tools | Q | — | **landed** | S9 | GPU 日志强制过检 |
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
@@ -213,7 +213,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；S8 | WC低 | forbid 开关未做 | **partial**（审计页 landed） | S8 | 不挡主线；forbid 另开 |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
-| **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log | Q | — | **partial** | S12 | 固化目录约定 |
+| **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log；[conventions](2026-10-27-dump-once-score-many.md) | Q | — | **partial**（约定+日志标记+checker landed） | S12 | GPU 上跑 dump→replay 验收 |
 | **C074** | 失败分类 | OOM/合同/数值/环境混报 | 退出码/日志 `tag=FAIL_*` | DeepInfer environ 族；与 C061 同批 | Q | — | **partial**（generate 站点 tagged；VAE 专用 tag 无独立站点） | S11 | GPU 日志抽检 |
 | **C075** | host | Qwen prefetch 深度 | `H3_QWEN_PREFETCH*` | text_encoder | WC低 | — | **partial** | S1 | 调参级 |
 | **C076** | DiT | 大量 `H3_DISABLE_FUSED_*` 回退开关 | 回归与 A/B | h3_dit.c env 列表 | D | — | **landed** | S6 | 保持；勿默认关融合 |
@@ -357,6 +357,7 @@ C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
+C073,D,eval,dump-once score-many conventions,partial,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed,fam4,P3
 C069,D,VAE,VAE RoPE memo+H2D skip,partial,fam4,P3
 C080,E,SKU,VDN/SelfLift/TAE tiering,idea,S7,observe

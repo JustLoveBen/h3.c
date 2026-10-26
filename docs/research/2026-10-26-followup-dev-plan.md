@@ -121,6 +121,7 @@
 9i. [x] **∥ turbo4×fewstep 禁配日志检** `tools/fewstep_forbidden_combo_check.py`；P0 runbook §4.3.1 接 waffle 同配置门示例。
 9j. [x] **∥ C061/C074/C040/C070 离线批**：generate 内联 `# H3_ENV_CONTRACT`、`tag=FAIL_*`、`H3_VRAM_LEDGER` 插桩、[`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；说明 [`c061-inline-env-contract`](2026-10-27-c061-inline-env-contract.md)。GPU 统一后验。
 9k. [x] **∥ C062 te_cache 产品化（opt-in）+ C068/C069 RoPE 状态**：HIT/MISS/REQUIRE_HIT、env 合同、p0 `--expect-te-cache-hit`；C068 host memo 已在 HEAD；C069 same-key H2D skip；说明 [`te-cache-productization`](2026-10-27-te-cache-productization.md) / [`c068-c069`](2026-10-27-c068-c069-rope-memo.md)。GPU 统一后验。
+9l. [x] **∥ C064 DeferredRelease 白名单 + C073 dump-once/score-many 约定**：`h3_lifecycle_whitelist.h` / `H3_LIFECYCLE_TRACE`（仅打印）；[`lifecycle-deferred-release`](2026-10-27-lifecycle-deferred-release.md)；[`dump-once-score-many`](2026-10-27-dump-once-score-many.md) + `tools/dump_once_score_many_check.py`。**不改热路径重叠**；GPU 后验。
 
 ---
 

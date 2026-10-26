@@ -41,6 +41,9 @@ static const h3_env_entry k_contract[] = {
     {"H3_DIAG_BLK0", "block0 diag", "unset"},
     {"H3_DUMP_LATENT", "dump latent once (gen/score split)", "info"},
     {"H3_REPLAY_LATENT", "replay dumped latent", "info"},
+    {"H3_DUMP_DIR", "oracle dump dir (TE/velocity; not gold retune)", "info"},
+    {"H3_DUMP_ONLY", "1=stop after step0 forward dump", "info"},
+    {"H3_LIFECYCLE_TRACE", "1=print C064 lifecycle whitelist/transitions", "info"},
 };
 
 static const char *fmt_val(const char *val, char *buf, size_t buf_size) {
