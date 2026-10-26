@@ -7,6 +7,13 @@ Also recognizes T3 fewstep log lines from --fewstep-preset / --fewstep-contract:
   fewstep_bound: ...
   sampler: selected=...
 
+Hard gates (P0 int8|nvfp4):
+  - sdpa_graph: wanted=0
+  - no NVFP4 chain (H3_DIT_NVFP4_CHAIN / FC1->FC2 chained / chain scratch)
+  - shape: line with sdpa= and seed=0x...
+  - sigma schedule print
+  - optional --expect-seed / --expect-skip-audio / --expect-live-te
+
 Does not run the model. Exit 0 = protocol OK; 1 = fail; 2 = usage error.
 See docs/research/2026-10-26-p0-visual-gate-runbook.md and
 docs/research/2026-10-26-fewstep-preset.md.
@@ -36,6 +43,13 @@ def _parse_float(s: str) -> float | None:
         return float(s)
     except ValueError:
         return None
+
+
+def _norm_seed(s: str) -> str:
+    s = s.strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    return s.lstrip("0") or "0"
 
 
 def check_fewstep(text: str, expect: str | None) -> tuple[list[str], list[str]]:
@@ -157,7 +171,6 @@ def check_fewstep(text: str, expect: str | None) -> tuple[list[str], list[str]]:
 
         if m_contract:
             _id_ok(m_contract.group(1), "fewstep_contract")
-            # contract print uses "lcm+re-noise" vs sampler name "lcm_renoise"
             csamp = m_contract.group(3)
             want_c = (
                 "lcm+re-noise"
@@ -222,15 +235,31 @@ def check_fewstep(text: str, expect: str | None) -> tuple[list[str], list[str]]:
     return errs, warnings
 
 
-def check(text: str, arm: str, expect_fewstep: str | None) -> list[str]:
+def check_chain_off(text: str) -> list[str]:
+    errs: list[str] = []
+    if re.search(r"H3_DIT_NVFP4_CHAIN\s*=\s*1", text):
+        errs.append("NVFP4 chain enabled (H3_DIT_NVFP4_CHAIN=1)")
+    if re.search(r"dit_nvfp4:.*CHAIN=1", text):
+        errs.append("dit_nvfp4 CHAIN=1 line present (P0 forbids chain)")
+    if re.search(r"FC1->FC2 chained", text):
+        errs.append("NVFP4 chain path active (FC1->FC2 chained)")
+    if re.search(r"dit_nvfp4:\s*chain scratch", text):
+        errs.append("dit_nvfp4 chain scratch line (P0 forbids chain)")
+    return errs
+
+
+def check(
+    text: str,
+    arm: str,
+    expect_fewstep: str | None,
+    *,
+    expect_seed: str | None = None,
+    expect_skip_audio: bool = False,
+    expect_live_te: bool = False,
+    expect_te_load: bool = False,
+) -> list[str]:
     errs: list[str] = []
     warnings: list[str] = []
-
-    def need(pat: str, label: str) -> re.Match | None:
-        m = re.search(pat, text, re.M)
-        if not m:
-            errs.append(f"missing: {label} (/{pat}/)")
-        return m
 
     # Graph must be off
     m = re.search(r"sdpa_graph:\s*wanted=(\d+)", text)
@@ -239,17 +268,99 @@ def check(text: str, arm: str, expect_fewstep: str | None) -> list[str]:
     elif m.group(1) != "0":
         errs.append(f"sdpa_graph wanted={m.group(1)} (need 0 for P0)")
 
-    # Chain must be off
-    if re.search(r"H3_DIT_NVFP4_CHAIN\s*=\s*1", text) or re.search(
-        r"dit_nvfp4:.*CHAIN=1", text
-    ):
-        errs.append("NVFP4 chain appears enabled (P0 forbids H3_DIT_NVFP4_CHAIN)")
+    errs.extend(check_chain_off(text))
 
-    # Sigma / shift printed (discipline)
+    # Sigma schedule (always for generate completion)
     if not re.search(r"sigma\[0\.\.", text):
         errs.append("missing: sigma[0..N] schedule print")
-    if not re.search(r"adaln_dual_sigma:.*video_shift=", text):
-        errs.append("missing: adaln_dual_sigma video_shift print")
+
+    # shape: banner — sdpa + seed (P0 + fewstep)
+    m_shape = re.search(
+        r"^shape:.*\bsdpa=(\S+).*?\bseed=(0x[0-9a-fA-F]+)",
+        text,
+        re.M,
+    )
+    if not m_shape:
+        # tolerate seed before sdpa ordering variants
+        m_shape = re.search(
+            r"^shape:.*\bseed=(0x[0-9a-fA-F]+).*?\bsdpa=(\S+)",
+            text,
+            re.M,
+        )
+        if m_shape:
+            seed_got, sdpa_got = m_shape.group(1), m_shape.group(2)
+        else:
+            seed_got, sdpa_got = None, None
+            if arm in ("int8", "nvfp4", "fewstep"):
+                errs.append("missing: shape: ... sdpa=... seed=0x... banner")
+    else:
+        sdpa_got, seed_got = m_shape.group(1), m_shape.group(2)
+
+    if expect_seed and seed_got:
+        if _norm_seed(seed_got) != _norm_seed(expect_seed):
+            errs.append(
+                f"seed={seed_got} (want {expect_seed} via --expect-seed)"
+            )
+    elif expect_seed and not seed_got:
+        errs.append(f"missing seed for --expect-seed={expect_seed}")
+
+    # skip-audio / dual sigma
+    m_phase_audio = re.search(
+        r"^phase_ms:.*?audio=([0-9.eE+-]+)", text, re.M
+    )
+    has_dual = bool(re.search(r"adaln_dual_sigma:.*video_shift=", text))
+    if expect_skip_audio:
+        if m_phase_audio:
+            av = _parse_float(m_phase_audio.group(1))
+            if av is not None and av > 1.0:
+                errs.append(
+                    f"phase_ms audio={av} (want ~0 for --expect-skip-audio)"
+                )
+        else:
+            warnings.append(
+                "no phase_ms audio= field (--expect-skip-audio; run may "
+                "have aborted before summary)"
+            )
+        # skip-audio → pack_audio=0 → no adaln_dual_sigma; do not require it
+        if has_dual:
+            warnings.append(
+                "adaln_dual_sigma present with --expect-skip-audio "
+                "(unexpected audio pack)"
+            )
+    else:
+        # Legacy: require dual-sigma when audio likely packed; else warn only
+        if not has_dual:
+            if arm == "fewstep":
+                warnings.append(
+                    "missing adaln_dual_sigma (ok if --skip-audio; "
+                    "fewstep gold usually needs audio shift print)"
+                )
+            elif arm in ("int8", "nvfp4"):
+                warnings.append(
+                    "missing adaln_dual_sigma "
+                    "(P0 visual gate uses --skip-audio; "
+                    "pass --expect-skip-audio to soft-skip this)"
+                )
+
+    # TE path gates
+    has_override = bool(
+        re.search(r"^text_h:\s*override loaded from\s+", text, re.M)
+    )
+    has_text_ck = bool(re.search(r"text_h checksum=0x[0-9a-fA-F]+", text))
+    if expect_live_te and has_override:
+        errs.append(
+            "text_h: override loaded present but --expect-live-te "
+            "(unset H3_TEXT_H_LOAD for visual gate)"
+        )
+    if expect_te_load and not has_override:
+        errs.append(
+            "missing text_h: override loaded (--expect-te-load for "
+            "velocity/md5 diagnostics with H3_TEXT_H_LOAD)"
+        )
+    if arm in ("int8", "nvfp4") and not has_text_ck and not has_override:
+        warnings.append(
+            "no text_h checksum= line (confirm TE / refine ran)"
+        )
 
     if arm == "int8":
         if re.search(r"dit_nvfp4:\s*H3_DIT_NVFP4=1", text):
@@ -260,9 +371,17 @@ def check(text: str, arm: str, expect_fewstep: str | None) -> list[str]:
         if not re.search(r"dit_nvfp4:\s*H3_DIT_NVFP4=1", text):
             errs.append("NVFP4 arm missing dit_nvfp4: H3_DIT_NVFP4=1")
         if not re.search(r"dit_nvfp4:\s*sidecar=", text):
-            warnings.append("no dit_nvfp4: sidecar= line (confirm H3_DIT_NVFP4_FILE)")
+            warnings.append(
+                "no dit_nvfp4: sidecar= line (confirm H3_DIT_NVFP4_FILE)"
+            )
+        if re.search(r"dit_format:\s*INT8", text) and not re.search(
+            r"dit_format:\s*NVFP4", text
+        ):
+            warnings.append(
+                "dit_format: INT8 without dit_format: NVFP4 "
+                "(confirm NVFP4 arm banner)"
+            )
     elif arm == "fewstep":
-        # DiT arm not asserted; fewstep contract is the gate.
         if expect_fewstep is None or expect_fewstep == "none":
             errs.append(
                 "--arm fewstep requires --expect-fewstep pdmd4|pdmd2|dmad4"
@@ -284,12 +403,10 @@ def check(text: str, arm: str, expect_fewstep: str | None) -> list[str]:
     errs.extend(fe)
     warnings.extend(fw)
 
-    # Optional RUN_RC footer
     mrc = re.search(r"^RUN_RC=(\d+)\s*$", text, re.M)
     if mrc and mrc.group(1) != "0":
         errs.append(f"RUN_RC={mrc.group(1)}")
 
-    # phase_ms presence (e2e completeness hint)
     if not re.search(r"phase_ms:", text):
         warnings.append("missing phase_ms (run may have aborted before summary)")
 
@@ -301,15 +418,44 @@ def check(text: str, arm: str, expect_fewstep: str | None) -> list[str]:
 def _self_test() -> int:
     """Host-only fixture checks (no GPU)."""
     base = """sdpa_graph: wanted=0
+shape: 864x480 5s → latent 1x30x54  dit_layers=40 te_layers=0 vae_blocks=0 vae_repeats=0 steps=8 reuse=0 magcache=0 step_cache=off/0 token_red=0 sdpa=cudnn attn_window=0 dist_attn=off overlap=0 cfg=1 seed=0x76800002 context_budget=0 (default 0; hard_max 0) preset=none ulysses=1 vae_decode=on
 sigma[0..4]=1.000 ...
-adaln_dual_sigma: video_shift=12 audio_shift=3
-dit_format: INT8
-phase_ms: total=1
+dit_format: INT8 ConvRot (theme-follow path)
+text_condition: refiner=1 tokens=78 text_mod_row=1(default_TEXT) (refiner QKV follows H3_DIT_QKV_GROUPED; default contiguous) text_h checksum=0xbca4036316f71294 n=419328
+phase_ms: te=1.0 dit=1.0 lift_switch=0.0 vae=1.0 vae_load=0.0 vae_blocks=0.0 audio=0.0 ppm=0.0 mux=0.0 total=1.0 dit_evals=8 dit_skips=0 hot=0 clip=1/1
 RUN_RC=0
 """
-    # P0 INT8 clean
-    e = check(base, "int8", None)
+    # P0 INT8 clean + skip-audio + live TE + seed
+    e = check(
+        base,
+        "int8",
+        None,
+        expect_seed="0x76800002",
+        expect_skip_audio=True,
+        expect_live_te=True,
+    )
     assert not e, e
+
+    # Wrong seed
+    e = check(base, "int8", None, expect_seed="0x76800001")
+    assert any("seed=" in x for x in e), e
+
+    # text_h override vs live-te
+    override = base + "\ntext_h: override loaded from /tmp/c_te_refined.f32 (419328 floats)\n"
+    e = check(override, "int8", None, expect_live_te=True)
+    assert any("override" in x for x in e), e
+    e = check(override, "int8", None, expect_te_load=True)
+    assert not e, e
+
+    # chain hard fails
+    chain = base + "\ndit_nvfp4: H3_DIT_NVFP4_CHAIN=1 — FC1->FC2 chained\n"
+    e = check(chain, "int8", None)
+    assert any("chain" in x.lower() or "CHAIN" in x for x in e), e
+
+    # skip-audio: audio wall too high
+    loud = base.replace("audio=0.0", "audio=12000.0")
+    e = check(loud, "int8", None, expect_skip_audio=True)
+    assert any("audio=" in x for x in e), e
 
     # fewstep pdmd4 happy path
     pdmd = base + """
@@ -318,6 +464,7 @@ fewstep_contract: id=pdmd4 steps=4 sampler=velocity_euler video_shift=12 audio_s
 sampler: selected=velocity_euler (explicit=0 fewstep=pdmd4)
 fewstep_bound: contract=pdmd4 steps=4 cfg=1 video_shift=12 audio_shift=3 sampler=velocity_euler speed_preset=none
 fewstep_contract: sigma_ok student_grid(nfe=4, video_shift=12, audio_shift=3)
+adaln_dual_sigma: video_shift=12 audio_shift=3
 """
     e = check(pdmd, "fewstep", "pdmd4")
     assert not e, e
@@ -342,14 +489,20 @@ fewstep_contract: sigma_ok student_grid(nfe=4, video_shift=12, audio_shift=2)
     e = check(dmad_ok, "fewstep", "dmad4")
     assert not e, e
 
-    # turbo4 + fewstep must fail
     turbo = pdmd.replace("speed_preset=none", "speed_preset=turbo4")
     e = check(turbo, "fewstep", "pdmd4")
     assert any("turbo4" in x for x in e), e
 
-    # expect none rejects bound
     e = check(pdmd, "int8", "none")
     assert any("expect-fewstep=none" in x for x in e), e
+
+    # nvfp4 arm needs dit_nvfp4 lines
+    nv = base.replace("dit_format: INT8 ConvRot (theme-follow path)",
+                      "dit_format: NVFP4 (非金线；dequant→INT8 GEMM)")
+    nv += "\ndit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track\n"
+    nv += "dit_nvfp4: sidecar=/models/dit_nvfp4.safetensors tensors=1332\n"
+    e = check(nv, "nvfp4", None, expect_skip_audio=True, expect_live_te=True)
+    assert not e, e
 
     print("ok p0_protocol_check_log self-test")
     return 0
@@ -371,11 +524,34 @@ def main() -> int:
         "(T3 offline check; default: soft-recognize if present)",
     )
     ap.add_argument(
+        "--expect-seed",
+        default=None,
+        help="require shape: seed=0x... match (e.g. 0x76800002)",
+    )
+    ap.add_argument(
+        "--expect-skip-audio",
+        action="store_true",
+        help="P0 visual gate: require phase_ms audio≈0; do not require "
+        "adaln_dual_sigma",
+    )
+    ap.add_argument(
+        "--expect-live-te",
+        action="store_true",
+        help="FAIL if text_h: override loaded (visual gate default)",
+    )
+    ap.add_argument(
+        "--expect-te-load",
+        action="store_true",
+        help="FAIL if H3_TEXT_H_LOAD override line missing (md5 diagnostics)",
+    )
+    ap.add_argument(
         "--self-test",
         action="store_true",
         help="run host fixtures and exit (no log file)",
     )
     args = ap.parse_args()
+    if args.expect_live_te and args.expect_te_load:
+        ap.error("--expect-live-te and --expect-te-load are mutually exclusive")
     if args.self_test:
         return _self_test()
     if args.log is None or args.arm is None:
@@ -383,7 +559,15 @@ def main() -> int:
     if not args.log.is_file():
         print(f"usage error: not a file: {args.log}", file=sys.stderr)
         return 2
-    errs = check(_read(args.log), args.arm, args.expect_fewstep)
+    errs = check(
+        _read(args.log),
+        args.arm,
+        args.expect_fewstep,
+        expect_seed=args.expect_seed,
+        expect_skip_audio=args.expect_skip_audio,
+        expect_live_te=args.expect_live_te,
+        expect_te_load=args.expect_te_load,
+    )
     if errs:
         for e in errs:
             print(f"FAIL: {e}", file=sys.stderr)

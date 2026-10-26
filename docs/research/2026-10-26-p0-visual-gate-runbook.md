@@ -120,7 +120,10 @@ echo RUN_RC=${PIPESTATUS[0]} | tee -a "$OUT/generate.log"
 离线核验（可在 Mac mini 上对拉回的 log）：
 
 ```bash
-python3 tools/p0_protocol_check_log.py --arm int8 "$OUT/generate.log"
+python3 tools/p0_protocol_check_log.py --arm int8 \
+  --expect-seed 0x76800002 --expect-skip-audio --expect-live-te \
+  "$OUT/generate.log"
+# TE dump identity (optional): python3 tools/te_f32_checksum.py "$OUT/dump/c_te_refined.f32"
 ```
 
 ### 3.2 Phase B — NVFP4 实验臂（同协议，chain 关）
@@ -141,7 +144,9 @@ export H3_DIT_NVFP4_FILE="$NVFP4_SIDE"
   2>&1 | tee "$OUT/generate.log"
 echo RUN_RC=${PIPESTATUS[0]} | tee -a "$OUT/generate.log"
 unset H3_DIT_NVFP4 H3_DIT_NVFP4_FILE
-python3 tools/p0_protocol_check_log.py --arm nvfp4 "$OUT/generate.log"
+python3 tools/p0_protocol_check_log.py --arm nvfp4 \
+  --expect-seed 0x76800002 --expect-skip-audio --expect-live-te \
+  "$OUT/generate.log"
 ```
 
 日志必须出现：`dit_nvfp4: H3_DIT_NVFP4=1`、`dit_nvfp4: sidecar=...`、**无** `H3_DIT_NVFP4_CHAIN`、`sdpa_graph: wanted=0`。  

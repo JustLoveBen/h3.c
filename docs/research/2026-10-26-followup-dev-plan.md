@@ -20,7 +20,7 @@
 
 ## 2. 当前基线快照
 
-- `main` @ `8359dae`（`feat(fewstep): --fewstep-preset`），含 `e037d42` lcm_renoise、`7fe119c` 合同自检与 P0 文档工具；**ahead origin 22+**，**未推送**。  
+- `main` @ origin-synced after `44e51c3`；本轮离线续作见 §2.1 新行（TE checksum / P0 硬门 / audio-env 冲突）。  
 - 默认路径仍是 **INT8 DiT**；`H3_DIT_NVFP4=1` 可切实验臂；基线 `fc1_fused` 守卫已修（`fcd930c`）。INT8 1-step velocity md5 在 graph 关下可复现（`321538a` graph 默认关）。  
 - NVFP4：**能跑完、latent 有限**；公平 1-step 相对稳定 INT8 轨迹差大（velocity rel ~0.94）；**P2.2 视觉门仍未在 238 按现基线重验**；链式 WIP 在工作区（端到端 latent rel ~0.33 未解释），**未提交，等视觉门 + 用户确认**。  
 - T3（PDMD/DMAD）：**仍标未验证（无 GPU 视觉验收）**。PDMD-2NFE 合同复验过；**PDMD-4NFE 原件正式验收未做**。开发侧：`h3_fewstep_contract`（`7fe119c`）、`lcm_renoise`（`e037d42`）、`--fewstep-preset`（`8359dae`）已落地；禁止用 Euler/turbo4 冒充 DMAD 通过。Metal `h3` CLI **未**接 fewstep（无 LoRA/sampler 路径；验收走 `h3_cuda_generate`）。  
@@ -37,6 +37,7 @@
 | `7fe119c` | 2026-10-26 21:44 | `h3_fewstep_contract`：`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`，错合同 FAIL；host 单测 |
 | `e037d42` | 2026-10-26 21:51 | `h3_sampler`：`--sampler lcm_renoise`（DMAD）；dmad4 自动选 lcm；host 单测 |
 | `8359dae` | 2026-10-26 22:27 | `--fewstep-preset` / `H3_FEWSTEP_PRESET`：一键绑 steps/cfg/shift/sampler/contract；host 单测 |
+| (see tip) | 2026-10-26 | fewstep audio-env 冲突提前 FAIL；P0 `--expect-seed/skip-audio/live-te`；`te_f32_checksum.py`；`timing_append_row.py`；[`2026-10-26-te-checksum-and-p0-gates.md`](2026-10-26-te-checksum-and-p0-gates.md) |
 
 **仍未做：** 238 上 P0 视觉门跑数、`git push` origin、链式 WIP 提交、磁盘清理 / nsys。
 
@@ -88,7 +89,7 @@
 | --- | --- |
 | 磁盘清理（238 `/mnt/nvme1n1` ~99%、根分区紧） | 未授权不删资产 |
 | nsys / EVT 剖析 | 盘满时不写 trace；需授权 |
-| `git push` origin（ahead **22+**） | 未推送；含 SDPA/NVFP4 基线 + P0 docs + fewstep/lcm/preset |
+| `git push` origin | 已在 `44e51c3` 齐平；本轮新提交需再授权 push |
 | 提交链式源码与脏工作区（`h3_dit_nvfp4_chain.cu` 等） | 视觉门 + 明确确认 |
 | 把 NVFP4 升为默认或并入 golden | 视觉门通过后的产品决策 |
 
@@ -106,8 +107,10 @@
 5b. [x] **∥ 少步一键 preset**：`--fewstep-preset` / `H3_FEWSTEP_PRESET`（`8359dae`；[`2026-10-26-fewstep-preset.md`](2026-10-26-fewstep-preset.md)）；绑 steps/cfg/shift/sampler/contract；勿叠 turbo4。离线日志识别见 `tools/p0_protocol_check_log.py --expect-fewstep`。  
 6. [x] **P2 DMAD 采样器**：`h3_sampler` / `--sampler lcm_renoise`（`e037d42`，2026-10-26）；[ ] `full_critic` GPU 验收（仅在你点头后；238 未跑）。  
 7. [ ] **P2 可选**：TE/VAE/DiT 生命周期与预热显存审计一页笔记。  
-8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push（现 ahead 22+）、是否清盘/nsys。  
-9. [ ] **生产债（不插队）**：`c_te_raw` 偶发不确定单独开修；修完前速度场对照继续优先 refine/`H3_TEXT_H_LOAD`。
+8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push 本轮新提交、是否清盘/nsys。  
+9. [ ] **生产债（不插队）**：`c_te_raw` 偶发不确定单独开修；修完前速度场对照继续优先 refine/`H3_TEXT_H_LOAD`。离线辅助已落地：`tools/te_f32_checksum.py` + P0 `--expect-live-te`/`--expect-te-load`（2026-10-26）。
+9b. [x] **∥ P0 日志硬门扩展 + timing 行模板**：seed/skip-audio/live-te/chain；`timing_append_row.py`（不自动改账本）。
+9c. [x] **∥ fewstep-preset × 错误 audio shift 提前 FAIL**：`h3_fewstep_preset_audio_env_compatible`。
 
 ---
 
@@ -141,3 +144,5 @@
 | 2026-10-26 | 勾 §6.5（`7fe119c`）；§6.6 采样器 hash `e037d42`；新增 §2.1 已落地表；基线改为 ahead 20；明确 238 视觉门 / push / 链式 / 清盘仍未做。 |
 | 2026-10-26 | 勾 §6.5b：`--fewstep-preset` 一键合同；GPU 验收仍未做。 |
 | 2026-10-26 | §2.1 记入 `8359dae`；离线协议检识别 fewstep_preset/bound/sampler；Metal CLI 明确不接 fewstep。 |
+
+| 2026-10-26 | 离线：TE checksum + P0 硬门扩展 + fewstep audio-env 冲突文案；未开 238 / 未碰链式 WIP。 |

@@ -126,6 +126,33 @@ int main(void) {
         (void)lcm0;
     }
 
+
+    /* Edge cases: empty count, sigma_next≈0 with noise ptr, bad sigma. */
+    {
+        float xe[1] = {1.0f};
+        float xv[1] = {0.0f};
+        float n[1] = {9.0f};
+        err[0] = '\0';
+        expect(h3_sampler_lcm_renoise_step_f32(xe, xv, 0, 1.0f, 0.5f, n, err,
+                                               sizeof err) == 0,
+               "empty count fail");
+        expect(h3_sampler_lcm_renoise_step_f32(NULL, xv, 1, 1.0f, 0.0f, NULL,
+                                               err, sizeof err) == 0,
+               "null sample fail");
+        /* Final step ignores noise pointer. */
+        xe[0] = 1.0f;
+        xv[0] = 0.5f;
+        expect(h3_sampler_lcm_renoise_step_f32(xe, xv, 1, 0.4f, 0.0f, n, err,
+                                               sizeof err) == 1,
+               "final ignores noise");
+        expect_near(xe[0], 1.0f + 0.4f * 0.5f, 1e-6f, "final+noiseptr");
+        /* Non-finite sigma → fail */
+        xe[0] = 0.0f;
+        expect(h3_sampler_lcm_renoise_step_f32(xe, xv, 1, NAN, 0.5f, n,
+                                               err, sizeof err) == 0,
+               "nan sigma fail");
+    }
+
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);
         return 1;
