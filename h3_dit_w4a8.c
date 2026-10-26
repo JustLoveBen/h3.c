@@ -3046,7 +3046,7 @@ static int nvfp4_ensure_rot(h3_dit_w4a8 *ctx, size_t seq, size_t k,
     size_t need;
     const size_t max_k = (size_t)H3_DIT_W4A8_FFN;
     if (k == 0 || k > max_k) {
-        fail(error, error_size, "nvfp4 rot: bad k=%zu (max %zu)", k, max_k);
+        snprintf(error, error_size, "nvfp4 rot: bad k=%zu (max %zu)", k, max_k);
         return 0;
     }
     if (ctx->d_nvfp4_rot && seq <= ctx->nvfp4_rot_cap_seq)
@@ -3060,7 +3060,7 @@ static int nvfp4_ensure_rot(h3_dit_w4a8 *ctx, size_t seq, size_t k,
         if (cudaMalloc((void **)&ctx->d_nvfp4_rot, need) != cudaSuccess) {
             ctx->d_nvfp4_rot_bytes = 0;
             ctx->nvfp4_rot_cap_seq = 0;
-            fail(error, error_size, "nvfp4 rot scratch OOM (%zu bytes)", need);
+            snprintf(error, error_size, "nvfp4 rot scratch OOM (%zu bytes)", need);
             return 0;
         }
         ctx->d_nvfp4_rot_bytes = need;
