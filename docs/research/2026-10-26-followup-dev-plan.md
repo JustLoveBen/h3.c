@@ -37,7 +37,7 @@
 | `7fe119c` | 2026-10-26 21:44 | `h3_fewstep_contract`：`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`，错合同 FAIL；host 单测 |
 | `e037d42` | 2026-10-26 21:51 | `h3_sampler`：`--sampler lcm_renoise`（DMAD）；dmad4 自动选 lcm；host 单测 |
 | `8359dae` | 2026-10-26 22:27 | `--fewstep-preset` / `H3_FEWSTEP_PRESET`：一键绑 steps/cfg/shift/sampler/contract；host 单测 |
-| (see tip) | 2026-10-26 | fewstep audio-env 冲突提前 FAIL；P0 `--expect-seed/skip-audio/live-te`；`te_f32_checksum.py`；`timing_append_row.py`；[`2026-10-26-te-checksum-and-p0-gates.md`](2026-10-26-te-checksum-and-p0-gates.md) |
+| `9356fa7` / `b7c08f0` | 2026-10-26 | fewstep audio-env 冲突提前 FAIL；P0 `--expect-seed/skip-audio/live-te`；`te_f32_checksum.py`；`timing_append_row.py`；[`2026-10-26-te-checksum-and-p0-gates.md`](2026-10-26-te-checksum-and-p0-gates.md) |
 
 **仍未做：** 238 上 P0 视觉门跑数、`git push` origin、链式 WIP 提交、磁盘清理 / nsys。
 
