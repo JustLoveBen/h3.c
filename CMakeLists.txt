@@ -665,6 +665,7 @@ add_executable(h3_cuda_generate
   h3_taomate.c
   h3_lora.c
   h3_fewstep_contract.c
+  h3_env_contract.c
   h3_sampler.c
   h3_tae.c
   h3_tae_cuda.cu

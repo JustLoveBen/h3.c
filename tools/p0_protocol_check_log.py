@@ -13,6 +13,8 @@ Hard gates (P0 int8|nvfp4):
   - shape: line with sdpa= and seed=0x...
   - sigma schedule print
   - optional --expect-seed / --expect-skip-audio / --expect-live-te
+  - recognizes inline "# H3_ENV_CONTRACT" from generate (C061);
+    --expect-env-contract requires the marker
 
 Does not run the model. Exit 0 = protocol OK; 1 = fail; 2 = usage error.
 See docs/research/2026-10-26-p0-visual-gate-runbook.md and
@@ -50,6 +52,42 @@ def _norm_seed(s: str) -> str:
     if s.startswith("0x"):
         s = s[2:]
     return s.lstrip("0") or "0"
+
+
+
+def check_env_contract(
+    text: str, *, require: bool = False
+) -> tuple[list[str], list[str]]:
+    """Recognize C061 inline # H3_ENV_CONTRACT block (soft by default)."""
+    errs: list[str] = []
+    warnings: list[str] = []
+    m = re.search(r"^# H3_ENV_CONTRACT\b.*$", text, re.M)
+    if not m:
+        if require:
+            errs.append("missing # H3_ENV_CONTRACT block (C061 inline)")
+        return errs, warnings
+    if not re.search(
+        r"^cli seed=0x[0-9a-fA-F]+\s+skip_audio=\d+\s+fewstep_preset=\S+\s+"
+        r"fewstep_contract=\S+\s+sampler=\S+\s+sdpa=\S+\s+sdpa_graph=\d+\s+"
+        r"te_path=(live|H3_TEXT_H_LOAD)\s*$",
+        text,
+        re.M,
+    ):
+        warnings.append(
+            "# H3_ENV_CONTRACT present but cli seed=... line missing/malformed"
+        )
+    m_ok = re.search(r"^# PROTO_ENV_OK\s+arm=(\S+)\s*$", text, re.M)
+    m_fail = re.search(r"^# PROTO_ENV_FAIL\b", text, re.M)
+    if m_fail:
+        errs.append("H3_ENV_CONTRACT PROTO_ENV_FAIL present")
+    if re.search(
+        r"^# H3_ENV_CONTRACT\s+arm=\S+\s+expect_p0=1\s*$", text, re.M
+    ):
+        if not m_ok and not m_fail:
+            warnings.append(
+                "expect_p0=1 but neither PROTO_ENV_OK nor PROTO_ENV_FAIL"
+            )
+    return errs, warnings
 
 
 def check_fewstep(text: str, expect: str | None) -> tuple[list[str], list[str]]:
@@ -257,6 +295,7 @@ def check(
     expect_skip_audio: bool = False,
     expect_live_te: bool = False,
     expect_te_load: bool = False,
+    expect_env_contract: bool = False,
 ) -> list[str]:
     errs: list[str] = []
     warnings: list[str] = []
@@ -403,6 +442,10 @@ def check(
     errs.extend(fe)
     warnings.extend(fw)
 
+    ee, ew = check_env_contract(text, require=expect_env_contract)
+    errs.extend(ee)
+    warnings.extend(ew)
+
     mrc = re.search(r"^RUN_RC=(\d+)\s*$", text, re.M)
     if mrc and mrc.group(1) != "0":
         errs.append(f"RUN_RC={mrc.group(1)}")
@@ -504,6 +547,20 @@ fewstep_contract: sigma_ok student_grid(nfe=4, video_shift=12, audio_shift=2)
     e = check(nv, "nvfp4", None, expect_skip_audio=True, expect_live_te=True)
     assert not e, e
 
+    # C061 inline env contract recognition
+    env_blk = base + """
+# H3_ENV_CONTRACT  arm=int8  expect_p0=0
+env H3_DIT_NVFP4=<unset>  # DiT NVFP4 experimental arm (1=on) rule=arm
+cli seed=0x76800002 skip_audio=1 fewstep_preset=none fewstep_contract=none sampler=velocity_euler sdpa=cudnn sdpa_graph=0 te_path=live
+"""
+    e = check(env_blk, "int8", None, expect_env_contract=True)
+    assert not e, e
+    e = check(base, "int8", None, expect_env_contract=True)
+    assert any("H3_ENV_CONTRACT" in x for x in e), e
+    # soft: without --expect-env-contract, missing block is OK
+    e = check(base, "int8", None)
+    assert not any("H3_ENV_CONTRACT" in x for x in e), e
+
     print("ok p0_protocol_check_log self-test")
     return 0
 
@@ -567,6 +624,7 @@ def main() -> int:
         expect_skip_audio=args.expect_skip_audio,
         expect_live_te=args.expect_live_te,
         expect_te_load=args.expect_te_load,
+        expect_env_contract=args.expect_env_contract,
     )
     if errs:
         for e in errs:

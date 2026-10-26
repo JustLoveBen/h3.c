@@ -33,6 +33,7 @@
 #include "h3_latent_upscaler.h"
 #include "h3_lora.h"
 #include "h3_fewstep_contract.h"
+#include "h3_env_contract.h"
 #include "h3_sampler.h"
 #include "h3_kpi_guard.h"
 #include "h3_sdpa.h"
@@ -82,6 +83,39 @@ static double now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
+
+/* C074: structured failure tags for log grepping (print before exit). */
+static void h3_fail_tag(const char *tag) {
+    if (!tag || !tag[0])
+        return;
+    fprintf(stderr, "tag=%s\n", tag);
+    fflush(stderr);
+}
+
+/* C040: opt-in VRAM ledger (H3_VRAM_LEDGER=1). Host builds without CUDA
+ * skip via stub; this TU always has cuda_runtime.h. */
+static int h3_vram_ledger_on(void) {
+    const char *e = getenv("H3_VRAM_LEDGER");
+    return (e && e[0] == '1') ? 1 : 0;
+}
+
+static void h3_vram_ledger_point(const char *point) {
+    size_t free_b = 0, total_b = 0;
+    if (!h3_vram_ledger_on() || !point)
+        return;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        printf("vram_ledger: point=%s status=memgetinfo_fail\n", point);
+        fflush(stdout);
+        return;
+    }
+    printf("vram_ledger: point=%s free_mib=%.1f used_mib=%.1f total_mib=%.1f\n",
+           point, (double)free_b / (1024.0 * 1024.0),
+           (double)(total_b - free_b) / (1024.0 * 1024.0),
+           (double)total_b / (1024.0 * 1024.0));
+    fflush(stdout);
+}
+
 
 /* Opt-in nsys capture of the first hot-clip high-res NFE. Default off. */
 static int h3_nsys_hires_begin(int clip_i, int first_hi_nfe) {
@@ -2591,6 +2625,7 @@ int main(int argc, char **argv) {
                                                      sizeof(perr));
             if (perr[0]) {
                 fprintf(stderr, "h3: %s\n", perr);
+                h3_fail_tag("FAIL_CONTRACT");
                 return 1;
             }
             contract_pre_set = 1;
@@ -2599,6 +2634,7 @@ int main(int argc, char **argv) {
             contract_pre = h3_fewstep_contract_resolve(NULL, perr, sizeof(perr));
             if (perr[0]) {
                 fprintf(stderr, "h3: %s\n", perr);
+                h3_fail_tag("FAIL_CONTRACT");
                 return 1;
             }
             contract_pre_set = 1;
@@ -2614,6 +2650,7 @@ int main(int argc, char **argv) {
         pin.contract_already = contract_pre;
         if (!h3_fewstep_preset_apply(&pin, &pout, perr, sizeof(perr))) {
             fprintf(stderr, "h3: %s\n", perr);
+            h3_fail_tag("FAIL_CONTRACT");
             return 1;
         }
         if (pout.applied) {
@@ -2624,6 +2661,7 @@ int main(int argc, char **argv) {
                         "（会改写 sigma；请无 speed preset + serving shift）\n",
                         h3_fewstep_contract_name(pout.id),
                         preset_name && preset_name[0] ? preset_name : "?");
+                h3_fail_tag("FAIL_CONTRACT");
                 return 1;
             }
             steps = pout.steps;
@@ -2636,6 +2674,7 @@ int main(int argc, char **argv) {
                                                             perr,
                                                             sizeof(perr))) {
                     fprintf(stderr, "h3: %s\n", perr);
+                    h3_fail_tag("FAIL_ENV");
                     return 1;
                 }
                 setenv("H3_AUDIO_SIGMA_SHIFT", pout.audio_env_value, 0);
@@ -2657,6 +2696,7 @@ int main(int argc, char **argv) {
         sampler_id = h3_sampler_resolve(sampler_cli, serr, sizeof(serr));
         if (serr[0]) {
             fprintf(stderr, "h3: %s\n", serr);
+            h3_fail_tag("FAIL_CONTRACT");
             return 1;
         }
     }
@@ -2669,6 +2709,7 @@ int main(int argc, char **argv) {
                                                  sizeof(ferr));
         if (ferr[0]) {
             fprintf(stderr, "h3: %s\n", ferr);
+            h3_fail_tag("FAIL_CONTRACT");
             return 1;
         }
         /* dmad4 defaults to lcm_renoise when user did not pick a sampler. */
@@ -2679,6 +2720,7 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "h3: --sampler lcm_renoise 与 lift/taomate 不兼容"
                     "（主路径 fewstep 专用）\n");
+            h3_fail_tag("FAIL_CONTRACT");
             return 1;
         }
         memset(&fin, 0, sizeof(fin));
@@ -2702,6 +2744,7 @@ int main(int argc, char **argv) {
             (sampler_id == H3_SAMPLER_LCM_RENOISE) ? 1 : 0;
         if (!h3_fewstep_contract_check_early(&fin, ferr, sizeof(ferr))) {
             fprintf(stderr, "h3: %s\n", ferr);
+            h3_fail_tag("FAIL_CONTRACT");
             return 1;
         }
         printf("sampler: selected=%s (explicit=%d fewstep=%s)\n",
@@ -2718,6 +2761,35 @@ int main(int argc, char **argv) {
                    preset_name && preset_name[0] ? preset_name : "none");
         }
         fflush(stdout);
+    }
+    /* C061: inline env contract after CLI/fewstep resolve, before heavy work. */
+    {
+        h3_env_contract_cli ecl;
+        int want_nvfp4_arm =
+            (preset_out.id == H3_PRESET_NVFP4) ||
+            (getenv("H3_DIT_NVFP4") && getenv("H3_DIT_NVFP4")[0] == '1');
+        memset(&ecl, 0, sizeof(ecl));
+        ecl.seed = seed;
+        ecl.skip_audio = skip_audio;
+        ecl.fewstep_preset =
+            (fewstep_preset_cli && fewstep_preset_cli[0]) ? fewstep_preset_cli
+            : (getenv("H3_FEWSTEP_PRESET") && getenv("H3_FEWSTEP_PRESET")[0])
+                  ? getenv("H3_FEWSTEP_PRESET")
+                  : "none";
+        ecl.fewstep_contract = h3_fewstep_contract_name(fewstep_id);
+        ecl.sampler = h3_sampler_name(sampler_id);
+        ecl.sdpa = sdpa;
+        ecl.arm = want_nvfp4_arm ? "nvfp4" : "int8";
+        h3_env_contract_fprint(stdout, &ecl);
+        if (h3_env_contract_expect_p0_visual()) {
+            char eerr[512];
+            if (!h3_env_contract_check_p0(ecl.arm, eerr, sizeof(eerr))) {
+                fprintf(stderr, "h3: P0 visual env contract FAIL: %s\n",
+                        eerr[0] ? eerr : "unknown");
+                h3_fail_tag("FAIL_ENV");
+                return 1;
+            }
+        }
     }
     if (ulysses < 1)
         ulysses = 1;
@@ -3838,6 +3910,7 @@ int main(int argc, char **argv) {
             if (!vision_merged || !vision_ds[0] || !vision_ds[1] ||
                 !vision_ds[2]) {
                 fprintf(stderr, "OOM vision buffers\n");
+            h3_fail_tag("FAIL_OOM");
                 goto cleanup;
             }
             printf("vision_encode: %s pictures=%zu "
@@ -3967,6 +4040,7 @@ int main(int argc, char **argv) {
                 if (!vision_merged || !vision_ds[0] || !vision_ds[1] ||
                     !vision_ds[2]) {
                     fprintf(stderr, "OOM vision buffers\n");
+            h3_fail_tag("FAIL_OOM");
                     goto cleanup;
                 }
                 printf("vision_encode: %s pictures=%d (Ref2VA host F32)\n", vis,
@@ -4088,6 +4162,7 @@ int main(int argc, char **argv) {
                 if (!vision_merged || !vision_ds[0] || !vision_ds[1] ||
                     !vision_ds[2]) {
                     fprintf(stderr, "OOM vision buffers (ref-video)\n");
+            h3_fail_tag("FAIL_OOM");
                     goto cleanup;
                 }
                 printf("vision_encode: %s video blocks=%zu samples=%zu "
@@ -4198,6 +4273,7 @@ int main(int argc, char **argv) {
     pw = (float *)malloc(video_seq * sizeof(float));
     if (!latent || !velocity || !sigmas || !text_h || !pt || !ph || !pw) {
         fprintf(stderr, "OOM\n");
+            h3_fail_tag("FAIL_OOM_DIT");
         goto cleanup;
     }
     if (cfg_scale > 1.0001f) {
@@ -4206,6 +4282,7 @@ int main(int argc, char **argv) {
         velocity_uncond = (float *)malloc(n_lat * sizeof(float));
         if (!text_h_uncond || !velocity_uncond) {
             fprintf(stderr, "OOM cfg buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             goto cleanup;
         }
         /* Placeholder until TE pad-uncond is filled below. */
@@ -4235,6 +4312,7 @@ int main(int argc, char **argv) {
         apw = (float *)calloc(audio_seq, sizeof(float));
         if (!audio_c2t || !audio_rows || !audio_vel || !apt || !aph || !apw) {
             fprintf(stderr, "OOM audio\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             goto cleanup;
         }
         fill_normal_f32(seed + 0xA11DULL, audio_c2t,
@@ -4259,6 +4337,7 @@ int main(int argc, char **argv) {
         frame0_img = (float *)malloc(frame0_elems * sizeof(float));
         if (!frame0_img) {
             fprintf(stderr, "OOM init-first-frame\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         if (!load_f32_raw(init_latent_path, frame0_img, frame0_elems, error,
@@ -4305,6 +4384,7 @@ int main(int argc, char **argv) {
         frame0_lock = (float *)malloc(frame0_elems * sizeof(float));
         if (!frame0_lock) {
             fprintf(stderr, "OOM frame0 lock\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         memcpy(frame0_lock, latent, frame0_elems * sizeof(float));
@@ -4336,6 +4416,7 @@ int main(int argc, char **argv) {
         cpw = (float *)malloc(cond_seq * sizeof(float));
         if (!cond_rows || !cpt || !cph || !cpw) {
             fprintf(stderr, "OOM cond rows\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         t_enc = now_ms();
@@ -4515,6 +4596,7 @@ int main(int argc, char **argv) {
         cpw = (float *)malloc(cond_seq * sizeof(float));
         if (!cond_rows || !cpt || !cph || !cpw) {
             fprintf(stderr, "OOM ref cond rows\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         t_enc = now_ms();
@@ -4677,6 +4759,7 @@ int main(int argc, char **argv) {
         cpw = (float *)malloc(cond_seq * sizeof(float));
         if (!cpt || !cph || !cpw) {
             fprintf(stderr, "OOM ref-video cond pos\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         if (!skip_dit && !cond_rows_path)
@@ -4794,6 +4877,7 @@ int main(int argc, char **argv) {
                 if (!grown) {
                     h3_audio_vae_cuda_latent_free(&alat);
                     fprintf(stderr, "OOM ref audio cond rows\n");
+            h3_fail_tag("FAIL_OOM");
                     goto cleanup;
                 }
                 audio_cond_rows = grown;
@@ -4814,6 +4898,7 @@ int main(int argc, char **argv) {
         acpw = (float *)malloc(audio_cond_seq * sizeof(float));
         if (!acpt || !acph || !acpw) {
             fprintf(stderr, "OOM ref audio cond pos\n");
+            h3_fail_tag("FAIL_OOM");
             goto cleanup;
         }
         cursor = (float)context + (float)n_ref_images;
@@ -4874,6 +4959,7 @@ int main(int argc, char **argv) {
     audio_sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
     if (!audio_sigmas) {
         fprintf(stderr, "OOM audio sigmas\n");
+            h3_fail_tag("FAIL_OOM_DIT");
         goto cleanup;
     }
     if (preset_out.id == H3_PRESET_TAOMATE) {
@@ -4911,6 +4997,7 @@ int main(int argc, char **argv) {
     vel_prev = (float *)malloc(n_lat * sizeof(float));
     if (!reuse_sel || !vel_last || !vel_prev) {
         fprintf(stderr, "OOM reuse buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
         goto cleanup;
     }
     if (pack_audio) {
@@ -4918,12 +5005,14 @@ int main(int argc, char **argv) {
         avel_prev = (float *)calloc(n_audio, sizeof(float));
         if (!avel_last || !avel_prev) {
             fprintf(stderr, "OOM audio reuse buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             goto cleanup;
         }
         if (cfg_scale > 1.0001f) {
             audio_vel_uncond = (float *)calloc(n_audio, sizeof(float));
             if (!audio_vel_uncond) {
                 fprintf(stderr, "OOM audio cfg buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                 goto cleanup;
             }
         }
@@ -4983,6 +5072,7 @@ int main(int argc, char **argv) {
         ferr[0] = '\0';
         if (!h3_fewstep_contract_check_sigmas(&fin, ferr, sizeof(ferr))) {
             fprintf(stderr, "h3: %s\n", ferr);
+            h3_fail_tag("FAIL_CONTRACT");
             goto cleanup;
         }
     }
@@ -5231,6 +5321,7 @@ int main(int argc, char **argv) {
                           vision_ds[0] && vision_ds[1] && vision_ds[2];
         if (!pad_ids) {
             fprintf(stderr, "OOM cfg pad ids\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             goto cleanup;
         }
         if (keep_vision) {
@@ -5296,6 +5387,7 @@ int main(int argc, char **argv) {
         text_mod_tags = (uint8_t *)malloc(context);
         if (!text_mod_tags) {
             fprintf(stderr, "OOM DiT text tags\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             goto cleanup;
         }
         if (!h3_multimodal_cuda_dit_text_tags(context, vision_spans,
@@ -5474,6 +5566,7 @@ int main(int argc, char **argv) {
     }
 
 clip_denoise:
+    h3_vram_ledger_point("before_dit");
     gen_mem_trace(cuda, clip_i > 0 ? "clip_start_hot" : "clip_start");
     mux_write = mux_path;
     if (mux_path && clip_repeat > 1) {
@@ -5621,6 +5714,7 @@ clip_denoise:
             (use_kv && (!kv_v || !kv_pt || !kv_ph || !kv_pw)) ||
             (lift_on && !tm_vel) || (lift_on && pack_audio && n_audio && !tm_a_vel)) {
             fprintf(stderr, "OOM taomate chunk buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
             free(v_chunk);
             free(v_vel);
             free(a_chunk);
@@ -5953,6 +6047,7 @@ clip_denoise:
             v_vel = (float *)malloc((size_t)max_vt * t_floats * sizeof(float));
             if (!v_chunk || !v_vel || !lat_noise) {
                 fprintf(stderr, "OOM taomate hires chunk buffers\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                 free(v_chunk); free(v_vel); free(a_chunk); free(a_vel);
                 free(tm_vel); free(tm_a_vel); free(lat_noise); free(au_noise);
                 goto cleanup;
@@ -6432,6 +6527,7 @@ clip_denoise:
             x0_pack = (float *)malloc(n_lat * sizeof(float));
             if (!x0_pack) {
                 fprintf(stderr, "OOM lift x0\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                 goto cleanup;
             }
             for (ii = 0; ii < n_lat; ii++)
@@ -6454,6 +6550,7 @@ clip_denoise:
             if (!z_high) {
                 free(z_low);
                 fprintf(stderr, "OOM lift z_high\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                 goto cleanup;
             }
             {
@@ -6597,6 +6694,7 @@ clip_denoise:
             if (!noise_hi) {
                 free(z0_pack);
                 fprintf(stderr, "OOM lift noise\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                 goto cleanup;
             }
             fill_normal_f32(seed + 1ULL, noise_hi, n_hi);
@@ -6660,6 +6758,7 @@ clip_denoise:
                                              need * sizeof(float));
                 if (!nb) {
                     fprintf(stderr, "OOM lcm renoise scratch\n");
+            h3_fail_tag("FAIL_OOM_DIT");
                     goto cleanup;
                 }
                 renoise_scratch = nb;
@@ -6912,8 +7011,10 @@ clip_denoise:
         h3_cuda_release_heavy_workspace(cuda);
         h3_cuda_sage3_drop_pool();
         h3_cuda_sol_cute_drop_pool();
+        h3_vram_ledger_point("peak_dit");
         printf("released DiT/TE before VAE (kept CUDA ctx; trimmed DiT scratch; "
                "dropped sage3/sol_cute pools)\n");
+        h3_vram_ledger_point("before_vae");
         fflush(stdout);
         if (preset_out.id == H3_PRESET_TAOMATE && vae_decode &&
             !strcmp(vae_decode, "official")) {
@@ -7131,6 +7232,7 @@ clip_denoise:
                "total=%.1f frames=%d %dx%d\n",
                vst.load_ms, vst.canvas_h2d_ms, vst.blocks_ms, vst.unpatch_d2h_ms,
                vst.total_ms, frames.frames, frames.width, frames.height);
+        h3_vram_ledger_point("after_vae");
         {
             double rope_ms = 0.0;
             unsigned long rope_calls = 0;

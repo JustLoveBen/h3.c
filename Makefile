@@ -20,8 +20,8 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
 	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
 	h3_fewstep_contract_test h3_sampler_test dump_fewstep_student_grid \
-	dump_fewstep_contracts print_fewstep_help \
-	h3_waffle_test fewstep_host_tests
+	dump_fewstep_contracts print_fewstep_help print_h3_env_contract_host \
+	h3_env_contract_test h3_waffle_test fewstep_host_tests
 
 all: h3 libh3.a
 
@@ -75,6 +75,15 @@ print_fewstep_help: tools/print_fewstep_help.c h3_fewstep_contract.c \
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/print_fewstep_help.c \
 		h3_fewstep_contract.c -lm
 
+print_h3_env_contract_host: tools/print_h3_env_contract_host.c h3_env_contract.c \
+		h3_env_contract.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/print_h3_env_contract_host.c \
+		h3_env_contract.c
+
+h3_env_contract_test: tests/test_h3_env_contract.c h3_env_contract.c h3_env_contract.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_env_contract.c \
+		h3_env_contract.c
+
 # Host-only LCM+re-noise sampler math (no Metal/CUDA).
 h3_sampler_test: tests/test_h3_sampler.c h3_sampler.c h3_sampler.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_sampler.c \
@@ -89,7 +98,7 @@ h3_waffle_test: tests/test_h3_waffle.c h3_waffle.c h3_waffle.h
 # See docs/research/2026-10-26-fewstep-metal-boundary.md
 fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
 		dump_fewstep_student_grid dump_fewstep_contracts print_fewstep_help \
-		h3_waffle_test
+		print_h3_env_contract_host h3_env_contract_test h3_waffle_test
 	./h3_fewstep_contract_test
 	./h3_sampler_test
 	./dump_fewstep_student_grid >/dev/null
@@ -97,11 +106,15 @@ fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
 	./print_fewstep_help | grep -q -- '--fewstep-contract'
 	./print_fewstep_help | grep -q -- '--fewstep-preset'
 	./print_fewstep_help | grep -q -- 'lcm_renoise'
+	./h3_env_contract_test
+	./print_h3_env_contract_host | grep -q '# H3_ENV_CONTRACT'
+	./print_h3_env_contract_host | grep -q 'sdpa_graph='
 	./h3_waffle_test
 	python3 tools/waffle_same_config_gate.py --self-test
 	python3 tools/fewstep_contracts_validate.py --self-test
 	python3 tools/fewstep_forbidden_combo_check.py --self-test
 	python3 tools/p0_protocol_check_log.py --self-test
+	python3 tools/print_h3_env_contract.py >/dev/null
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

@@ -185,7 +185,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 | deadend-memory 条目1；A2 | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **idea** | S2 | **能力轴第一刀** |
+| **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 | deadend-memory 条目1；A2；`H3_VRAM_LEDGER` | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **partial**（插桩 landed；238 未跑） | S2 | 238：开 ledger 跑 768p 分桶 |
 | **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **idea** | S2 | 一次性实验，不解默认 |
 | **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2 | VRAM高 | C040 | **idea** | S2 | waffle 非 bit-identical |
 | **C043** | DiT | Layerwise weight streaming | 权重按层驻留+prefetch | transfer 4.3；SGLang −30GB 指针 | VRAM高 WC中性~负 | C040；视觉后 | **idea** | S1/S2 | 768p 全序列能力优先 |
@@ -201,7 +201,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
 | **C060** | 对照 | TE 路径漂移污染 md5/waffle | 强制标明 live vs `H3_TEXT_H_LOAD` | P0 runbook；timing | Q高 | — | **partial** | S9 | 报告硬字段 |
-| **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | print_h3_env_contract；A10 | Q（防测错） | 无 GPU | **idea** | S9/S11 | **可立即开发** |
+| **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **partial**（内联 landed；GPU 日志未验） | S9/S11 | GPU 跑强制过 `# H3_ENV_CONTRACT` |
 | **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial** | S1/S9/S12 | 默认策略设计 |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
 | **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；DeepInfer B | VRAM/WC | 真机峰值 | **partial** | S1 | 安全条件满足再重叠 H2D |
@@ -210,11 +210,11 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
 | **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **idea** | 族4 | P3 小刀 |
 | **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | 表提升到 clip 级 | 同上 | WC低 bit同 | — | **idea** | 族4 | 与 VAE 文件顺带 |
-| **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | speed-strategies S8；roadmap P3 | WC低 | 审计清单 | **idea** | S8 | 不挡主线 |
+| **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；S8 | WC低 | forbid 开关未做 | **partial**（审计页 landed） | S8 | 不挡主线；forbid 另开 |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
 | **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log | Q | — | **partial** | S12 | 固化目录约定 |
-| **C074** | 失败分类 | OOM/合同/数值/环境混报 | 退出码/日志标签 | DeepInfer environ 族 | Q | — | **idea** | S11 | 与 C061 一起 |
+| **C074** | 失败分类 | OOM/合同/数值/环境混报 | 退出码/日志 `tag=FAIL_*` | DeepInfer environ 族；与 C061 同批 | Q | — | **partial**（generate 站点 tagged；VAE 专用 tag 无独立站点） | S11 | GPU 日志抽检 |
 | **C075** | host | Qwen prefetch 深度 | `H3_QWEN_PREFETCH*` | text_encoder | WC低 | — | **partial** | S1 | 调参级 |
 | **C076** | DiT | 大量 `H3_DISABLE_FUSED_*` 回退开关 | 回归与 A/B | h3_dit.c env 列表 | D | — | **landed** | S6 | 保持；勿默认关融合 |
 | **C077** | SDPA | graph pool/clean/destroy 纪律 | 防挂 | deeper-pass；cudnn sdpa | Q | 若再开 graph | **partial** | S6 | 政策备忘 |
@@ -351,10 +351,10 @@ C017,A,DiT,L2 pin hot tables,idea,S2,P3
 C030,B,fewstep,PDMD-4NFE GPU accept,blocked,S7,P1
 C031,B,fewstep,DMAD lcm_renoise GPU,partial,S7,P2
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
-C040,C,768p,VRAM ledger instrumentation,idea,S2,P2
+C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
-C061,D,tooling,inline env contract at generate,idea,S9/S11,P0-dev
+C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
 C068,D,DiT,INT8 RoPE table memo,idea,fam4,P3
@@ -375,6 +375,8 @@ C081,E,serving,continuous batching,defer,S3,defer
 | [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md) | A1–A15 增量扫掠 |
 | [`2026-10-26-deepinfer-speed-strategies.md`](2026-10-26-deepinfer-speed-strategies.md) | S1–S12 |
 | [`2026-10-27-deepinfer-thinking-to-h3c.md`](2026-10-27-deepinfer-thinking-to-h3c.md) | DeepInfer **思维模式** T01–T14 → 文件/开关/Cxxx（非拒绝清单） |
+| [`2026-10-27-c061-inline-env-contract.md`](2026-10-27-c061-inline-env-contract.md) | C061 内联 env 合同落地说明 |
+| [`2026-10-27-cuda-sync-audit.md`](2026-10-27-cuda-sync-audit.md) | C070 sync 审计 |
 | [`2026-10-05-acceleration-mechanisms.md`](2026-10-05-acceleration-mechanisms.md) | 族 1–8 |
 | [`2026-10-07-sm120-operator-frontier.md`](2026-10-07-sm120-operator-frontier.md) | E/L/M 原始方案 |
 | [`2026-10-07-deadend-audit-*.md`](2026-10-07-deadend-audit-operators.md) | 关闭项证据 |
@@ -388,6 +390,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
 | 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |
 | 2026-10-27 | 初版：合并 research 目录 + 管线扫掠；五轴 taxonomy；Closed Z*；机会 C001–C099（含占位/交叉）；2–8 周 backlog + 长地平线；CSV 摘要。不跑 GPU；不碰链式 WIP。 |
 
