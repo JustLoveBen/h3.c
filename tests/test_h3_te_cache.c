@@ -28,6 +28,10 @@ int main(void) {
            "key2");
     expect(strcmp(hex, hex2) != 0, "ids change key");
     ids[0] = 11;
+    expect(h3_te_cache_key(ids, 4, 49, "/no/such/te", hex2, sizeof hex2, err,
+                           sizeof err) == 1,
+           "key layers");
+    expect(strcmp(hex, hex2) != 0, "layers change key");
     if (!mkdtemp(dir)) {
         fprintf(stderr, "FAIL mkdtemp\n");
         return 1;

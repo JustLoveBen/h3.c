@@ -15,6 +15,8 @@ Hard gates (P0 int8|nvfp4):
   - optional --expect-seed / --expect-skip-audio / --expect-live-te
   - recognizes inline "# H3_ENV_CONTRACT" from generate (C061);
     --expect-env-contract requires the marker
+  - recognizes te_prompt_cache HIT/MISS/SKIP (C062);
+    --expect-te-cache-hit requires a HIT line
 
 Does not run the model. Exit 0 = protocol OK; 1 = fail; 2 = usage error.
 See docs/research/2026-10-26-p0-visual-gate-runbook.md and
@@ -87,6 +89,66 @@ def check_env_contract(
             warnings.append(
                 "expect_p0=1 but neither PROTO_ENV_OK nor PROTO_ENV_FAIL"
             )
+    return errs, warnings
+
+
+def check_te_prompt_cache(
+    text: str, *, require_hit: bool = False
+) -> tuple[list[str], list[str]]:
+    """Recognize C062 te_prompt_cache HIT/MISS/SKIP lines (soft by default).
+
+    Grep-friendly shapes (generate):
+      te_prompt_cache: dir=... require_hit=0|1 (opt-in; gold default off)
+      te_prompt_cache: HIT dir=... key=... tokens=N layers=N dim=N
+      te_prompt_cache: MISS wrote dir=... key=... tokens=N layers=N dim=N
+      te_prompt_cache: MISS dir=... key=none ... reason=no_key
+      te_prompt_cache: SKIP dir=... reason=vision_span
+      te_prompt_cache: REQUIRE_HIT failed ...
+    """
+    errs: list[str] = []
+    warnings: list[str] = []
+    has_any = bool(re.search(r"^te_prompt_cache:", text, re.M))
+    hit = bool(
+        re.search(
+            r"^te_prompt_cache:\s*HIT\s+dir=\S+\s+key=[0-9a-f]+\s+"
+            r"tokens=\d+\s+layers=\d+\s+dim=\d+\s*$",
+            text,
+            re.M,
+        )
+    )
+    miss = bool(re.search(r"^te_prompt_cache:\s*MISS\b", text, re.M))
+    skip = bool(
+        re.search(r"^te_prompt_cache:\s*SKIP\b.*vision_span", text, re.M)
+    )
+    req_fail = bool(
+        re.search(r"^te_prompt_cache:\s*REQUIRE_HIT failed", text, re.M)
+    )
+    if req_fail:
+        errs.append("te_prompt_cache REQUIRE_HIT failed (C062 hard gate)")
+    if require_hit:
+        if not has_any:
+            errs.append(
+                "missing te_prompt_cache lines (--expect-te-cache-hit)"
+            )
+        elif skip:
+            warnings.append(
+                "te_prompt_cache SKIP vision_span "
+                "(HIT not applicable)"
+            )
+        elif not hit:
+            errs.append(
+                "te_prompt_cache HIT required "
+                "(--expect-te-cache-hit; warm cache first)"
+            )
+        if miss and not hit:
+            # redundant with above but keeps message explicit
+            if "te_prompt_cache HIT required" not in errs[-1:]:
+                errs.append("te_prompt_cache MISS while HIT required")
+    elif has_any and miss and not hit:
+        warnings.append(
+            "te_prompt_cache MISS (ok for cold; set H3_TE_CACHE_REQUIRE_HIT "
+            "or --expect-te-cache-hit for warm KPI)"
+        )
     return errs, warnings
 
 
@@ -296,6 +358,7 @@ def check(
     expect_live_te: bool = False,
     expect_te_load: bool = False,
     expect_env_contract: bool = False,
+    expect_te_cache_hit: bool = False,
 ) -> list[str]:
     errs: list[str] = []
     warnings: list[str] = []
@@ -445,6 +508,11 @@ def check(
     ee, ew = check_env_contract(text, require=expect_env_contract)
     errs.extend(ee)
     warnings.extend(ew)
+    te, tw = check_te_prompt_cache(
+        text, require_hit=expect_te_cache_hit
+    )
+    errs.extend(te)
+    warnings.extend(tw)
 
     mrc = re.search(r"^RUN_RC=(\d+)\s*$", text, re.M)
     if mrc and mrc.group(1) != "0":
@@ -561,6 +629,26 @@ cli seed=0x76800002 skip_audio=1 fewstep_preset=none fewstep_contract=none sampl
     e = check(base, "int8", None)
     assert not any("H3_ENV_CONTRACT" in x for x in e), e
 
+    # C062 te_prompt_cache recognition
+    te_hit = (
+        base
+        + "\nte_prompt_cache: dir=/tmp/te require_hit=0 "
+        + "(opt-in; gold default off)\n"
+        + "te_prompt_cache: HIT dir=/tmp/te key=0123456789abcdef "
+        + "tokens=16 layers=4 dim=5120\n"
+    )
+    e = check(te_hit, "int8", None, expect_te_cache_hit=True)
+    assert not e, e
+    te_miss = (
+        base
+        + "\nte_prompt_cache: MISS wrote dir=/tmp/te key=0123456789abcdef "
+        + "tokens=16 layers=4 dim=5120\n"
+    )
+    e = check(te_miss, "int8", None, expect_te_cache_hit=True)
+    assert e and any("HIT required" in x for x in e), e
+    e = check(te_miss, "int8", None)  # soft: warning only
+    assert not e, e
+
     print("ok p0_protocol_check_log self-test")
     return 0
 
@@ -602,6 +690,16 @@ def main() -> int:
         help="FAIL if H3_TEXT_H_LOAD override line missing (md5 diagnostics)",
     )
     ap.add_argument(
+        "--expect-env-contract",
+        action="store_true",
+        help="require # H3_ENV_CONTRACT marker (C061)",
+    )
+    ap.add_argument(
+        "--expect-te-cache-hit",
+        action="store_true",
+        help="require te_prompt_cache HIT line (C062 warm KPI)",
+    )
+    ap.add_argument(
         "--self-test",
         action="store_true",
         help="run host fixtures and exit (no log file)",
@@ -625,6 +723,7 @@ def main() -> int:
         expect_live_te=args.expect_live_te,
         expect_te_load=args.expect_te_load,
         expect_env_contract=args.expect_env_contract,
+        expect_te_cache_hit=args.expect_te_cache_hit,
     )
     if errs:
         for e in errs:

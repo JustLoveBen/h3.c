@@ -163,7 +163,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
 | **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2 | WC低 VRAM高 Q中 | C040 账本 | **idea** | S2 | 768p 备胎 |
 | **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；sm120 L2 | WC低（−0.1~−0.3） | 融合后；自写核 | **idea** | S5/S8 | 排 C003 后 |
-| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot/RoPE/mod/s_channel | sm120 M3 | WC低 bit同 | 授权小改 | **idea** | S2 | 与 C003 可并行 |
+| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot/RoPE/mod/s_channel | sm120 M3 | WC低 bit同 | 授权小改 | **idea**（本片跳过） | S2 | 与 C003 可并行；需 profile |
 | **C018** | DiT | QKV merge（3→1 宽 GEMM） | 历史 gap list | quality-preserving gap | WC中 | 验证是否已被现路径覆盖 | **idea/可能过时** | S5 | 先 diff 现状再决定；勿假设仍缺 |
 | **C019** | DiT | QKNorm+RoPE 融合 | gap list 附属 | quality-preserving | WC低 | — | **idea** | S5 | profile 后 |
 | **C020** | — | （占位）E2 即 C003 | — | — | — | — | — | — | 与 A1 同 |
@@ -202,14 +202,14 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 |---|---|---|---|---|---|---|---|---|---|
 | **C060** | 对照 | TE 路径漂移污染 md5/waffle | 强制标明 live vs `H3_TEXT_H_LOAD` | P0 runbook；timing | Q高 | — | **partial** | S9 | 报告硬字段 |
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **partial**（内联 landed；GPU 日志未验） | S9/S11 | GPU 跑强制过 `# H3_ENV_CONTRACT` |
-| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial** | S1/S9/S12 | 默认策略设计 |
+| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache；[productization](2026-10-27-te-cache-productization.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial**（opt-in 产品化 landed；默认仍 off；GPU HIT 未验） | S1/S9/S12 | GPU 验 HIT；默认策略保持 off |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
 | **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；DeepInfer B | VRAM/WC | 真机峰值 | **partial** | S1 | 安全条件满足再重叠 H2D |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
 | **C066** | 测量 | P0 日志协议 | `p0_protocol_check_log.py` | tools | Q | — | **landed** | S9 | GPU 日志强制过检 |
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
-| **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **idea** | 族4 | P3 小刀 |
-| **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | 表提升到 clip 级 | 同上 | WC低 bit同 | — | **idea** | 族4 | 与 VAE 文件顺带 |
+| **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **landed**（host memo；GPU WC 未验） | 族4 | GPU 测墙钟 |
+| **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | host memo + same-key H2D skip | 同上；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低 bit同 | — | **partial**（host memo+H2D skip；clip 级常驻 defer） | 族4 | GPU 测；全 geometry 常驻 defer |
 | **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；S8 | WC低 | forbid 开关未做 | **partial**（审计页 landed） | S8 | 不挡主线；forbid 另开 |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
@@ -357,7 +357,8 @@ C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
-C068,D,DiT,INT8 RoPE table memo,idea,fam4,P3
+C068,D,DiT,INT8 RoPE table memo,landed,fam4,P3
+C069,D,VAE,VAE RoPE memo+H2D skip,partial,fam4,P3
 C080,E,SKU,VDN/SelfLift/TAE tiering,idea,S7,observe
 C081,E,serving,continuous batching,defer,S3,defer
 ```

@@ -120,6 +120,7 @@
 9h. [x] **∥ fewstep 合同 JSON 表 + schema + dump/validate**；共享 `--fewstep-*` help 抽到 `h3_fewstep_help_fprint`（不碰脏 `h3_cuda_generate.c`）。
 9i. [x] **∥ turbo4×fewstep 禁配日志检** `tools/fewstep_forbidden_combo_check.py`；P0 runbook §4.3.1 接 waffle 同配置门示例。
 9j. [x] **∥ C061/C074/C040/C070 离线批**：generate 内联 `# H3_ENV_CONTRACT`、`tag=FAIL_*`、`H3_VRAM_LEDGER` 插桩、[`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；说明 [`c061-inline-env-contract`](2026-10-27-c061-inline-env-contract.md)。GPU 统一后验。
+9k. [x] **∥ C062 te_cache 产品化（opt-in）+ C068/C069 RoPE 状态**：HIT/MISS/REQUIRE_HIT、env 合同、p0 `--expect-te-cache-hit`；C068 host memo 已在 HEAD；C069 same-key H2D skip；说明 [`te-cache-productization`](2026-10-27-te-cache-productization.md) / [`c068-c069`](2026-10-27-c068-c069-rope-memo.md)。GPU 统一后验。
 
 ---
 

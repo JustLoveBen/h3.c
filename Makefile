@@ -94,11 +94,18 @@ h3_waffle_test: tests/test_h3_waffle.c h3_waffle.c h3_waffle.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_waffle.c \
 		h3_waffle.c -lm
 
+
+# Opt-in TE prompt cache host unit test (C062; no GPU).
+h3_te_cache_test: tests/test_h3_te_cache.c h3_te_cache.c h3_te_cache.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_te_cache.c \
+		h3_te_cache.c
+
 # CI-ish: all offline fewstep / sampler / waffle host checks (no GPU).
 # See docs/research/2026-10-26-fewstep-metal-boundary.md
 fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
 		dump_fewstep_student_grid dump_fewstep_contracts print_fewstep_help \
-		print_h3_env_contract_host h3_env_contract_test h3_waffle_test
+		print_h3_env_contract_host h3_env_contract_test h3_waffle_test \
+		h3_te_cache_test
 	./h3_fewstep_contract_test
 	./h3_sampler_test
 	./dump_fewstep_student_grid >/dev/null
@@ -109,6 +116,8 @@ fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
 	./h3_env_contract_test
 	./print_h3_env_contract_host | grep -q '# H3_ENV_CONTRACT'
 	./print_h3_env_contract_host | grep -q 'sdpa_graph='
+	./print_h3_env_contract_host | grep -q 'H3_TE_PROMPT_CACHE'
+	./h3_te_cache_test
 	./h3_waffle_test
 	python3 tools/waffle_same_config_gate.py --self-test
 	python3 tools/fewstep_contracts_validate.py --self-test

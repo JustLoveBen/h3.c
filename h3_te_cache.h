@@ -9,8 +9,9 @@ extern "C" {
 #endif
 
 /* Opt-in TE prompt embedding disk cache. Gold default is off.
- * Key = token ids + te_layers + TE path fingerprint (mtime+size).
- * Vision / multimodal embeddings are never cached. */
+ * Key = token ids + te_layers + text_dim + TE path fingerprint
+ * (mtime+size + path string). Vision / multimodal never cached.
+ * H3_TE_CACHE_REQUIRE_HIT=1 (generate): MISS → FAIL_ENV when cache on. */
 
 enum { H3_TE_CACHE_TEXT_DIM = 5120 };
 

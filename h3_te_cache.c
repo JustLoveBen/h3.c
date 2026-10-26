@@ -28,15 +28,17 @@ int h3_te_cache_key(const int32_t *ids, size_t n, unsigned te_layers,
                     char *err, size_t err_size) {
     uint64_t h = 14695981039346656037ull;
     struct stat st;
-    uint64_t meta[3];
+    uint64_t meta[4];
     unsigned i;
     if (!ids || n < 1 || !hex || hex_size < 17)
         return tc_fail(err, err_size, "te_cache: bad key args");
     memset(meta, 0, sizeof(meta));
     meta[0] = (uint64_t)n;
     meta[1] = (uint64_t)te_layers;
+    meta[2] = (uint64_t)H3_TE_CACHE_TEXT_DIM; /* C062: dim in key */
+    meta[3] = 0;
     if (te_path && te_path[0] && stat(te_path, &st) == 0) {
-        meta[2] = (uint64_t)st.st_mtime ^ ((uint64_t)st.st_size << 1);
+        meta[3] = (uint64_t)st.st_mtime ^ ((uint64_t)st.st_size << 1);
         h = fnv1a_update(h, te_path, strlen(te_path));
     } else if (te_path && te_path[0]) {
         h = fnv1a_update(h, te_path, strlen(te_path));

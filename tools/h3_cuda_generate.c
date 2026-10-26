@@ -2437,6 +2437,7 @@ int main(int argc, char **argv) {
                     "                     S_real (pad rows excluded). Gold default stays 1.\n"
                     "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
                     "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
+                    "                     H3_TE_CACHE_REQUIRE_HIT=1 → MISS is FAIL_ENV.\n"
                     "                     Text-only; vision/multimodal never cached.\n"
                     "  --vae-decode official|tae  Default official（金线必须 official）。\n"
                     "                     tae 仅 turbo4/nvfp4 快档 opt-in：非金线、画质有损\n"
@@ -3306,9 +3307,12 @@ int main(int argc, char **argv) {
                (unsigned)H3_CUDA_TEXT_CONTEXT_HARD_MAX,
                preset_name && preset_name[0] ? preset_name : "none", ulysses,
                vae_decode);
-        if (te_cache_dir && te_cache_dir[0])
-            printf("te_prompt_cache: dir=%s (opt-in; gold default off)\n",
-                   te_cache_dir);
+        if (te_cache_dir && te_cache_dir[0]) {
+            const char *req = getenv("H3_TE_CACHE_REQUIRE_HIT");
+            printf("te_prompt_cache: dir=%s require_hit=%d "
+                   "(opt-in; gold default off)\n",
+                   te_cache_dir, (req && req[0] == '1') ? 1 : 0);
+        }
         if (first_frame_path || last_frame_path || n_ref_images ||
             ref_video_path) {
             printf("cfg_defaults: t2va=5 f2va=1 l2va=1 fl2va=1 ref2va=1 "
@@ -5161,8 +5165,10 @@ int main(int argc, char **argv) {
                     te_st.embed_cache_hit = 1;
                     te_st.n_layers = te_layers;
                     te_st.all_finite = 1;
-                    printf("te_prompt_cache: HIT dir=%s key=%s tokens=%zu\n",
-                           te_cache_dir, te_pc_hex, context);
+                    printf("te_prompt_cache: HIT dir=%s key=%s tokens=%zu "
+                           "layers=%u dim=%d\n",
+                           te_cache_dir, te_pc_hex, context, te_layers,
+                           (int)H3_TE_CACHE_TEXT_DIM);
                     /* Packed hook never fires on HIT — kick host_stage here. */
                     if ((dit_is_int8 || dit_is_nvfp4) && dit &&
                         !host_stage_th_ok) {
@@ -5211,11 +5217,36 @@ int main(int argc, char **argv) {
                                 error);
                         error[0] = '\0';
                     } else {
-                        printf("te_prompt_cache: MISS wrote dir=%s key=%s\n",
-                               te_cache_dir, te_pc_hex);
+                        printf("te_prompt_cache: MISS wrote dir=%s key=%s "
+                               "tokens=%zu layers=%u dim=%d\n",
+                               te_cache_dir, te_pc_hex, context, te_layers,
+                               (int)H3_TE_CACHE_TEXT_DIM);
                     }
                 }
             }
+        }
+        if (te_cache_dir && te_cache_dir[0] && !te_pc_hit &&
+            !have_vision_span) {
+            /* Structured MISS even when save skipped (no hex / save fail). */
+            if (!te_pc_hex[0])
+                printf("te_prompt_cache: MISS dir=%s key=none tokens=%zu "
+                       "layers=%u dim=%d reason=no_key\n",
+                       te_cache_dir, context, te_layers,
+                       (int)H3_TE_CACHE_TEXT_DIM);
+            {
+                const char *req = getenv("H3_TE_CACHE_REQUIRE_HIT");
+                if (req && req[0] == '1') {
+                    fprintf(stderr,
+                            "te_prompt_cache: REQUIRE_HIT failed "
+                            "(H3_TE_CACHE_REQUIRE_HIT=1; warm cache first)\n");
+                    h3_fail_tag("FAIL_ENV");
+                    goto cleanup;
+                }
+            }
+        }
+        if (te_cache_dir && te_cache_dir[0] && have_vision_span) {
+            printf("te_prompt_cache: SKIP dir=%s reason=vision_span\n",
+                   te_cache_dir);
         }
         if (!text_emb) {
             fprintf(stderr, "TE encode: %s\n", error);

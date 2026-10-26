@@ -415,6 +415,16 @@ static int g_vae_rope_origin_h = 0;
 static int g_vae_rope_origin_w = 0;
 static int g_vae_rope_full_h = 0;
 static int g_vae_rope_full_w = 0;
+/* C069: skip rope prepare+H2D when device already holds identical key. */
+static int g_vae_rope_dev_valid = 0;
+static int g_vae_rope_dev_t = 0;
+static int g_vae_rope_dev_h = 0;
+static int g_vae_rope_dev_w = 0;
+static int g_vae_rope_dev_oh = 0;
+static int g_vae_rope_dev_ow = 0;
+static int g_vae_rope_dev_fh = 0;
+static int g_vae_rope_dev_fw = 0;
+static size_t g_vae_rope_dev_seq = 0;
 
 static cudaGraphExec_t g_vae_layer_graph;
 static size_t g_vae_layer_graph_seq;
@@ -462,6 +472,7 @@ static int vae_cuda_grow(void **p, size_t *cap, size_t need) {
 
 static void vae_scratch_drop(void) {
     vae_scratch_pool *s = &g_vae_scratch;
+    g_vae_rope_dev_valid = 0;
     if (s->d_slice) cudaFree(s->d_slice);
     if (s->d_ws) cudaFree(s->d_ws);
     if (s->d_ws2) cudaFree(s->d_ws2);
@@ -2212,6 +2223,7 @@ static int h3_vae_decode_cuda_spatial(
     else
         unsetenv("H3_VAE_NO_SPATIAL_TILE");
     g_vae_borrowed_weights = NULL;
+    g_vae_rope_dev_valid = 0;
     g_vae_rope_origin_h = g_vae_rope_origin_w = 0;
     g_vae_rope_full_h = g_vae_rope_full_w = 0;
     if (ok)
@@ -2228,6 +2240,7 @@ static int h3_vae_decode_cuda_spatial(
     }
 done:
     g_vae_borrowed_weights = NULL;
+    g_vae_rope_dev_valid = 0;
     g_vae_rope_origin_h = g_vae_rope_origin_w = 0;
     g_vae_rope_full_h = g_vae_rope_full_w = 0;
     h3_vae_int8_cuda_weights_free(shared_w);
@@ -3208,24 +3221,53 @@ int h3_vae_int8_decode_cuda_ex(h3_cuda *cuda, const h3_vae_int8_store *store,
             if (t0_frame + c_here > (size_t)latent_t)
                 c_here = (size_t)latent_t - t0_frame;
             seq_here = c_here * spat + reg_tail;
-            if (!h3_vae_int8_prepare_rope_ex(
-                    (int)c_here, latent_h, latent_w, g_vae_rope_origin_h,
-                    g_vae_rope_origin_w,
-                    g_vae_rope_full_h > 0 ? g_vae_rope_full_h : latent_h,
-                    g_vae_rope_full_w > 0 ? g_vae_rope_full_w : latent_w,
-                    c_here * spat, seq_here, rope_cos, rope_sin, error,
-                    error_size)) {
-                goto done;
-            }
-            if (d_rope_cos &&
-                (cudaMemcpy(d_rope_cos, rope_cos,
-                            seq_here * H3_VAE_INT8_ROPE_HALF * sizeof(float),
-                            cudaMemcpyHostToDevice) != cudaSuccess ||
-                 cudaMemcpy(d_rope_sin, rope_sin,
-                            seq_here * H3_VAE_INT8_ROPE_HALF * sizeof(float),
-                            cudaMemcpyHostToDevice) != cudaSuccess)) {
-                fail(error, error_size, "vae rope H2D failed");
-                goto done;
+            {
+                int fh = g_vae_rope_full_h > 0 ? g_vae_rope_full_h : latent_h;
+                int fw = g_vae_rope_full_w > 0 ? g_vae_rope_full_w : latent_w;
+                int same_dev =
+                    g_vae_rope_dev_valid && d_rope_cos && d_rope_sin &&
+                    g_vae_rope_dev_t == (int)c_here &&
+                    g_vae_rope_dev_h == latent_h &&
+                    g_vae_rope_dev_w == latent_w &&
+                    g_vae_rope_dev_oh == g_vae_rope_origin_h &&
+                    g_vae_rope_dev_ow == g_vae_rope_origin_w &&
+                    g_vae_rope_dev_fh == fh && g_vae_rope_dev_fw == fw &&
+                    g_vae_rope_dev_seq == seq_here;
+                if (!same_dev) {
+                    if (!h3_vae_int8_prepare_rope_ex(
+                            (int)c_here, latent_h, latent_w,
+                            g_vae_rope_origin_h, g_vae_rope_origin_w, fh, fw,
+                            c_here * spat, seq_here, rope_cos, rope_sin,
+                            error, error_size)) {
+                        goto done;
+                    }
+                    if (d_rope_cos &&
+                        (cudaMemcpy(
+                             d_rope_cos, rope_cos,
+                             seq_here * H3_VAE_INT8_ROPE_HALF * sizeof(float),
+                             cudaMemcpyHostToDevice) != cudaSuccess ||
+                         cudaMemcpy(
+                             d_rope_sin, rope_sin,
+                             seq_here * H3_VAE_INT8_ROPE_HALF * sizeof(float),
+                             cudaMemcpyHostToDevice) != cudaSuccess)) {
+                        g_vae_rope_dev_valid = 0;
+                        fail(error, error_size, "vae rope H2D failed");
+                        goto done;
+                    }
+                    if (d_rope_cos && d_rope_sin) {
+                        g_vae_rope_dev_valid = 1;
+                        g_vae_rope_dev_t = (int)c_here;
+                        g_vae_rope_dev_h = latent_h;
+                        g_vae_rope_dev_w = latent_w;
+                        g_vae_rope_dev_oh = g_vae_rope_origin_h;
+                        g_vae_rope_dev_ow = g_vae_rope_origin_w;
+                        g_vae_rope_dev_fh = fh;
+                        g_vae_rope_dev_fw = fw;
+                        g_vae_rope_dev_seq = seq_here;
+                    } else {
+                        g_vae_rope_dev_valid = 0;
+                    }
+                }
             }
 
             if (gpu_embed_done && use_dev_slice && chunk >= latent_t &&

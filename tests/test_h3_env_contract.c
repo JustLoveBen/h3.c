@@ -75,6 +75,10 @@ int main(void) {
         expect_ok("skip_audio", strstr(buf, "skip_audio=1") != NULL);
         expect_ok("te live", strstr(buf, "te_path=live") != NULL);
         expect_ok("sdpa_graph=0", strstr(buf, "sdpa_graph=0") != NULL);
+        expect_ok("te cache env",
+                  strstr(buf, "env H3_TE_PROMPT_CACHE=") != NULL);
+        expect_ok("te require_hit env",
+                  strstr(buf, "env H3_TE_CACHE_REQUIRE_HIT=") != NULL);
     }
 
     setenv("H3_EXPECT_P0_VISUAL", "1", 1);
