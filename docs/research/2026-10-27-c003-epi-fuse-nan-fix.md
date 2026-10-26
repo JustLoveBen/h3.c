@@ -79,3 +79,8 @@ Host Hadamard (H4 normalized): skip-rot vs true rel_l2≈0.40; quant+skip vs qua
 
 ### Not race / scratch
 DiT fuse path itself was deterministic; prior scratch/AdaLN bugs were separate and already fixed. Remaining waffle FAIL was numerical wrongness of skip-ConvRot, not a race.
+
+
+## 2026-10-27 disarm retest @ `3145ba0` (238)
+
+P2 skip-ConvRot **DISARMED**. fuse≡ctrl checksum `0x1752bd77f232dbb6`; waffle fuse+ctrl **PASS**; dit ≈0% delta. See [`skip-convrot-unreachable`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md) + gpu-unified addendum.

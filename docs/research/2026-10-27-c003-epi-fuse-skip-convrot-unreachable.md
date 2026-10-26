@@ -35,3 +35,10 @@ DESIGN §3 proved the **rotated** path identity, then jumped to the unrotated ac
 - P1 stays disabled (AdaLN); P3 unwired.
 
 See also: [`2026-10-27-c003-epi-fuse-nan-fix.md`](2026-10-27-c003-epi-fuse-nan-fix.md).
+
+
+## 238 confirm (`3145ba0`)
+
+After disarm: all four arms hot latent checksum `0x1752bd77f232dbb6` (fuse≡ctrl).  
+waffle fuse PASS meanΔ=0.013; ctrl PASS meanΔ=0.004.  
+`epi_fuse_req=1` / `epi_fuse=0 DISARMED` on fuse arms. Out: `out/c003_epi_fuse_20261027_disarm_from238/`.

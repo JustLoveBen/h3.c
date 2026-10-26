@@ -152,7 +152,7 @@ Mac pull: `out/c062_te_cache_hit_20261027_from238/`. Default te_cache policy rem
 ## Still needs human eyes (updated)
 
 1. C001 INT8 / NVFP4 mp4s (`out/p0_visual_20261027_from238/`) — NVFP4 waffle FAIL + both INVALID_LOWENERGY
-2. C003 fuse vs ctrl hot mp4s (`out/c003_epi_fuse_20261027_scratchfix_from238/fuse_*/*_r2.mp4`) — finite but waffle FAIL / latent diverge
+2. C003 historical bad-fuse mp4s (`out/c003_epi_fuse_20261027_scratchfix_from238/fuse_*/*_r2.mp4`) — pre-disarm wrong path; disarm outs match ctrl (`out/c003_epi_fuse_20261027_disarm_from238/`)
 3. C030 PDMD-4 mp4s (`out/c030_pdmd4_20261027_from238/`)
 4. C031 DMAD-4 mp4s (`out/c031_dmad4_20261027_from238/`)
 
@@ -161,3 +161,36 @@ Mac pull: `out/c062_te_cache_hit_20261027_from238/`. Default te_cache policy rem
 - NVFP4 chain WIP untouched (local dirty on Mac; not synced / not committed)
 - No nsys/EVT; no disk wipe; ComfyUI / eval-matrix pause flags left alone
 - C040 VRAM ledger not run (disk ~99%; skipped). C062 HIT smoke **done** (see above).
+
+
+## Addendum — C003 P2 skip-ConvRot DISARM (238 · SHA `3145ba0`)
+
+Tree: `/mnt/nvme1n1/workspace/h3_c_main_20261027` · bin sha256 `477f0de8485dc28d2b5c4ff2dea68569866fd2a1ddc361002487466007d4bc2b`  
+Mac pull: `out/c003_epi_fuse_20261027_disarm_from238/`  
+Protocol: turbo4 INT8 864×480 seed `0x48000001` repeat=2 · `H3_DIT_NVFP4_CHAIN` unset · same as scratchfix.
+
+### Root cause (waffle Δ≈0.39)
+P2 fused requant skipped act ConvRot while FC2 weights stay `W_rot=W@H`.  
+Correct: `Y=(X@H)@W_rot.T`. Fuse did `quant(X)@W_rot.T` — DESIGN §3 algebra false.  
+Prior fuse↔ctrl latent rel_l2≈1.49; host H4 skip-rot rel_l2≈0.40.
+
+### Disposition
+Code forces `epi_fuse=0` even when env=1; log shows `epi_fuse_req` + `DISARMED`. Default OFF. Env=1 is **no-op** until in-kernel ConvRot+requant redesign.
+
+### Hot clip2 dit_ms / latent
+
+| arm | cold dit_ms | hot dit_ms | hot latent checksum |
+| --- | ---: | ---: | --- |
+| ctrl_r1 | 14080.9 | 13821.2 | `0x1752bd77f232dbb6` |
+| fuse_r1 | 14170.1 | 13887.3 | `0x1752bd77f232dbb6` |
+| ctrl_r2 | 14221.3 | 13906.4 | `0x1752bd77f232dbb6` |
+| fuse_r2 | 14227.2 | 13915.7 | `0x1752bd77f232dbb6` |
+
+- fuse≡ctrl latents (all four hot checksums identical; matches prior ctrl).
+- Log: fuse arms `epi_fuse_req=1 epi_fuse=0 (P2 skip-ConvRot DISARMED)`.
+- same-config waffle (generate.log hot): **fuse PASS** meanΔ=0.013 max=0.022; **ctrl PASS** meanΔ=0.004 max=0.015.
+- dit speedup ≈ 0% (expected for no-op).
+
+### Verdict
+**Boundary landed.** Skip-ConvRot P2 unreachable for quality; disarmed; waffle PASS as ctrl-equivalent. Do **not** default-on; do **not** claim E2 speedup. C004 still blocked. Human visual list unchanged for aesthetic review of prior fuse mp4s (historical wrong path) — current disarm mp4s match ctrl.
+
