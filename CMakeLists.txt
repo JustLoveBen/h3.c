@@ -1051,6 +1051,15 @@ target_include_directories(h3_dit_fused_epi_test PRIVATE ${CMAKE_CURRENT_SOURCE_
 target_compile_features(h3_dit_fused_epi_test PRIVATE c_std_11)
 target_link_libraries(h3_dit_fused_epi_test PRIVATE m)
 
+add_executable(h3_nvfp4_act_convrot_test
+  tests/test_h3_nvfp4_act_convrot.c
+  h3_w4a8.c
+  h3_w4a8_dequant.c
+  h3_safetensors.c)
+target_include_directories(h3_nvfp4_act_convrot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_nvfp4_act_convrot_test PRIVATE c_std_11)
+target_link_libraries(h3_nvfp4_act_convrot_test PRIVATE m)
+
 add_executable(h3_w4a8_window_test
   tests/test_h3_w4a8_window.c)
 target_include_directories(h3_w4a8_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

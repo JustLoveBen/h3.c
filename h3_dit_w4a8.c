@@ -33,6 +33,13 @@ static int env_flag_is_one(const char *name) {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+/* Kill-switch: restore broken NVFP4 (W_rot @ unrotated act) for A/B.
+ * Default OFF — act ConvRot is required when sidecar weights are
+ * ConvRot-baked (tools/quant_dit_nvfp4.py). */
+static int nvfp4_skip_act_convrot(void) {
+    return env_flag_is_one("H3_DIT_NVFP4_SKIP_ACT_CONVROT");
+}
+
 /* P4.2 Phase-1: FC1→FC2 chained direct-output. Requires H3_DIT_NVFP4=1 AND
  * the chain build (H3_ENABLE_NVFP4_CHAIN). Env H3_DIT_NVFP4_CHAIN=1 enables. */
 static int h3_dit_nvfp4_chain_on(void) {
@@ -323,6 +330,13 @@ struct h3_dit_w4a8 {
     uint8_t *d_nvfp4_chain_scratch;
     size_t d_nvfp4_chain_scratch_bytes;
     size_t nvfp4_chain_scratch_cap_seq;
+    /* Act ConvRot scratch for NVFP4 (W_rot needs X@H before FP4 quant).
+     * Sized for seq * max_k (ffn=14336). Separate from gemm scratch so
+     * d_x / scratch cannot alias through the quantizer. */
+    float *d_nvfp4_rot;
+    size_t d_nvfp4_rot_bytes;
+    size_t nvfp4_rot_cap_seq;
+    int nvfp4_act_convrot_logged;
 };
 
 static uint32_t dit_text_row_mod(const h3_dit_w4a8 *ctx, size_t i,
@@ -474,6 +488,15 @@ h3_dit_w4a8 *h3_dit_w4a8_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
         fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
                         "(INT8 weights load lazily only on FP4 dispatch "
                         "miss)\n");
+        if (ctx->convrot_gs > 0 && !nvfp4_skip_act_convrot())
+            fprintf(stderr,
+                    "dit_nvfp4: act_convrot policy=ON gs=%d "
+                    "(per-linear; chain auto-skipped)\n",
+                    ctx->convrot_gs);
+        else if (ctx->convrot_gs > 0)
+            fprintf(stderr,
+                    "dit_nvfp4: act_convrot policy=SKIP "
+                    "(H3_DIT_NVFP4_SKIP_ACT_CONVROT=1)\n");
         fflush(stderr);
     }
     ctx->nvfp4_chain_on = h3_dit_nvfp4_chain_on();
@@ -509,7 +532,8 @@ h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
     ctx->nvfp4_store = store;
     ctx->act_quant = H3_W4A8_ACT_QUANT_PER_ROW;
     ctx->group_size = 0;
-    ctx->convrot_gs = 0; /* NVFP4 is not ConvRot-preprocessed */
+    ctx->convrot_gs = 0; /* pure NVFP4 store: no INT8 ConvRot metadata;
+                          * overlay open (W4A8+sidecar) sets gs from INT8 */
 
     if (cfg)
         local = *cfg;
@@ -535,6 +559,15 @@ h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
         fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
                         "(INT8 weights load lazily only on FP4 dispatch "
                         "miss)\n");
+        if (ctx->convrot_gs > 0 && !nvfp4_skip_act_convrot())
+            fprintf(stderr,
+                    "dit_nvfp4: act_convrot policy=ON gs=%d "
+                    "(per-linear; chain auto-skipped)\n",
+                    ctx->convrot_gs);
+        else if (ctx->convrot_gs > 0)
+            fprintf(stderr,
+                    "dit_nvfp4: act_convrot policy=SKIP "
+                    "(H3_DIT_NVFP4_SKIP_ACT_CONVROT=1)\n");
         fflush(stderr);
     }
     ctx->nvfp4_chain_on = h3_dit_nvfp4_chain_on();
@@ -602,6 +635,7 @@ void h3_dit_w4a8_free(h3_dit_w4a8 *ctx) {
     }
     if (ctx->d_nvfp4_scratch) cudaFree(ctx->d_nvfp4_scratch);
     if (ctx->d_nvfp4_chain_scratch) cudaFree(ctx->d_nvfp4_chain_scratch);
+    if (ctx->d_nvfp4_rot) cudaFree(ctx->d_nvfp4_rot);
     if (ctx->nvfp4_ready) h3_st_free_header(&ctx->nvfp4_hdr);
     free(ctx);
     dit_rope_memo_free_all();
@@ -3006,6 +3040,72 @@ static int nvfp4_load_block_weights(h3_dit_w4a8 *ctx, unsigned block,
     return 1;
 }
 
+/* Ensure d_nvfp4_rot can hold [seq, k] f32 (k <= FFN). */
+static int nvfp4_ensure_rot(h3_dit_w4a8 *ctx, size_t seq, size_t k,
+                            char *error, size_t error_size) {
+    size_t need;
+    const size_t max_k = (size_t)H3_DIT_W4A8_FFN;
+    if (k == 0 || k > max_k) {
+        fail(error, error_size, "nvfp4 rot: bad k=%zu (max %zu)", k, max_k);
+        return 0;
+    }
+    if (ctx->d_nvfp4_rot && seq <= ctx->nvfp4_rot_cap_seq)
+        return 1;
+    need = seq * max_k * sizeof(float);
+    if (need > ctx->d_nvfp4_rot_bytes) {
+        if (ctx->d_nvfp4_rot) {
+            cudaFree(ctx->d_nvfp4_rot);
+            ctx->d_nvfp4_rot = NULL;
+        }
+        if (cudaMalloc((void **)&ctx->d_nvfp4_rot, need) != cudaSuccess) {
+            ctx->d_nvfp4_rot_bytes = 0;
+            ctx->nvfp4_rot_cap_seq = 0;
+            fail(error, error_size, "nvfp4 rot scratch OOM (%zu bytes)", need);
+            return 0;
+        }
+        ctx->d_nvfp4_rot_bytes = need;
+    }
+    ctx->nvfp4_rot_cap_seq = seq;
+    return 1;
+}
+
+/* When weights are ConvRot-baked (ctx->convrot_gs > 0), rotate acts into
+ * d_nvfp4_rot and return that pointer. Otherwise return d_x unchanged.
+ * H3_DIT_NVFP4_SKIP_ACT_CONVROT=1 forces the old broken path. */
+static const float *nvfp4_act_maybe_convrot(h3_dit_w4a8 *ctx, const float *d_x,
+                                            size_t seq, size_t k, char *error,
+                                            size_t error_size) {
+    int gs = ctx->convrot_gs;
+    char detail[384];
+    if (gs <= 0 || nvfp4_skip_act_convrot()) {
+        if (gs > 0 && !ctx->nvfp4_act_convrot_logged) {
+            fprintf(stderr,
+                    "dit_nvfp4: act_convrot=0 SKIP_ACT_CONVROT "
+                    "(W_rot @ unrotated act — expected mosaic)\n");
+            fflush(stderr);
+            ctx->nvfp4_act_convrot_logged = 1;
+        }
+        return d_x;
+    }
+    if (!nvfp4_ensure_rot(ctx, seq, k, error, error_size))
+        return NULL;
+    if (!h3_cuda_convrot_act_f32_dd(ctx->cuda, d_x, seq, k, gs,
+                                    ctx->d_nvfp4_rot, detail,
+                                    sizeof(detail))) {
+        snprintf(error, error_size, "nvfp4 act convrot: %s", detail);
+        return NULL;
+    }
+    if (!ctx->nvfp4_act_convrot_logged) {
+        fprintf(stderr,
+                "dit_nvfp4: act_convrot=1 gs=%d "
+                "(sidecar W_rot; SKIP_ACT_CONVROT=1 for broken A/B)\n",
+                gs);
+        fflush(stderr);
+        ctx->nvfp4_act_convrot_logged = 1;
+    }
+    return ctx->d_nvfp4_rot;
+}
+
 static int nvfp4_ensure_scratch(h3_dit_w4a8 *ctx, size_t seq, char *error,
                                 size_t error_size) {
     size_t need, widest_n;
@@ -3191,6 +3291,8 @@ static int nvfp4_gemm_dispatch(h3_dit_w4a8 *ctx, unsigned block, unsigned kind,
                                double *gemm_ms, char *error,
                                size_t error_size) {
     const h3_cuda_nvfp4_weight *w;
+    const float *d_x_use;
+    size_t k;
     char detail[384];
     char tag[32];
     if (!nvfp4_load_block_weights(ctx, block, error, error_size))
@@ -3202,14 +3304,21 @@ static int nvfp4_gemm_dispatch(h3_dit_w4a8 *ctx, unsigned block, unsigned kind,
         fail(error, error_size, "nvfp4 weight missing");
         return 0;
     }
+    k = h3_cuda_nvfp4_weight_k(w);
+    /* Sidecar FP4 weights are ConvRot-baked (same basis as INT8 W_rot).
+     * Rotate activations before FP4 quant — matches INT8 gemm_f32_dd path.
+     * Missing this was the C001 NVFP4 mosaic root cause (2026-10-27). */
+    d_x_use = nvfp4_act_maybe_convrot(ctx, d_x, seq, k, error, error_size);
+    if (!d_x_use)
+        return 0;
     snprintf(tag, sizeof(tag), "b%u.%s", block, nvfp4_linear_suffix(kind));
     if (h3_nvfp4_debug_nan_dev()) {
-        h3_nvfp4_debug_scan_dev(ctx->cuda, d_x, seq * h3_cuda_nvfp4_weight_k(w),
-                                "f32", tag, "dispatch_in");
+        h3_nvfp4_debug_scan_dev(ctx->cuda, d_x_use, seq * k, "f32", tag,
+                                "dispatch_in");
     }
     if (kind == 2u) {
         if (!h3_cuda_gemm_fp4_w_act_dev_swiglu(
-                ctx->cuda, w, d_x, 1.0f, seq, d_lora, d_y,
+                ctx->cuda, w, d_x_use, 1.0f, seq, d_lora, d_y,
                 ctx->d_nvfp4_scratch, prep_ms, gemm_ms, detail,
                 sizeof(detail), tag)) {
             snprintf(error, error_size, "nvfp4 fc1: %s", detail);
@@ -3219,7 +3328,7 @@ static int nvfp4_gemm_dispatch(h3_dit_w4a8 *ctx, unsigned block, unsigned kind,
     }
     if (kind == 1u || kind == 3u) {
         if (!h3_cuda_gemm_fp4_w_act_dev_gate(
-                ctx->cuda, w, d_x, 1.0f, seq, d_residual, d_mod, d_map,
+                ctx->cuda, w, d_x_use, 1.0f, seq, d_residual, d_mod, d_map,
                 (size_t)H3_DIT_W4A8_SLOTS, gate_slot, d_lora, d_y,
                 ctx->d_nvfp4_scratch, prep_ms, gemm_ms, detail,
                 sizeof(detail), tag)) {
@@ -3229,7 +3338,7 @@ static int nvfp4_gemm_dispatch(h3_dit_w4a8 *ctx, unsigned block, unsigned kind,
         }
         return 1;
     }
-    if (!h3_cuda_gemm_fp4_w_act_dev(ctx->cuda, w, d_x, 1.0f, seq, d_y,
+    if (!h3_cuda_gemm_fp4_w_act_dev(ctx->cuda, w, d_x_use, 1.0f, seq, d_y,
                                     ctx->d_nvfp4_scratch, prep_ms, gemm_ms,
                                     detail, sizeof(detail), tag)) {
         snprintf(error, error_size, "nvfp4 qkv: %s", detail);
@@ -3565,11 +3674,16 @@ out_done:
 
         prep = gemm = 0.0;
         uly_klog("fc1_gemm", "enter");
-        if (ctx->nvfp4_chain_on) {
+        if (ctx->nvfp4_chain_on &&
+            !(ctx->convrot_gs > 0 && !nvfp4_skip_act_convrot())) {
             /* P4.2 Phase-1: chained FC1→SwiGLU→requant→FC2. Runs BOTH FC1 and
              * FC2 (writes d_y), so on success we skip the standalone swiglu
              * and the FC2 dispatch below. Falls back to the per-linear FP4
-             * path (then INT8) on any chain failure. */
+             * path (then INT8) on any chain failure.
+             *
+             * When convrot_gs>0 the fused swiglu+requant cannot ConvRot the
+             * FC2 activation before FP4 quant — skip chain and use the
+             * corrected per-linear path instead. */
             snprintf(backend, sizeof(backend), "%s", "cutlass_fp4_chain");
             if (nvfp4_chain_fc1_fc2(ctx, block, d_a, d_b, d_mod, d_map,
                                     ctx->lora ? d_fc1 : NULL,

@@ -147,7 +147,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步实验 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；roadmap P0；timing；[`gpu-unified`](2026-10-27-gpu-unified-test-results.md)；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **boundary**（INT8 visual **PASS**；NVFP4 visual **FAIL/BLOCK** mosaic；waffle NVFP4 FAIL；**勿升默认 / 勿交 chain**） | S4 | NVFP4 根因另开；chain 仍 gated |
+| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；[`nvfp4-mosaic-act-convrot`](2026-10-27-nvfp4-mosaic-act-convrot.md)；timing；[`gpu-unified`](2026-10-27-gpu-unified-test-results.md)；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **in_progress**（根因=缺 act ConvRot；host 证明 PASS；fix 待 238 P0+OR 复验；**勿升默认 / 勿交 chain**） | S4 | 复验绿后改 landed/boundary；chain 仍 gated |
 | **C002** | DiT NVFP4 | 链式消除 FC1→FC2 激活中转 | CUTLASS 79b FP4-out+SFD | `nvfp4-chained-*`；WIP 未提交 | WC中 Q高 R高 | **C001 NVFP4 visual PASS + 用户确认** | **blocked**（C001 NVFP4 **FAIL**；WIP 不动） | S4/S5 | 先修 C001 NVFP4 观感再议 chain |
 | **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | DESIGN §8 errata；[`skip-convrot-unreachable`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md)；[`nan-fix`](2026-10-27-c003-epi-fuse-nan-fix.md) | WC中 Q高（代数错） | act_f16+convrot | **boundary** @ `3145ba0`（P2 skip-ConvRot **DISARMED**/不可达；NaN 已修；238 waffle PASS as no-op；**默认 OFF**） | S5 | 勿 default-on； redesign 需 in-kernel ConvRot；C004 仍挡 |
 | **C004** | DiT INT8 | E2-P3 跨 phase FC2→QKV | mode 3 requant 接线 | DESIGN.md §5 | WC中 R中高 | C003 数值门 | **idea** | S5 | A1 通过后再开 |
@@ -340,7 +340,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 ```csv
 id,axis,stage,title,status,s_link,near_term_pri
-C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,boundary-nvfp4-block,S4,P0-blocked
+C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,in_progress-act-convrot-fix,S4,P0-reverify
 C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
 C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-disarmed,S5,defer-redesign
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3

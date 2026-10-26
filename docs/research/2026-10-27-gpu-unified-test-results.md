@@ -221,3 +221,11 @@ Out: `out/c070_forbid_smoke_20261027/{int8_forbid,nvfp4_format}/`
 - **C070:** opt-in forbid **landed + 238 smoke PASS** (generate completes under FORBID=1).
 - **dit_format:** NVFP4 arm no longer misreports as INT8-only; protocol check clean.
 - Visual/quality of NVFP4 arm unchanged → still **BLOCK** (see OR review); chain WIP still untouched / not committed.
+
+## Addendum — C001 NVFP4 act-ConvRot fix (pending 238)
+
+Code: `nvfp4_act_maybe_convrot` in `h3_dit_w4a8.c` (default ON when
+`convrot_gs>0`; kill-switch `H3_DIT_NVFP4_SKIP_ACT_CONVROT=1`).
+Host proof: `tests/test_h3_nvfp4_act_convrot.c` ALL PASS.
+**238 rebuild + P0 NVFP4 vs INT8 + OR re-review still required** before
+lifting BLOCK. Chain remains unset / auto-skipped when ConvRot required.
