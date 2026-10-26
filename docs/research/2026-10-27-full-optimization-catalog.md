@@ -147,9 +147,9 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步实验 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；roadmap P0；timing graph-关 ~1.14× dit 中位 | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **blocked**（P2.2 未按现基线重验） | S4 | 238：P0 runbook INT8→NVFP4 目检+同配置 waffle |
+| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；roadmap P0；timing graph-关 ~1.14× dit 中位；[`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **partial**（238 PROTO_OK；INT8 waffle PASS；NVFP4 waffle FAIL；**目检未做**） | S4 | 人眼目检 `out/p0_visual_20261027_from238/` |
 | **C002** | DiT NVFP4 | 链式消除 FC1→FC2 激活中转 | CUTLASS 79b FP4-out+SFD | `nvfp4-chained-*`；WIP 未提交 | WC中 Q高 R高 | **C001 视觉结论 + 用户确认** | **blocked**（WIP 不动） | S4/S5 | 视觉门后解释 latent rel~0.33 再议提交 |
-| **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | `e2-epi-fuse/DESIGN.md`；`H3_DIT_EPI_FUSE`；fused kernels 已接线 P1/P2 | WC中（估−0.2~−0.4s） Q中 R中 | 授权 238；act_f16+convrot | **partial**（代码齐未验） | S5 | `ab.sh` hot clip2 ≥2；waffle 同配置 |
+| **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | `e2-epi-fuse/DESIGN.md`；`H3_DIT_EPI_FUSE`；[`c003-epi-fuse-nan-fix`](2026-10-27-c003-epi-fuse-nan-fix.md) @ `1b37f28` | WC中（实测 hot ~3% dit） Q中 R中 | 授权 238；act_f16+convrot | **partial**（NaN 已修；fuse waffle FAIL；**默认仍 OFF**） | S5 | 残差数值/目检；勿 default-on；C004 仍等质量门 |
 | **C004** | DiT INT8 | E2-P3 跨 phase FC2→QKV | mode 3 requant 接线 | DESIGN.md §5 | WC中 R中高 | C003 数值门 | **idea** | S5 | A1 通过后再开 |
 | **C005** | DiT | Hadamard/ConvRot 与 FP4 共设计 | 激活旋转抑 outlier | transfer 2.2；nvfp4 文 | Q中（绑 C001） | 随 NVFP4 | **partial** | S4 | 不单独开项 |
 | **C006** | Attn | cuDNN SDPA / sol 后端选择与稳态 | registry；graph 政策 | `h3_sdpa*`；`321538a` | WC低~中 Q高 | 对照纪律 | **landed/政策** | S6 | 保持 graph 默认关；临时开写标题 |
@@ -172,8 +172,8 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；`--fewstep-preset pdmd4` | WC高（少步） Q高 | INT8；合同开 | **blocked** | S7 | 480p 同 seed 目检 |
-| **C031** | fewstep | DMAD 官方采样器需诚实验 | `lcm_renoise`+full_critic+12/2 | sampler 已提交 `e037d42` | WC高 Q高 | C030 纪律 | **partial** | S7 | GPU 验收；Euler≠通过 |
+| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；`--fewstep-preset pdmd4`；gpu-unified-results | WC高（少步） Q高 | INT8；合同开 | **partial**（238 PROTO+waffle PASS @ rank128 原件；**目检未做**） | S7 | 人眼目检 `out/c030_pdmd4_20261027_from238/` |
+| **C031** | fewstep | DMAD 官方采样器需诚实验 | `lcm_renoise`+full_critic+12/2 | sampler `e037d42`；gpu-unified addendum；LoRA `dmad_minimax_h3_4step_full_critic.h3repo.safetensors` | WC高 Q高 | C030 纪律 | **partial**（238 PROTO+waffle PASS；`lcm_renoise` 已确认；**目检未做**） | S7 | 人眼目检 `out/c031_dmad4_20261027_from238/` |
 | **C032** | fewstep | 错合同污染加速叙事 | contract FAIL / preset / σ 金表 | fewstep_contract；fixtures | Q高 R低 | — | **landed**（host） | S11 | GPU 跑时强制 `--fewstep-contract` |
 | **C033** | fewstep | PDMD-2 仅作合同回归 | 大 σ 跳固有发糊 | pdmd 文 r2–r4 | — | — | **landed/边界** | — | 不作 T3 通过尺 |
 | **C034** | fewstep | Metal CLI 无 LoRA/sampler | 边界说明 | fewstep-metal-boundary | — | — | **landed（文档）** | — | 验收走 `h3_cuda_generate` |
@@ -340,16 +340,16 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 ```csv
 id,axis,stage,title,status,s_link,near_term_pri
-C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,blocked,S4,P0
+C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,partial,S4,P0
 C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
-C003,A,DiT-INT8,E2 epi-fuse A/B,partial,S5,P1
+C003,A,DiT-INT8,E2 epi-fuse A/B,partial-nan-fixed-waffle-fail,S5,P1
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
 C015,A/C,DiT,act FP16 staging,idea,S2,P3
 C017,A,DiT,L2 pin hot tables,idea,S2,P3
-C030,B,fewstep,PDMD-4NFE GPU accept,blocked,S7,P1
-C031,B,fewstep,DMAD lcm_renoise GPU,partial,S7,P2
+C030,B,fewstep,PDMD-4NFE GPU accept,partial,S7,P1
+C031,B,fewstep,DMAD lcm_renoise GPU,partial-proto-pass,S7,P2
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
 C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
@@ -392,6 +392,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | 238 GPU：C003 NaN 修 @ `1b37f28`（waffle 仍 FAIL，默认 OFF）；C001 PROTO；C030/C031 PROTO+waffle PASS；均待目检。见 [`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md)。 |
 | 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
 | 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |
 | 2026-10-27 | 初版：合并 research 目录 + 管线扫掠；五轴 taxonomy；Closed Z*；机会 C001–C099（含占位/交叉）；2–8 周 backlog + 长地平线；CSV 摘要。不跑 GPU；不碰链式 WIP。 |

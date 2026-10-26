@@ -87,15 +87,59 @@ Contract lines present: `fewstep_preset: id=pdmd4 … sampler=velocity_euler`, `
 
 ---
 
-## Still needs human eyes
 
-1. C001 INT8 / NVFP4 mp4s (NVFP4 waffle FAIL + both low-energy waffle)
-2. C003 fuse vs ctrl mp4s (fuse mux ~100 KB — likely broken)
-3. C030 PDMD-4 mp4s vs known turbo4 / teacher baselines
+---
+
+## Addendum — C003 scratchfix + C031 DMAD (238 · same day, SHA `1b37f28`)
+
+Binary: `build-cuda-sm120/h3_cuda_generate`  
+`sha256: 2cd0d12e17c7a1685b26d86b8e9c12d0bd11089d335ab11e5acf7746f17b7e64`  
+Mac pulls: `out/c003_epi_fuse_20261027_scratchfix_from238/`, `out/c031_dmad4_20261027_from238/`  
+Disk end: still ~99% / ~58G free; VRAM idle after runs. Chain WIP untouched.
+
+### C003 retest (NaN fix)
+
+See [`2026-10-27-c003-epi-fuse-nan-fix.md`](2026-10-27-c003-epi-fuse-nan-fix.md). Summary:
+
+| metric | ctrl hot | fuse hot | note |
+| --- | ---: | ---: | --- |
+| dit_ms mean (r1/r2) | 13848.6 | 13436.7 | **~3.0%** dit (not prior 8.4%) |
+| latent finite | yes | **yes** | NaN fixed |
+| latent checksum r1=r2 | yes | yes | |
+| mux size | ~3.8 MB | ~6.0 MB | no longer ~100 KB |
+| waffle same-config | PASS Δ=0 | **FAIL** meanΔ=0.39 | keep default OFF |
+
+**Verdict:** NaN fixed; quality/determinism **not** green — **do not default-on**.
+
+### C031 — DMAD-4 GPU accept (`lcm_renoise`)
+
+Asset (original non-truncated, mirror C030 discipline):
+
+- `/mnt/nvme1n1/workspace/models/loras/dmad_minimax_h3_4step_full_critic.h3repo.safetensors` (1 880 927 608 B)
+- `--fewstep-preset dmad4` → contract `dmad4`, sampler **`lcm_renoise`** (Euler ≠ pass), video_shift=12, audio_shift=2, cfg=1
+- INT8 ConvRot base, 864×480, 5s, seed `0x76800003`, cudnn, chain unset
+- Out 238: `out/c031_dmad4_20261027/{r1,r2}`
+
+| arm | RUN_RC | PROTO | dit_ms | total_ms (report) | mux |
+| --- | ---: | --- | ---: | ---: | ---: |
+| r1 | 0 | PROTO_OK (cold TE MISS warn) | 18001.4 | 29854.6 | 1.74 MB |
+| r2 | 0 | PROTO_OK | 15409.1 | (see log) | 1.68 MB |
+
+- latent_stats identical r1/r2: mean=0.03177 checksum=`0x4c6cb54664fa9586`
+- waffle same-config (generate.log): **PASS** mean|Δb16|=0.053 max=0.147 (WAFFLE_RC=0); frames still `INVALID_LOWENERGY`
+- log confirms `sampler: selected=lcm_renoise` and `fewstep_contract: id=dmad4 … sampler=lcm+re-noise`
+
+**Protocol verdict:** PASS. **Human visual still required** (protocol ≠ quality).
+
+## Still needs human eyes (updated)
+
+1. C001 INT8 / NVFP4 mp4s (`out/p0_visual_20261027_from238/`) — NVFP4 waffle FAIL + both INVALID_LOWENERGY
+2. C003 fuse vs ctrl hot mp4s (`out/c003_epi_fuse_20261027_scratchfix_from238/fuse_*/*_r2.mp4`) — finite but waffle FAIL / latent diverge
+3. C030 PDMD-4 mp4s (`out/c030_pdmd4_20261027_from238/`)
+4. C031 DMAD-4 mp4s (`out/c031_dmad4_20261027_from238/`)
 
 ## Not done / out of scope this pass
 
-- NVFP4 chain WIP untouched (local dirty on Mac; not synced)
-- No nsys/EVT
-- No origin push of WIP weights/code beyond this results doc + converter
-- Disk cleanup not performed
+- NVFP4 chain WIP untouched (local dirty on Mac; not synced / not committed)
+- No nsys/EVT; no disk wipe; ComfyUI / eval-matrix pause flags left alone
+- C062 te_cache HIT hard-gate GPU smoke and C040 VRAM ledger not run in this addendum window (optional leftover)
