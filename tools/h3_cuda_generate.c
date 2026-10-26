@@ -5243,23 +5243,23 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-        }
-        if (te_cache_dir && te_cache_dir[0] && !te_pc_hit &&
-            !have_vision_span) {
-            /* Structured MISS even when save skipped (no hex / save fail). */
-            if (!te_pc_hex[0])
-                printf("te_prompt_cache: MISS dir=%s key=none tokens=%zu "
-                       "layers=%u dim=%d reason=no_key\n",
-                       te_cache_dir, context, te_layers,
-                       (int)H3_TE_CACHE_TEXT_DIM);
-            {
-                const char *req = getenv("H3_TE_CACHE_REQUIRE_HIT");
-                if (req && req[0] == '1') {
-                    fprintf(stderr,
-                            "te_prompt_cache: REQUIRE_HIT failed "
-                            "(H3_TE_CACHE_REQUIRE_HIT=1; warm cache first)\n");
-                    h3_fail_tag("FAIL_ENV");
-                    goto cleanup;
+            if (te_cache_dir && te_cache_dir[0] && !te_pc_hit &&
+                !have_vision_span) {
+                /* Structured MISS even when save skipped (no hex / save fail). */
+                if (!te_pc_hex[0])
+                    printf("te_prompt_cache: MISS dir=%s key=none tokens=%zu "
+                           "layers=%u dim=%d reason=no_key\n",
+                           te_cache_dir, context, te_layers,
+                           (int)H3_TE_CACHE_TEXT_DIM);
+                {
+                    const char *req = getenv("H3_TE_CACHE_REQUIRE_HIT");
+                    if (req && req[0] == '1') {
+                        fprintf(stderr,
+                                "te_prompt_cache: REQUIRE_HIT failed "
+                                "(H3_TE_CACHE_REQUIRE_HIT=1; warm cache first)\n");
+                        h3_fail_tag("FAIL_ENV");
+                        goto cleanup;
+                    }
                 }
             }
         }
