@@ -57,7 +57,7 @@ PDMD-4 期望视频格点（serving `linspace` + shift 12）应与发布 `studen
 ## 4. 最小实现切片（后续代码，非本提交）
 
 1. **文档 / 日志（已有）**：继续保证打印 `sigma[]` 与 `adaln_dual_sigma`（已在 `h3_cuda_generate.c`）。  
-2. **离线检：** `scripts/p0_protocol_check_log.py` 可扩 `--expect-audio-shift 3` 等（少步用，不塞进 P0 视觉门默认）。  
+2. **离线检：** `tools/p0_protocol_check_log.py` 可扩 `--expect-audio-shift 3` 等（少步用，不塞进 P0 视觉门默认）。  
 3. **进程内：** 在 `h3_generate_preset_apply` 之后、建 sigma 之后增加 `h3_fewstep_contract_check(...)`；FAIL 走现有 `fprintf` + `return 1`。  
 4. **不要**在本轮改脏的 `h3_lora.c` 大 diff；合同检查放新文件 `h3_fewstep_contract.c` 更干净。
 

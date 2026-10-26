@@ -85,7 +85,7 @@
 
 有序 checklist（完成一项勾一项；并行臂标「∥」）：
 
-1. [x] **P0 纪律**：对照模板与命令块见 [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md)；离线日志检 `scripts/p0_protocol_check_log.py`。（2026-10-26）  
+1. [x] **P0 纪律**：对照模板与命令块见 [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md)；离线日志检 `tools/p0_protocol_check_log.py`。（2026-10-26）  
 2. [ ] **P0 视觉门**：graph 关、chain 关，NVFP4 vs 稳定 INT8，P2.2 协议重做目检 + 同配置 waffle；结论写入进展文档（通过 / 不可用 / 需改核），**作废** graph 修复前旧片子。  
 3. [ ] **P1 耗时**：仅追加 timing 文档缺项（同协议重复、标明冷启动）；不挡视觉结论。  
 4. [ ] **∥ T3 PDMD-4NFE**：原件 → h3repo → 864×480、4-step Euler、shift 12/3、cfg 1、INT8；记录 sigma 与 `refiner_pairs`；目检。  
@@ -118,4 +118,4 @@
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：收束 10-09 主线 + PDMD/DMAD + DeepInfer 取舍为 P0–P3 与近两周 checklist。 |
-| 2026-10-26 | 勾 §6.1；链到 P0 runbook + 合同自检设计 + `scripts/p0_protocol_check_log.py`。 |
+| 2026-10-26 | 勾 §6.1；链到 P0 runbook + 合同自检设计 + `tools/p0_protocol_check_log.py`。 |
