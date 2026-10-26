@@ -113,6 +113,9 @@
 9b. [x] **∥ P0 日志硬门扩展 + timing 行模板**：seed/skip-audio/live-te/chain；`timing_append_row.py`（不自动改账本）。
 9c. [x] **∥ fewstep-preset × 错误 audio shift 提前 FAIL**：`h3_fewstep_preset_audio_env_compatible`。
 9d. [x] **∥ student_grid golden fixture**：`tests/fixtures/fewstep_student_grid_golden.h` + `tools/dump_fewstep_student_grid`；`check_sigmas` 对照冻结表 (pdmd2/4、dmad4；pdmd2 audio 3|6)。
+9e. [x] **∥ `make fewstep_host_tests`**：打包 contract/sampler/dump/waffle host 测 + `waffle_same_config_gate.py --self-test`。
+9f. [x] **∥ 同配置 waffle 接缝门**：[`2026-10-26-waffle-same-config-gate.md`](2026-10-26-waffle-same-config-gate.md) + 离线脚本（禁跨配置比）。
+9g. [x] **∥ Metal/CUDA fewstep 边界 + TODO 表**：[`2026-10-26-fewstep-metal-boundary.md`](2026-10-26-fewstep-metal-boundary.md)。
 
 ---
 
@@ -148,3 +151,4 @@
 | 2026-10-26 | §2.1 记入 `8359dae`；离线协议检识别 fewstep_preset/bound/sampler；Metal CLI 明确不接 fewstep。 |
 
 | 2026-10-26 | 离线：TE checksum + P0 硬门扩展 + fewstep audio-env 冲突文案；未开 238 / 未碰链式 WIP。 |
+| 2026-10-26 | 离线：`make fewstep_host_tests` + waffle 同配置门 + Metal 边界 TODO；commit 后 push。 |

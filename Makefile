@@ -19,7 +19,8 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
 	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
-	h3_fewstep_contract_test h3_sampler_test dump_fewstep_student_grid
+	h3_fewstep_contract_test h3_sampler_test dump_fewstep_student_grid \
+	h3_waffle_test fewstep_host_tests
 
 all: h3 libh3.a
 
@@ -67,6 +68,20 @@ h3_sampler_test: tests/test_h3_sampler.c h3_sampler.c h3_sampler.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_sampler.c \
 		h3_sampler.c -lm
 
+# Host-only waffle b16 + INVALID gate (no Metal/CUDA).
+h3_waffle_test: tests/test_h3_waffle.c h3_waffle.c h3_waffle.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_waffle.c \
+		h3_waffle.c -lm
+
+# CI-ish: all offline fewstep / sampler / waffle host checks (no GPU).
+# See docs/research/2026-10-26-fewstep-metal-boundary.md
+fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
+		dump_fewstep_student_grid h3_waffle_test
+	./h3_fewstep_contract_test
+	./h3_sampler_test
+	./dump_fewstep_student_grid >/dev/null
+	./h3_waffle_test
+	python3 tools/waffle_same_config_gate.py --self-test
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
