@@ -202,7 +202,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 |---|---|---|---|---|---|---|---|---|---|
 | **C060** | 对照 | TE 路径漂移污染 md5/waffle | 强制标明 live vs `H3_TEXT_H_LOAD` | P0 runbook；timing | Q高 | — | **partial** | S9 | 报告硬字段 |
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **partial**（内联 landed；GPU 日志未验） | S9/S11 | GPU 跑强制过 `# H3_ENV_CONTRACT` |
-| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache；[productization](2026-10-27-te-cache-productization.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial**（opt-in 产品化 landed；默认仍 off；GPU HIT 未验） | S1/S9/S12 | GPU 验 HIT；默认策略保持 off |
+| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache；productization；gpu-unified addendum HIT smoke | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial**（opt-in landed；238 HIT+REQUIRE_HIT **PROTO_OK**；默认仍 off） | S1/S9/S12 | 默认策略保持 off；多 prompt 稳健后再议默认 |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
 | **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h` | VRAM/WC | 真机峰值 | **partial**（白名单+trace landed；真重叠仍门控） | S1 | 安全条件满足再重叠 H2D |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
@@ -355,7 +355,7 @@ C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
-C062,D,TE,te_cache productization,partial,S1/S9,P1
+C062,D,TE,te_cache productization,partial-hit-verified,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
 C073,D,eval,dump-once score-many conventions,partial,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed,fam4,P3
@@ -392,7 +392,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
-| 2026-10-27 | 238 GPU：C003 NaN 修 @ `1b37f28`（waffle 仍 FAIL，默认 OFF）；C001 PROTO；C030/C031 PROTO+waffle PASS；均待目检。见 [`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md)。 |
+| 2026-10-27 | 238 GPU：C003 NaN 修 @ `1b37f28`（waffle 仍 FAIL，默认 OFF）；C001 PROTO；C030/C031 PROTO+waffle PASS；C062 HIT 硬门 PROTO_OK；均待目检（C062 除外）。见 [`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md)。 |
 | 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
 | 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |
 | 2026-10-27 | 初版：合并 research 目录 + 管线扫掠；五轴 taxonomy；Closed Z*；机会 C001–C099（含占位/交叉）；2–8 周 backlog + 长地平线；CSV 摘要。不跑 GPU；不碰链式 WIP。 |

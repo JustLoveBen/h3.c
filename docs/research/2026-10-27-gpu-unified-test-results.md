@@ -131,6 +131,24 @@ Asset (original non-truncated, mirror C030 discipline):
 
 **Protocol verdict:** PASS. **Human visual still required** (protocol ≠ quality).
 
+
+
+### C062 — te_cache HIT hard-gate smoke (optional same batch)
+
+Reuse C031 warm cache `out/c031_dmad4_20261027/te_cache/` (key=`a150f97b2a58968e`).  
+`H3_TE_CACHE_REQUIRE_HIT=1` + `--te-cache` + protocol `--expect-te-cache-hit`. Same dmad4/INT8/480p/seed as C031.
+
+| metric | value |
+| --- | --- |
+| RUN_RC | 0 |
+| te_prompt_cache | **HIT** require_hit=1 |
+| PROTO (`--expect-te-cache-hit`) | **PROTO_OK** |
+| te_ms | 294.2 (C031 cold was ~3566) |
+| dit_ms | 15320.4 |
+| latent checksum | `0x4c6cb54664fa9586` (= C031) |
+
+Mac pull: `out/c062_te_cache_hit_20261027_from238/`. Default te_cache policy remains **off**.
+
 ## Still needs human eyes (updated)
 
 1. C001 INT8 / NVFP4 mp4s (`out/p0_visual_20261027_from238/`) — NVFP4 waffle FAIL + both INVALID_LOWENERGY
@@ -142,4 +160,4 @@ Asset (original non-truncated, mirror C030 discipline):
 
 - NVFP4 chain WIP untouched (local dirty on Mac; not synced / not committed)
 - No nsys/EVT; no disk wipe; ComfyUI / eval-matrix pause flags left alone
-- C062 te_cache HIT hard-gate GPU smoke and C040 VRAM ledger not run in this addendum window (optional leftover)
+- C040 VRAM ledger not run (disk ~99%; skipped). C062 HIT smoke **done** (see above).
