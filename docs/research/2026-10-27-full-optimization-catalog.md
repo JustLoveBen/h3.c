@@ -163,7 +163,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
 | **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2 | WC低 VRAM高 Q中 | C040 账本 | **idea** | S2 | 768p 备胎 |
 | **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；sm120 L2 | WC低（−0.1~−0.3） | 融合后；自写核 | **idea** | S5/S8 | 排 C003 后 |
-| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot/RoPE/mod/s_channel | sm120 M3 | WC低 bit同 | 授权小改 | **idea**（本片跳过） | S2 | 与 C003 可并行；需 profile |
+| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot Hadamard `H3_CUDA_L2_PIN` | sm120 M3；[`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) | WC低 bit同 | — | **landed(opt-in)**（默认 off；pin `d_hadamard`；238 smoke TBD this batch） | S2 | KPI 记 dit Δ；扩 pin RoPE/mod 另开 |
 | **C018** | DiT | QKV merge（3→1 宽 GEMM） | 历史 gap list | quality-preserving gap | WC中 | 验证是否已被现路径覆盖 | **idea/可能过时** | S5 | 先 diff 现状再决定；勿假设仍缺 |
 | **C019** | DiT | QKNorm+RoPE 融合 | gap list 附属 | quality-preserving | WC低 | — | **idea** | S5 | profile 后 |
 | **C020** | — | （占位）E2 即 C003 | — | — | — | — | — | — | 与 A1 同 |
@@ -172,7 +172,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；gpu-unified；[`or-visual`](2026-10-27-or-visual-review.md) | WC高（少步） Q高 | INT8；合同开 | **landed(visual-OR)**（238 PROTO+waffle PASS；OR-limited 观感可接受） | S7 | 可选人眼抛光；合同继续强制 |
+| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；gpu-unified；[`or-visual`](2026-10-27-or-visual-review.md)；[`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md) | WC高（少步） Q高 | INT8；合同开 | **landed(visual-OR)**（**preferred vs DMAD** @4NFE） | S7 | 可选人眼抛光；合同继续强制 |
 | **C031** | fewstep | DMAD 官方采样器需诚实验 | `lcm_renoise`+full_critic+12/2 | sampler；gpu-unified；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 Q高 | C030 纪律 | **landed(visual-OR)**（PROTO+waffle PASS；`lcm_renoise`；OR-limited 可接受，有 smear） | S7 | 可选人眼抛光 |
 | **C032** | fewstep | 错合同污染加速叙事 | contract FAIL / preset / σ 金表 | fewstep_contract；fixtures | Q高 R低 | — | **landed**（host） | S11 | GPU 跑时强制 `--fewstep-contract` |
 | **C033** | fewstep | PDMD-2 仅作合同回归 | 大 σ 跳固有发糊 | pdmd 文 r2–r4 | — | — | **landed/边界** | — | 不作 T3 通过尺 |
@@ -202,7 +202,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 |---|---|---|---|---|---|---|---|---|---|
 | **C060** | 对照 | TE 路径漂移污染 md5/waffle | 强制标明 live vs `H3_TEXT_H_LOAD` | P0 runbook；timing | Q高 | — | **partial** | S9 | 报告硬字段 |
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **landed**（内联；238 generate 日志有 `# H3_ENV_CONTRACT` + FORBID 行） | S9/S11 | 继续强制过检 |
-| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 | timing F1/F2；h3_te_cache；productization；gpu-unified addendum HIT smoke | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial**（opt-in landed；238 HIT+REQUIRE_HIT **PROTO_OK**；默认仍 off） | S1/S9/S12 | 默认策略保持 off；多 prompt 稳健后再议默认 |
+| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 + `H3_TE_CACHE_AUTO` | timing；productization；[`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial+**（HIT 硬门 PROTO_OK；`AUTO=1`+repeat≥2 → `out/te_cache_auto`；默认仍 off） | S1/S9/S12 | 默认保持 off；多 prompt 后再议 |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
 | **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h` | VRAM/WC | 真机峰值 | **partial**（白名单+trace landed；真重叠仍门控） | S1 | 安全条件满足再重叠 H2D |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
@@ -342,12 +342,12 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 id,axis,stage,title,status,s_link,near_term_pri
 C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,boundary-nvfp4-block,S4,P0-blocked
 C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
-C003,A,DiT-INT8,E2 epi-fuse A/B,partial-nan-fixed-waffle-fail,S5,P1
+C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-disarmed,S5,defer-redesign
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
 C015,A/C,DiT,act FP16 staging,idea,S2,P3
-C017,A,DiT,L2 pin hot tables,idea,S2,P3
+C017,A,DiT,L2 pin hot tables,landed-opt-in,S2,P3-done-dev
 C030,B,fewstep,PDMD-4NFE GPU accept,landed-visual-OR,S7,done-dev
 C031,B,fewstep,DMAD lcm_renoise GPU,landed-visual-OR,S7,done-dev
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
@@ -355,7 +355,7 @@ C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
-C062,D,TE,te_cache productization,partial-hit-verified,S1/S9,P1
+C062,D,TE,te_cache productization,partial-plus-auto,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
 C073,D,eval,dump-once score-many conventions,partial,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed,fam4,P3
@@ -392,6 +392,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | Beyond-DMAD + lossless 计划：C017 `H3_CUDA_L2_PIN` opt-in；C062 `H3_TE_CACHE_AUTO`；PDMD-4 优选于 DMAD；C003 维持 DISARMED。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |
 | 2026-10-27 | 238 smoke：C070 `FORBID=1` INT8/NVFP4 4-step RUN_RC=0；dit_format 澄清后 PROTO_OK；C061 合同行在 generate 日志验过。见 gpu-unified addendum。 |
 | 2026-10-27 | C070 `H3_FORBID_HOT_SYNC` + dit_format NVFP4 日志澄清（INT8 store+GEMM track）。 |
 | 2026-10-27 | OR 目检：C001 INT8 PASS / NVFP4 **BLOCK**；C030/C031 **landed(visual-OR)**；C003 维持 DISARMED。见 [`or-visual-review`](2026-10-27-or-visual-review.md)。 |

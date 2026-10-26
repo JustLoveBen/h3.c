@@ -45,6 +45,8 @@ static const h3_env_entry k_contract[] = {
     {"H3_DUMP_ONLY", "1=stop after step0 forward dump", "info"},
     {"H3_LIFECYCLE_TRACE", "1=print C064 lifecycle whitelist/transitions", "info"},
     {"H3_FORBID_HOT_SYNC", "1=abort on H3_SYNC_HOT device sync (C070)", "info"},
+    {"H3_CUDA_L2_PIN", "1=pin ConvRot Hadamard in persisting L2 (C017 bit-id)", "info"},
+    {"H3_TE_CACHE_AUTO", "1=auto te_cache under out/ when --repeat>=2 (C062)", "info"},
 };
 
 static const char *fmt_val(const char *val, char *buf, size_t buf_size) {

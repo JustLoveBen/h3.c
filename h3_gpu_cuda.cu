@@ -234,6 +234,93 @@ static cudaStream_t h3_cuda_op_st(const h3_cuda *cuda) {
     return (cuda && cuda->op_stream) ? cuda->op_stream : (cudaStream_t)0;
 }
 
+/* C017: opt-in L2 accessPolicyWindow pin for small hot tables (bit-identical).
+ * H3_CUDA_L2_PIN=1 enables; default off. Pins d_hadamard(+f16) on op_stream
+ * (or streams[0] / default). Does not change numerics. */
+static int h3_cuda_l2_pin_wanted(void) {
+    const char *e = getenv("H3_CUDA_L2_PIN");
+    return (e && e[0] == '1') ? 1 : 0;
+}
+
+static int g_h3_cuda_l2_limit_set = 0;
+
+static void h3_cuda_l2_pin_ensure_limit(h3_cuda *cuda) {
+    int l2 = 0;
+    size_t want;
+    cudaError_t st;
+    if (!cuda || g_h3_cuda_l2_limit_set) return;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize,
+                               cuda->device_index) != cudaSuccess ||
+        l2 <= 0) {
+        cudaGetLastError();
+        return;
+    }
+    /* Persist up to 1/4 of L2 (Hadamard 256^2 f32 = 256KiB; leave headroom). */
+    want = (size_t)l2 / 4;
+    if (want < 256 * 1024) want = 256 * 1024;
+    if (want > (size_t)l2 / 2) want = (size_t)l2 / 2;
+    st = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+    if (st != cudaSuccess) {
+        cudaGetLastError();
+        printf("l2_pin: setLimit failed st=%d l2=%d (continuing)\n", (int)st,
+               l2);
+        return;
+    }
+    g_h3_cuda_l2_limit_set = 1;
+    printf("l2_pin: persisting_l2_limit=%zu (device_l2=%d)\n", want, l2);
+    fflush(stdout);
+}
+
+static void h3_cuda_l2_pin_ptr(h3_cuda *cuda, void *ptr, size_t bytes,
+                               const char *tag) {
+    cudaStream_t st = NULL;
+    cudaStreamAttrValue attr;
+    cudaError_t ce;
+    if (!h3_cuda_l2_pin_wanted() || !cuda || !ptr || bytes == 0) return;
+    h3_cuda_l2_pin_ensure_limit(cuda);
+    if (cuda->op_stream)
+        st = cuda->op_stream;
+    else if (cuda->streams_ready && cuda->streams[0])
+        st = cuda->streams[0];
+    /* default stream (NULL) is valid for SetAttribute on recent CUDA */
+    memset(&attr, 0, sizeof(attr));
+    attr.accessPolicyWindow.base_ptr = ptr;
+    attr.accessPolicyWindow.num_bytes = bytes;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    ce = cudaStreamSetAttribute(st, cudaStreamAttributeAccessPolicyWindow,
+                                &attr);
+    if (ce != cudaSuccess) {
+        cudaGetLastError();
+        printf("l2_pin: FAIL tag=%s bytes=%zu st=%d\n", tag ? tag : "?", bytes,
+               (int)ce);
+        fflush(stdout);
+        return;
+    }
+    printf("l2_pin: OK tag=%s bytes=%zu stream=%s\n", tag ? tag : "?", bytes,
+           cuda->op_stream ? "op" : (st ? "streams0" : "default"));
+    fflush(stdout);
+}
+
+static void h3_cuda_l2_pin_hadamard(h3_cuda *cuda) {
+    size_t n;
+    if (!cuda || !h3_cuda_l2_pin_wanted()) return;
+    /* One AccessPolicyWindow per stream — prefer f32 H (larger / primary). */
+    if (cuda->d_hadamard && cuda->hadamard_gs > 0) {
+        n = (size_t)cuda->hadamard_gs * (size_t)cuda->hadamard_gs *
+            sizeof(float);
+        h3_cuda_l2_pin_ptr(cuda, cuda->d_hadamard, n, "hadamard_f32");
+        return;
+    }
+    if (cuda->d_hadamard_f16 && cuda->hadamard_f16_gs > 0) {
+        n = (size_t)cuda->hadamard_f16_gs * (size_t)cuda->hadamard_f16_gs * 2u;
+        h3_cuda_l2_pin_ptr(cuda, cuda->d_hadamard_f16, n, "hadamard_f16");
+    }
+}
+
+
+
 #if defined(H3_HAVE_CUDNN_FRONTEND)
 extern "C" int h3_cuda_sdpa_cudnn_f16_run(
     void *cudnn_handle, const void *d_q_half, const void *d_k_half,
@@ -4003,6 +4090,7 @@ static int h3_cuda_ensure_hadamard(h3_cuda *cuda, int gs, char *error,
         return 0;
     }
     cuda->hadamard_gs = gs;
+    h3_cuda_l2_pin_hadamard(cuda);
     return 1;
 }
 
@@ -4072,6 +4160,7 @@ static int h3_cuda_ensure_hadamard_f16(h3_cuda *cuda, int gs, char *error,
         return 0;
     }
     cuda->hadamard_f16_gs = gs;
+    h3_cuda_l2_pin_hadamard(cuda);
     return 1;
 }
 
@@ -7807,6 +7896,7 @@ int h3_cuda_set_op_stream(h3_cuda *cuda, void *stream, char *error,
     if (!h3_cuda_bind(cuda, error, error_size))
         return 0;
     cuda->op_stream = st;
+    h3_cuda_l2_pin_hadamard(cuda);
     if (cublasSetStream(cuda->cublas, st) != CUBLAS_STATUS_SUCCESS) {
         h3_cuda_set_error(error, error_size, "cublasSetStream failed");
         return 0;

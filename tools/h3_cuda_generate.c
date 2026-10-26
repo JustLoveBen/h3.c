@@ -2425,6 +2425,8 @@ int main(int argc, char **argv) {
                     "      或 H3_FEWSTEP_PRESET=。勿与 --preset turbo4/taomate 叠。\n"
                     "      pdmd4: 4-step Euler shift 12/3 cfg1；pdmd2: 2-step；\n"
                     "      dmad4: 4-step lcm_renoise shift 12/2 cfg1。\n"
+                    "      Rank (beyond-DMAD): prefer pdmd4 over dmad4 at same\n"
+                    "      NFE when quality matters (paper auto-score + OR).\n"
                     "      仍须 --lora 原件；显式 --steps/--cfg/--sampler 优先。\n"
                     "  --sampler velocity_euler|lcm_renoise\n"
                     "      或 H3_SAMPLER=。默认 velocity_euler。\n"
@@ -2439,6 +2441,9 @@ int main(int argc, char **argv) {
                     "                     N>1 drives DiT A2A after QKV+LoRA; SDPA uses\n"
                     "                     S_real (pad rows excluded). Gold default stays 1.\n"
                     "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
+                    "                     H3_TE_CACHE_AUTO=1 + --repeat>=2\n"
+                    "                     → auto dir out/te_cache_auto (C062).\n"
+                    "                     H3_CUDA_L2_PIN=1 → pin Hadamard L2 (C017).\n"
                     "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
                     "                     H3_TE_CACHE_REQUIRE_HIT=1 → MISS is FAIL_ENV.\n"
                     "                     Text-only; vision/multimodal never cached.\n"
@@ -2848,6 +2853,21 @@ int main(int argc, char **argv) {
         const char *e = getenv("H3_TE_PROMPT_CACHE");
         if (e && e[0])
             te_cache_dir = e;
+    }
+    /* C062: opt-in auto TE cache for in-process --repeat>=2 (bit-identical
+     * emb reuse). Still off unless H3_TE_CACHE_AUTO=1; never gold default. */
+    if ((!te_cache_dir || !te_cache_dir[0]) && clip_repeat >= 2) {
+        const char *ae = getenv("H3_TE_CACHE_AUTO");
+        if (ae && ae[0] == '1') {
+            static char te_cache_auto_buf[1100];
+            snprintf(te_cache_auto_buf, sizeof(te_cache_auto_buf),
+                     "%s/te_cache_auto", out_dir);
+            te_cache_dir = te_cache_auto_buf;
+            printf("te_prompt_cache: AUTO dir=%s (H3_TE_CACHE_AUTO=1 "
+                   "repeat=%d; emb reuse across clips)\n",
+                   te_cache_dir, clip_repeat);
+            fflush(stdout);
+        }
     }
     if (tae_path && tae_path[0] && !strcmp(vae_decode, "official"))
         vae_decode = "tae";
