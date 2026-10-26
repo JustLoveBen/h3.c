@@ -4983,28 +4983,15 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
      * `d_a` which can be only 8-byte aligned (odd seq + map pad). Gold
      * ConvRot already writes an aligned `d_rot` in this scratch. */
     int use_f16 = (gs > 0) && dit_act_f16_wanted();
-    if (epi && epi->requant_mode && use_f16) {
-        /* Fused requant replaces the whole act-prep region: the next GEMM
-         * consumes d_rq_* directly (dev_pre_q), so skip rot/i8 scratch.
-         * Buffer width is the NEXT act row width (mode1=n/2 swiglu out,
-         * mode2/3=n gate out) — NOT this GEMM's K (FC1 K=hidden << ffn). */
-        size_t rq_width =
-            (epi->requant_mode == 1) ? (n / 2u) : n;
-        size_t i8_bytes = m_pad * rq_width;
-        size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
-        size_t pre_off;
-        size_t gs_eff;
-        size_t ngroups;
-        if (epi->requant_mode == 3 && epi->requant_gs > 0)
-            gs_eff = (size_t)epi->requant_gs;
-        else
-            gs_eff = rq_width > 0 ? rq_width : 1;
-        ngroups = (gs_eff > 0 && rq_width % gs_eff == 0) ? (rq_width / gs_eff)
-                                                        : 1;
-        pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
-                  ~(size_t)15u;
-        tmp_bytes = pre_off + m_pad * sizeof(float);
-    } else if (use_f16) {
+    /* Producer act-prep scratch is always sized for THIS GEMM's K (ConvRot +
+     * input quant). Fused requant OUTPUT for the NEXT GEMM lives in the
+     * dedicated d_rq_scratch — never alias d_act_scratch. The previous
+     * layout skipped rot/i8 space when requant_mode was set, but act_f16
+     * prep still wrote d_xh/d_rot_h at base and overran into unallocated
+     * memory (FC1: need ~4*k bytes/row of f16 temps vs rq_width=ffn),
+     * and/or tiled GEMMs scrambled later input rows when requant reused
+     * d_xi8 with a wider stride. That produced latent NaNs on 238. */
+    if (use_f16) {
         size_t rot_bytes = m * k * sizeof(__half) * 2u;
         size_t i8_bytes = m_pad * k;
         size_t act_off = (rot_bytes + i8_bytes + 15u) & ~(size_t)15u;
@@ -5017,28 +5004,7 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
         return 0;
     {
         char *base = (char *)cuda->d_act_scratch;
-        if (epi && epi->requant_mode && use_f16) {
-            size_t rq_width =
-                (epi->requant_mode == 1) ? (n / 2u) : n;
-            size_t i8_bytes = m_pad * rq_width;
-            size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
-            size_t pre_off;
-            size_t gs_eff;
-            size_t ngroups;
-            if (epi->requant_mode == 3 && epi->requant_gs > 0)
-                gs_eff = (size_t)epi->requant_gs;
-            else
-                gs_eff = rq_width > 0 ? rq_width : 1;
-            ngroups = (gs_eff > 0 && rq_width % gs_eff == 0)
-                          ? (rq_width / gs_eff)
-                          : 1;
-            pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
-                      ~(size_t)15u;
-            d_rot = NULL;
-            d_xi8 = (int8_t *)base;
-            d_act = (float *)(base + act_off);
-            d_pre = (float *)(base + pre_off);
-        } else if (use_f16) {
+        if (use_f16) {
             size_t rot_bytes = m * k * sizeof(__half) * 2u;
             size_t i8_bytes = m_pad * k;
             size_t act_off = (rot_bytes + i8_bytes + 15u) & ~(size_t)15u;
@@ -5203,11 +5169,33 @@ quant_done:
         if (prep_ms) *prep_ms = (double)prep_elapsed;
     }
 
-    if (epi && epi->requant_mode && use_f16) {
+    if (epi && epi->requant_mode) {
+        /* Output requant into dedicated rq scratch (separate from input
+         * d_xi8 / d_act). Width is NEXT act row (mode1=n/2 swiglu, else n). */
         h3_cuda_dit_gemm_epi *epi_mut = (h3_cuda_dit_gemm_epi *)epi;
-        epi_mut->d_rq_x = d_xi8;
-        epi_mut->d_rq_act = d_act;
-        epi_mut->d_rq_pre = d_pre;
+        size_t rq_width = (epi->requant_mode == 1) ? (n / 2u) : n;
+        size_t i8_bytes = m_pad * rq_width;
+        size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
+        size_t gs_eff;
+        size_t ngroups;
+        size_t pre_off;
+        size_t rq_bytes;
+        char *rq_base;
+        if (epi->requant_mode == 3 && epi->requant_gs > 0)
+            gs_eff = (size_t)epi->requant_gs;
+        else
+            gs_eff = rq_width > 0 ? rq_width : 1;
+        ngroups = (gs_eff > 0 && rq_width % gs_eff == 0) ? (rq_width / gs_eff)
+                                                        : 1;
+        pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
+                  ~(size_t)15u;
+        rq_bytes = pre_off + m_pad * sizeof(float);
+        if (!h3_cuda_ensure_rq_scratch(cuda, rq_bytes, error, error_size))
+            goto cleanup;
+        rq_base = (char *)cuda->d_rq_scratch;
+        epi_mut->d_rq_x = (int8_t *)rq_base;
+        epi_mut->d_rq_act = (float *)(rq_base + act_off);
+        epi_mut->d_rq_pre = (float *)(rq_base + pre_off);
         epi_mut->requant_rows = m_pad;
     }
     if (!h3_cuda_gemm_i8_dequant_f32_dev_dx(

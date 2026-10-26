@@ -19,3 +19,12 @@
 ## Files
 - `h3_dit_w4a8.c`, `h3_gpu_cuda.cu`
 - `out/review-2026-10-07/e2-epi-fuse/DESIGN.md` §7
+
+## 2026-10-27 retest (still NaN) → scratch alias fix
+
+After disabling P1, 238 retest at `c11357b` still had fuse `latent_stats: mean=nan`, mux ~100KB, dit ~11% faster. Root cause #2:
+
+**Producer (`w_act_dev_epi`) requant layout skipped f16 ConvRot scratch** when `requant_mode!=0`, sizing only `m_pad*rq_width` and setting `d_xi8=base`. Act-f16 prep still wrote `d_xh`/`d_rot_h` at `base` (needs ~`4*K` bytes/row; FC1 K=5376 vs ffn rq_width=14336) → buffer overrun. Tiled GEMM could also scramble later input rows when requant reused `d_xi8` with wider stride.
+
+**Fix:** always size `d_act_scratch` for this GEMM's act prep (K-based). Put fused requant **output** in dedicated `d_rq_scratch` (already existed for `pre_q`). Default still OFF until re-verify.
+
