@@ -29,10 +29,10 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 
 | Rank | ID | Slice | Lossless? | Est. WC | Status after this batch | Notes |
 | ---: | --- | --- | --- | --- | --- | --- |
-| 1 | **C017** | `H3_CUDA_L2_PIN=1` Hadamard AccessPolicyWindow | bit-id | −0.05–0.15s/clip (sm120) | **landed(opt-in)** @ `95ab073` | 238 BIT_ID PASS; WC Δ noise; default off |
+| 1 | **C017** | `H3_CUDA_L2_PIN=1` Hadamard AccessPolicyWindow | bit-id | −0.05–0.15s/clip (sm120) | **landed(opt-in)** @ hot-KPI | fair hot Δ≈0; BIT_ID PASS; **keep opt-in** |
 | 2 | **C062** | `H3_TE_CACHE_AUTO=1` + `--repeat>=2` | bit-id emb | te 3.5s→~0.3s on HIT | **partial+** @ `95ab073` | AUTO MISS→reuse OK; still not gold default |
 | 3 | C070 | `H3_FORBID_HOT_SYNC` | n/a (hygiene) | low | landed(forbid) | KPI runs |
-| 4 | C068/C069 | RoPE host memo + VAE H2D skip | bit-id | low; GPU WC TBD | landed / partial | Host done; WC verify deferred if smoke tight |
+| 4 | C068/C069 | RoPE host memo + VAE H2D skip | bit-id | rope host −9ms; dit Δ noise | landed / partial+ | Fair hot memo on/off done; default-on |
 | 5 | C011 | VAE cast/prescale fuse | bit-id if fuse-only | mid | idea | Needs nsys; disk 99% |
 | 6 | C003 redesign | in-kernel ConvRot+requant | bit-id if algebra kept | mid (was fake +3–8%) | **DISARMED** | Skip-ConvRot unreachable; no default-on |
 | 7 | C018 QKV merge | maybe non-bit if INT8 order | mid | idea/maybe stale | Diff before build |
@@ -71,8 +71,58 @@ Work tree `h3_c_main_20261027` @ `95ab073`. Script `out/scripts/run_c017_l2_pin.
 - Disk ~99% / ~58G — blocks nsys / large multi-arm outs.
 - C001 NVFP4 visual BLOCK — no chain.
 - C003 true fuse needs new kernel design (not re-enable skip-ConvRot).
-- C068/C069 wall-clock still needs a quiet KPI pass with `H3_ROPE_PROFILE=1`.
+- C068/C069 fair hot done (Δ≈0 material); memo default-on.
 - Human aesthetic polish on PDMD/DMAD optional; OR already PASS fewstep.
+
+
+## 6. Fair hot KPI (238, Asia/Shanghai 2026-10-27)
+
+Protocol: dmad4 INT8, TE HIT, `H3_FORBID_HOT_SYNC=1`, `--repeat`≥3, **discard clip1**, mean dit of hot clips. Same seed/contract. Summaries: `out/c017_hot_kpi_20261027_from238/`, `out/c068_rope_memo_kpi_20261027_from238/`.
+
+### 6.1 C017 L2 pin (`H3_CUDA_L2_PIN`)
+
+| Arm | hot dit mean (n=3) | vals | BIT_ID |
+| --- | ---: | --- | --- |
+| base | **15076.4** | 15042.6 / 15080.1 / 15106.6 | — |
+| pin | **15138.8** | 15132.6 / 15141.0 / 15142.8 | per-clip seq **PASS** |
+
+- Δ = **+62.4 ms (+0.41%)** → pin not faster.
+- **CLAIM: NO_WALLCLOCK_WIN** — keep **opt-in**, do not default-on.
+- `l2_pin: OK hadamard_f32` on pin arm only.
+
+### 6.2 C068/C069 RoPE memo (`H3_ROPE_MEMO`, default on; `=0` disables)
+
+| Arm | hot dit mean (n=2) | dit_rope hot avg total_ms | memo hits (hot) | BIT_ID |
+| --- | ---: | ---: | --- | --- |
+| memo_on | **15079.3** | **2.2** | 4/0 | PASS |
+| memo_off | **15130.8** | **11.4** | 0/0 | PASS |
+
+- Host rope saves ~9 ms/clip; dit Δ **+51.5 ms (+0.34%)** within noise vs 15.1s dit.
+- **CLAIM: NO_MATERIAL_WALLCLOCK** — memo stays **default-on**; `H3_ROPE_MEMO=0` is KPI-only.
+- VAE rope hot: on ≈0.02 ms (HIT) vs off ≈0.5 ms — also ≪ VAE blocks.
+
+### 6.3 Round closure
+
+**本轮开发收口条件已满足** (auto ROI exhausted under constraints):
+
+| Done | Status |
+| --- | --- |
+| Beyond-DMAD rank + PDMD preferred | docs + CLI |
+| C017 L2 pin | landed opt-in; fair hot Δ≈0 |
+| C062 TE_CACHE_AUTO | partial+; default off |
+| C068/C069 fair hot | memo default-on; WC material no |
+| C003 EPI_FUSE | **DISARMED** (algebra) |
+| C070 forbid | landed |
+| C001 NVFP4 | visual BLOCK — no chain |
+
+**剩余需授权 / 非自动 ROI：**
+
+1. **清盘**（~99% / 58G）— 阻塞 nsys / 大矩阵 outs  
+2. **nsys** VAE cast/prescale（C011）— 需盘+授权  
+3. **NVFP4 mosaic 根因** — 非本轮 chain WIP  
+4. **真 EPI_FUSE** in-kernel ConvRot+requant — 大 redesign，仅当 waffle≈ctrl  
+5. 可选人眼抛光 PDMD/DMAD；扩 L2 pin 到 RoPE device buf（无证据不优先）
+
 
 ## 5. Related
 

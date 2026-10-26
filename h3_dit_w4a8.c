@@ -2014,15 +2014,28 @@ int h3_dit_w4a8_time_feat_from_table(const h3_dit_w4a8_block_aux *aux,
 /* Phase-A profile counters (RoPE table build). Zero-cost unless env var set. */
 static double g_dit_rope_profile_ms = 0.0;
 static unsigned long g_dit_rope_profile_calls = 0;
+static unsigned long g_dit_rope_memo_hits = 0;
+static unsigned long g_dit_rope_memo_misses = 0;
 
 void h3_dit_w4a8_rope_profile_get(double *ms, unsigned long *calls) {
     if (ms) *ms = g_dit_rope_profile_ms;
     if (calls) *calls = g_dit_rope_profile_calls;
 }
 
+void h3_dit_w4a8_rope_profile_get_ex(double *ms, unsigned long *calls,
+                                     unsigned long *hits,
+                                     unsigned long *misses) {
+    if (ms) *ms = g_dit_rope_profile_ms;
+    if (calls) *calls = g_dit_rope_profile_calls;
+    if (hits) *hits = g_dit_rope_memo_hits;
+    if (misses) *misses = g_dit_rope_memo_misses;
+}
+
 void h3_dit_w4a8_rope_profile_reset(void) {
     g_dit_rope_profile_ms = 0.0;
     g_dit_rope_profile_calls = 0;
+    g_dit_rope_memo_hits = 0;
+    g_dit_rope_memo_misses = 0;
 }
 
 /* Per-shape memo cache for DiT RoPE tables.
@@ -2137,6 +2150,9 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
     size_t row, axis, f;
     clock_t t0 = 0, t1 = 0;
     const int profile = env_flag_is_one("H3_ROPE_PROFILE");
+    /* Explicit H3_ROPE_MEMO=0 disables host memo (fair KPI). Default on. */
+    const char *memo_env = getenv("H3_ROPE_MEMO");
+    const int use_memo = !(memo_env && memo_env[0] == '0' && memo_env[1] == '\0');
     uint64_t pos_hash = 0;
     dit_rope_memo_entry *memo = NULL;
     if (profile) t0 = clock();
@@ -2150,11 +2166,21 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
         return 0;
     }
     pos_hash = dit_rope_hash_all(pos_t, pos_h, pos_w, seq, spatial_scale);
-    memo = dit_rope_memo_find(seq, spatial_scale, pos_hash);
-    if (!memo) {
-        memo = dit_rope_memo_alloc(seq, spatial_scale, pos_hash, error,
-                                   error_size);
-        if (!memo) return 0;
+    if (use_memo)
+        memo = dit_rope_memo_find(seq, spatial_scale, pos_hash);
+    if (use_memo && memo) {
+        g_dit_rope_memo_hits++;
+        memcpy(cos_out, memo->cos_table,
+               seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+        memcpy(sin_out, memo->sin_table,
+               seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
+    } else {
+        if (use_memo) {
+            g_dit_rope_memo_misses++;
+            memo = dit_rope_memo_alloc(seq, spatial_scale, pos_hash, error,
+                                       error_size);
+            if (!memo) return 0;
+        }
         for (row = 0; row < seq; row++) {
             float axes[3] = {pos_t[row], pos_h[row] * spatial_scale,
                              pos_w[row] * spatial_scale};
@@ -2164,16 +2190,17 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
                         row * H3_DIT_W4A8_ROPE_HALF +
                         axis * H3_DIT_W4A8_ROPE_FREQS + f;
                     float angle = axes[axis] * inv_freq[f];
-                    memo->cos_table[index] = cosf(angle);
-                    memo->sin_table[index] = sinf(angle);
+                    float c = cosf(angle), s = sinf(angle);
+                    cos_out[index] = c;
+                    sin_out[index] = s;
+                    if (memo) {
+                        memo->cos_table[index] = c;
+                        memo->sin_table[index] = s;
+                    }
                 }
             }
         }
     }
-    memcpy(cos_out, memo->cos_table,
-           seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
-    memcpy(sin_out, memo->sin_table,
-           seq * H3_DIT_W4A8_ROPE_HALF * sizeof(float));
     if (profile) {
         t1 = clock();
         g_dit_rope_profile_ms += elapsed_ms(t0, t1);

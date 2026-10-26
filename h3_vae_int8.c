@@ -235,15 +235,28 @@ int h3_vae_int8_load_latent_stats(const h3_vae_int8_store *store,
 /* Phase-A profile counters (RoPE table build). Zero-cost unless env var set. */
 static double g_vae_rope_profile_ms = 0.0;
 static unsigned long g_vae_rope_profile_calls = 0;
+static unsigned long g_vae_rope_memo_hits = 0;
+static unsigned long g_vae_rope_memo_misses = 0;
 
 void h3_vae_int8_rope_profile_get(double *ms, unsigned long *calls) {
     if (ms) *ms = g_vae_rope_profile_ms;
     if (calls) *calls = g_vae_rope_profile_calls;
 }
 
+void h3_vae_int8_rope_profile_get_ex(double *ms, unsigned long *calls,
+                                     unsigned long *hits,
+                                     unsigned long *misses) {
+    if (ms) *ms = g_vae_rope_profile_ms;
+    if (calls) *calls = g_vae_rope_profile_calls;
+    if (hits) *hits = g_vae_rope_memo_hits;
+    if (misses) *misses = g_vae_rope_memo_misses;
+}
+
 void h3_vae_int8_rope_profile_reset(void) {
     g_vae_rope_profile_ms = 0.0;
     g_vae_rope_profile_calls = 0;
+    g_vae_rope_memo_hits = 0;
+    g_vae_rope_memo_misses = 0;
 }
 
 /* Per-shape memo cache for VAE RoPE tables.
@@ -341,6 +354,9 @@ int h3_vae_int8_prepare_rope_ex(int t_len, int latent_h, int latent_w,
     int denom_h, denom_w;
     clock_t t0 = 0, t1 = 0;
     const int profile = env_flag_is_one("H3_ROPE_PROFILE");
+    const char *memo_env = getenv("H3_ROPE_MEMO");
+    const int use_memo =
+        !(memo_env && memo_env[0] == '0' && memo_env[1] == '\0');
     vae_rope_memo_entry *memo = NULL;
     if (profile) t0 = clock();
     if (!cos || !sin || t_len < 1 || latent_h < 1 || latent_w < 1 ||
@@ -355,13 +371,21 @@ int h3_vae_int8_prepare_rope_ex(int t_len, int latent_h, int latent_w,
         fail(error, error_size, "prepare_rope tile exceeds canvas");
         return 0;
     }
-    memo = vae_rope_memo_find(t_len, latent_h, latent_w, origin_h, origin_w,
-                              full_h, full_w, seq);
-    if (!memo) {
-        memo = vae_rope_memo_alloc(t_len, latent_h, latent_w, origin_h,
-                                   origin_w, full_h, full_w, seq, error,
-                                   error_size);
-        if (!memo) return 0;
+    if (use_memo)
+        memo = vae_rope_memo_find(t_len, latent_h, latent_w, origin_h, origin_w,
+                                  full_h, full_w, seq);
+    if (use_memo && memo) {
+        g_vae_rope_memo_hits++;
+        memcpy(cos, memo->cos_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+        memcpy(sin, memo->sin_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
+    } else {
+        if (use_memo) {
+            g_vae_rope_memo_misses++;
+            memo = vae_rope_memo_alloc(t_len, latent_h, latent_w, origin_h,
+                                       origin_w, full_h, full_w, seq, error,
+                                       error_size);
+            if (!memo) return 0;
+        }
         for (t = 0; t < t_len; t++)
             for (h = 0; h < latent_h; h++)
                 for (w = 0; w < latent_w; w++, row++) {
@@ -383,19 +407,27 @@ int h3_vae_int8_prepare_rope_ex(int t_len, int latent_h, int latent_w,
                                           axes[axis] * inverse;
                             size_t offset = row * H3_VAE_INT8_ROPE_HALF +
                                             (size_t)axis * 8 + frequency;
-                            memo->cos_table[offset] = cosf(angle);
-                            memo->sin_table[offset] = sinf(angle);
+                            float c = cosf(angle), s = sinf(angle);
+                            cos[offset] = c;
+                            sin[offset] = s;
+                            if (memo) {
+                                memo->cos_table[offset] = c;
+                                memo->sin_table[offset] = s;
+                            }
                         }
                 }
         for (; row < seq; row++) {
             for (index = 0; index < H3_VAE_INT8_ROPE_HALF; index++) {
-                memo->cos_table[row * H3_VAE_INT8_ROPE_HALF + index] = 1.0f;
-                memo->sin_table[row * H3_VAE_INT8_ROPE_HALF + index] = 0.0f;
+                size_t off = row * H3_VAE_INT8_ROPE_HALF + index;
+                cos[off] = 1.0f;
+                sin[off] = 0.0f;
+                if (memo) {
+                    memo->cos_table[off] = 1.0f;
+                    memo->sin_table[off] = 0.0f;
+                }
             }
         }
     }
-    memcpy(cos, memo->cos_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
-    memcpy(sin, memo->sin_table, seq * H3_VAE_INT8_ROPE_HALF * sizeof(float));
     if (profile) {
         t1 = clock();
         g_vae_rope_profile_ms +=

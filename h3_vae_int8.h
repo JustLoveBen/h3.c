@@ -163,6 +163,9 @@ int h3_vae_int8_prepare_rope_ex(int t_len, int latent_h, int latent_w,
 /* Phase-A profile: cumulative RoPE table build time and call count.
  * Enable with H3_ROPE_PROFILE=1. */
 void h3_vae_int8_rope_profile_get(double *ms, unsigned long *calls);
+void h3_vae_int8_rope_profile_get_ex(double *ms, unsigned long *calls,
+                                     unsigned long *hits,
+                                     unsigned long *misses);
 void h3_vae_int8_rope_profile_reset(void);
 
 /* Minimal decode: post_quant → embed → N INT8 blocks → norm_out → proj_out

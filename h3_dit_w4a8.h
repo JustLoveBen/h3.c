@@ -363,6 +363,9 @@ int h3_dit_w4a8_rope_tables_f32(const float *inv_freq, size_t seq,
 /* Phase-A profile: cumulative RoPE table build time and call count.
  * Enable with H3_ROPE_PROFILE=1. */
 void h3_dit_w4a8_rope_profile_get(double *ms, unsigned long *calls);
+void h3_dit_w4a8_rope_profile_get_ex(double *ms, unsigned long *calls,
+                                     unsigned long *hits,
+                                     unsigned long *misses);
 void h3_dit_w4a8_rope_profile_reset(void);
 
 /* Metal h3_layout video/audio RoPE coords (float). video_seq=T*(H/2)*(W/2).

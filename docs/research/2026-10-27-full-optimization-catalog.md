@@ -163,7 +163,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
 | **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2 | WC低 VRAM高 Q中 | C040 账本 | **idea** | S2 | 768p 备胎 |
 | **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；sm120 L2 | WC低（−0.1~−0.3） | 融合后；自写核 | **idea** | S5/S8 | 排 C003 后 |
-| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot Hadamard `H3_CUDA_L2_PIN` | sm120 M3；[`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) | WC低 bit同 | — | **landed(opt-in)** @ `95ab073`（默认 off；238 BIT_ID PASS；dit Δ 冷热混淆、无 KPI 收益） | S2 | 保持 opt-in；扩 pin RoPE/mod 另开 |
+| **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot Hadamard `H3_CUDA_L2_PIN` | sm120 M3；[`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) | WC低 bit同 | — | **landed(opt-in)**（fair hot Δ≈+62ms；BIT_ID PASS；**无墙钟收益**） | S2 | 保持 opt-in；勿 default-on |
 | **C018** | DiT | QKV merge（3→1 宽 GEMM） | 历史 gap list | quality-preserving gap | WC中 | 验证是否已被现路径覆盖 | **idea/可能过时** | S5 | 先 diff 现状再决定；勿假设仍缺 |
 | **C019** | DiT | QKNorm+RoPE 融合 | gap list 附属 | quality-preserving | WC低 | — | **idea** | S5 | profile 后 |
 | **C020** | — | （占位）E2 即 C003 | — | — | — | — | — | — | 与 A1 同 |
@@ -208,8 +208,8 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
 | **C066** | 测量 | P0 日志协议 | `p0_protocol_check_log.py` | tools | Q | — | **landed** | S9 | GPU 日志强制过检 |
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
-| **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **landed**（host memo；GPU WC 未验） | 族4 | GPU 测墙钟 |
-| **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | host memo + same-key H2D skip | 同上；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低 bit同 | — | **partial**（host memo+H2D skip；clip 级常驻 defer） | 族4 | GPU 测；全 geometry 常驻 defer |
+| **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **landed**（host memo default-on；fair hot rope −9ms、dit Δ noise） | 族4 | `H3_ROPE_MEMO=0` KPI only |
+| **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | host memo + same-key H2D skip | 同上；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低 bit同 | — | **partial+**（host memo+H2D；hot HIT ~0.02ms；常驻 defer） | 族4 | 全 geometry 常驻仍 defer |
 | **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；`h3_cuda_hot_sync.h`；gpu-unified C070 smoke | WC低 | 默认 off | **landed(forbid)**（opt-in；238 smoke `FORBID=1` RUN_RC=0 @ `e40d649`） | S8 | KPI 跑可开 |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
@@ -347,7 +347,7 @@ C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
 C015,A/C,DiT,act FP16 staging,idea,S2,P3
-C017,A,DiT,L2 pin hot tables,landed-opt-in,S2,P3-done-dev
+C017,A,DiT,L2 pin hot tables,landed-opt-in-no-wc,S2,closed-opt-in
 C030,B,fewstep,PDMD-4NFE GPU accept,landed-visual-OR,S7,done-dev
 C031,B,fewstep,DMAD lcm_renoise GPU,landed-visual-OR,S7,done-dev
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
@@ -358,8 +358,8 @@ C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial-plus-auto,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
 C073,D,eval,dump-once score-many conventions,partial,S12,P2
-C068,D,DiT,INT8 RoPE table memo,landed,fam4,P3
-C069,D,VAE,VAE RoPE memo+H2D skip,partial,fam4,P3
+C068,D,DiT,INT8 RoPE table memo,landed-default-on,fam4,closed-kpi
+C069,D,VAE,VAE RoPE memo+H2D skip,partial-plus,fam4,closed-kpi
 C080,E,SKU,VDN/SelfLift/TAE tiering,idea,S7,observe
 C081,E,serving,continuous batching,defer,S3,defer
 ```
@@ -392,6 +392,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | Fair hot KPI：C017 Δ≈0 keep opt-in；C068 memo default-on（rope −9ms）；`H3_ROPE_MEMO=0` KPI；**本轮自动 ROI 收口**。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) §6。 |
 | 2026-10-27 | C017 238 BIT_ID PASS @ `95ab073`；C062 AUTO MISS→reuse；WC Δ 不宣称。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |
 | 2026-10-27 | Beyond-DMAD + lossless 计划：C017 `H3_CUDA_L2_PIN` opt-in；C062 `H3_TE_CACHE_AUTO`；PDMD-4 优选于 DMAD；C003 维持 DISARMED。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |
 | 2026-10-27 | 238 smoke：C070 `FORBID=1` INT8/NVFP4 4-step RUN_RC=0；dit_format 澄清后 PROTO_OK；C061 合同行在 generate 日志验过。见 gpu-unified addendum。 |

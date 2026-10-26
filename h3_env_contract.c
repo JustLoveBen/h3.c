@@ -46,6 +46,8 @@ static const h3_env_entry k_contract[] = {
     {"H3_LIFECYCLE_TRACE", "1=print C064 lifecycle whitelist/transitions", "info"},
     {"H3_FORBID_HOT_SYNC", "1=abort on H3_SYNC_HOT device sync (C070)", "info"},
     {"H3_CUDA_L2_PIN", "1=pin ConvRot Hadamard in persisting L2 (C017 bit-id)", "info"},
+    {"H3_ROPE_PROFILE", "1=log dit/vae rope ms + memo hit/miss", "info"},
+    {"H3_ROPE_MEMO", "0=disable RoPE host memo (fair KPI); default on", "info"},
     {"H3_TE_CACHE_AUTO", "1=auto te_cache under out/ when --repeat>=2 (C062)", "info"},
 };
 

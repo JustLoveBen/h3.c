@@ -2443,7 +2443,7 @@ int main(int argc, char **argv) {
                     "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
                     "                     H3_TE_CACHE_AUTO=1 + --repeat>=2\n"
                     "                     → auto dir out/te_cache_auto (C062).\n"
-                    "                     H3_CUDA_L2_PIN=1 → pin Hadamard L2 (C017).\n"
+                    "                     H3_CUDA_L2_PIN=1 → pin Hadamard L2 (C017).\n                     H3_ROPE_PROFILE=1 → dit/vae rope ms + memo hits.\n                     H3_ROPE_MEMO=0 → disable RoPE host memo (KPI).\n"
                     "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
                     "                     H3_TE_CACHE_REQUIRE_HIT=1 → MISS is FAIL_ENV.\n"
                     "                     Text-only; vision/multimodal never cached.\n"
@@ -6923,11 +6923,14 @@ clip_denoise:
            dit_skips, t_dit);
     {
         double rope_ms = 0.0;
-        unsigned long rope_calls = 0;
-        h3_dit_w4a8_rope_profile_get(&rope_ms, &rope_calls);
+        unsigned long rope_calls = 0, hits = 0, misses = 0;
+        h3_dit_w4a8_rope_profile_get_ex(&rope_ms, &rope_calls, &hits, &misses);
         if (rope_calls > 0)
-            printf("dit_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f\n",
-                   rope_calls, rope_ms, rope_ms / (double)rope_calls);
+            printf("dit_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f "
+                   "memo_hits=%lu memo_misses=%lu\n",
+                   rope_calls, rope_ms, rope_ms / (double)rope_calls, hits,
+                   misses);
+        h3_dit_w4a8_rope_profile_reset();
     }
     if (host_stage_th_ok) {
         pthread_join(host_stage_th, NULL);
@@ -7325,11 +7328,15 @@ clip_denoise:
         h3_vram_ledger_point("after_vae");
         {
             double rope_ms = 0.0;
-            unsigned long rope_calls = 0;
-            h3_vae_int8_rope_profile_get(&rope_ms, &rope_calls);
+            unsigned long rope_calls = 0, hits = 0, misses = 0;
+            h3_vae_int8_rope_profile_get_ex(&rope_ms, &rope_calls, &hits,
+                                           &misses);
             if (rope_calls > 0)
-                printf("vae_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f\n",
-                       rope_calls, rope_ms, rope_ms / (double)rope_calls);
+                printf("vae_rope_profile: calls=%lu total_ms=%.1f avg_ms=%.2f "
+                       "memo_hits=%lu memo_misses=%lu\n",
+                       rope_calls, rope_ms, rope_ms / (double)rope_calls, hits,
+                       misses);
+            h3_vae_int8_rope_profile_reset();
         }
 
         /* R20: overlap=decode already kicked before video VAE. ppm|0 here. */
