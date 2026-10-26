@@ -121,6 +121,12 @@ int main(void) {
            "dmad4 no lcm fail");
     expect(strstr(err, "lcm") != NULL, "dmad4 lcm msg");
 
+    /* dmad4 + lcm_renoise + shift 12/2 → PASS */
+    in.has_lcm_renoise = 1;
+    in.audio_shift = 2.0f;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "dmad4 lcm ok");
+
     /* dmad4 wrong audio */
     in.has_lcm_renoise = 1;
     in.audio_shift = 3.0f;

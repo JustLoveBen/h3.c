@@ -33,6 +33,7 @@
 #include "h3_latent_upscaler.h"
 #include "h3_lora.h"
 #include "h3_fewstep_contract.h"
+#include "h3_sampler.h"
 #include "h3_kpi_guard.h"
 #include "h3_sdpa.h"
 #include "h3_selflift.h"
@@ -959,6 +960,31 @@ static int dump_meta_txt(const char *dir, size_t context, int latent_t,
 #ifndef H3_CUDA_VIDEO_SIGMA_SHIFT
 #define H3_CUDA_VIDEO_SIGMA_SHIFT 12.0f
 #endif
+
+/* Dispatch one denoise step: velocity_euler or lcm_renoise (DMAD). */
+static int apply_sampler_step_f32(h3_sampler_id sid, float *sample,
+                                  const float *velocity, size_t count,
+                                  float sigma, float sigma_next,
+                                  float *renoise_scratch, uint64_t noise_seed,
+                                  char *error, size_t error_size) {
+    if (sid == H3_SAMPLER_LCM_RENOISE) {
+        const float *noise = NULL;
+        if (sigma_next > 1e-8f) {
+            if (!renoise_scratch) {
+                snprintf(error, error_size, "lcm_renoise: no scratch");
+                return 0;
+            }
+            fill_normal_f32(noise_seed, renoise_scratch, count);
+            noise = renoise_scratch;
+        }
+        return h3_sampler_lcm_renoise_step_f32(sample, velocity, count, sigma,
+                                               sigma_next, noise, error,
+                                               error_size);
+    }
+    return h3_dit_w4a8_euler_step_f32(sample, velocity, count, sigma,
+                                      sigma_next, error, error_size);
+}
+
 #ifndef H3_CUDA_AUDIO_SIGMA_SHIFT
 #define H3_CUDA_AUDIO_SIGMA_SHIFT 3.0f
 #endif
@@ -1767,6 +1793,11 @@ int main(int argc, char **argv) {
     const char *lora_path = NULL;
     const char *fewstep_contract_cli = NULL;
     h3_fewstep_id fewstep_id = H3_FEWSTEP_NONE;
+    const char *sampler_cli = NULL;
+    int sampler_explicit = 0;
+    h3_sampler_id sampler_id = H3_SAMPLER_VELOCITY_EULER;
+    float *renoise_scratch = NULL;
+    size_t renoise_scratch_n = 0;
     const char *vae_decode = "official";
     const char *tae_path = NULL;
     const char *te_cache_dir = NULL;
@@ -2218,7 +2249,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[iarg], "--fewstep-contract") &&
                    iarg + 1 < argc)
             fewstep_contract_cli = argv[++iarg];
-        else if (!strcmp(argv[iarg], "--ulysses") && iarg + 1 < argc)
+        else if (!strcmp(argv[iarg], "--sampler") && iarg + 1 < argc) {
+            sampler_cli = argv[++iarg];
+            sampler_explicit = 1;
+        } else if (!strcmp(argv[iarg], "--ulysses") && iarg + 1 < argc)
             ulysses = (int)strtol(argv[++iarg], NULL, 10);
         else if (!strcmp(argv[iarg], "--vae-decode") && iarg + 1 < argc)
             vae_decode = argv[++iarg];
@@ -2342,8 +2376,13 @@ int main(int argc, char **argv) {
                     "  --fewstep-contract pdmd4|pdmd2|dmad4\n"
                     "      少步合同自检（或 H3_FEWSTEP_CONTRACT）。未设=off。\n"
                     "      错 steps/shift/preset(turbo4)/sampler 硬 FAIL。\n"
-                    "      dmad4 在本仓实现 lcm+re-noise 前一律拒绝。\n"
-                    "      H3_FEWSTEP_STRICT=1；H3_FEWSTEP_ALLOW_NVFP4=1。\n"
+                    "      dmad4 需要 --sampler lcm_renoise（未显式设时自动选）。\n"
+                    "      H3_AUDIO_SIGMA_SHIFT=2；H3_FEWSTEP_STRICT=1；\n"
+                    "      H3_FEWSTEP_ALLOW_NVFP4=1。\n"
+                    "  --sampler velocity_euler|lcm_renoise\n"
+                    "      或 H3_SAMPLER=。默认 velocity_euler。\n"
+                    "      lcm_renoise = Comfy lcm+simple（DMAD 合同）。\n"
+                    "      别名：euler / lcm / lcm+simple。\n"
                     "  --latent-upscaler FILE    lift / taomate-lift 必填；LBH 3D\n"
                     "  --lift-transition K       低分 DiT 次数（8step 默认 6；4step=3；\n"
                     "                            taomate 3-step 默认 2；Z0_ONLY 时=3）\n"
@@ -2530,6 +2569,17 @@ int main(int argc, char **argv) {
                     preset_name && preset_name[0] ? preset_name : "fast");
     }
     {
+        char serr[256];
+        serr[0] = '\0';
+        if (!sampler_explicit && getenv("H3_SAMPLER") && getenv("H3_SAMPLER")[0])
+            sampler_explicit = 1;
+        sampler_id = h3_sampler_resolve(sampler_cli, serr, sizeof(serr));
+        if (serr[0]) {
+            fprintf(stderr, "h3: %s\n", serr);
+            return 1;
+        }
+    }
+    {
         char ferr[384];
         h3_fewstep_contract_in fin;
         int want_nvfp4;
@@ -2538,6 +2588,16 @@ int main(int argc, char **argv) {
                                                  sizeof(ferr));
         if (ferr[0]) {
             fprintf(stderr, "h3: %s\n", ferr);
+            return 1;
+        }
+        /* dmad4 defaults to lcm_renoise when user did not pick a sampler. */
+        if (fewstep_id == H3_FEWSTEP_DMAD4 && !sampler_explicit)
+            sampler_id = H3_SAMPLER_LCM_RENOISE;
+        if (sampler_id == H3_SAMPLER_LCM_RENOISE &&
+            (lift_on || preset_out.id == H3_PRESET_TAOMATE)) {
+            fprintf(stderr,
+                    "h3: --sampler lcm_renoise 与 lift/taomate 不兼容"
+                    "（主路径 fewstep 专用）\n");
             return 1;
         }
         memset(&fin, 0, sizeof(fin));
@@ -2555,12 +2615,18 @@ int main(int argc, char **argv) {
                      (getenv("H3_DIT_NVFP4") &&
                       getenv("H3_DIT_NVFP4")[0] == '1');
         fin.nvfp4_enabled = want_nvfp4 ? 1 : 0;
-        fin.sampler_is_velocity_euler = 1;
-        fin.has_lcm_renoise = 0; /* not implemented yet */
+        fin.sampler_is_velocity_euler =
+            (sampler_id == H3_SAMPLER_VELOCITY_EULER) ? 1 : 0;
+        fin.has_lcm_renoise =
+            (sampler_id == H3_SAMPLER_LCM_RENOISE) ? 1 : 0;
         if (!h3_fewstep_contract_check_early(&fin, ferr, sizeof(ferr))) {
             fprintf(stderr, "h3: %s\n", ferr);
             return 1;
         }
+        printf("sampler: selected=%s (explicit=%d fewstep=%s)\n",
+               h3_sampler_name(sampler_id), sampler_explicit,
+               h3_fewstep_contract_name(fewstep_id));
+        fflush(stdout);
     }
     if (ulysses < 1)
         ulysses = 1;
@@ -6495,23 +6561,46 @@ clip_denoise:
             continue;
         }
         {
+            size_t need = n_lat;
+            if (pack_audio && n_audio > need)
+                need = n_audio;
+            if (sampler_id == H3_SAMPLER_LCM_RENOISE && need > renoise_scratch_n) {
+                float *nb = (float *)realloc(renoise_scratch,
+                                             need * sizeof(float));
+                if (!nb) {
+                    fprintf(stderr, "OOM lcm renoise scratch\n");
+                    goto cleanup;
+                }
+                renoise_scratch = nb;
+                renoise_scratch_n = need;
+            }
             if (pack_audio) {
-                if (!h3_dit_w4a8_euler_step_f32(
-                        audio_rows, audio_vel, n_audio, audio_sigmas[step],
-                        audio_sigmas[step + 1], error, sizeof(error))) {
-                    fprintf(stderr, "audio euler: %s\n", error);
+                if (!apply_sampler_step_f32(
+                        sampler_id, audio_rows, audio_vel, n_audio,
+                        audio_sigmas[step], audio_sigmas[step + 1],
+                        renoise_scratch,
+                        seed + 0xA11DULL + 0x10000ULL + (uint64_t)step, error,
+                        sizeof(error))) {
+                    fprintf(stderr, "audio sampler: %s\n", error);
                     goto cleanup;
                 }
             }
-            if (!h3_dit_w4a8_euler_step_f32(
-                    latent, velocity, n_lat, sigmas[step],
-                    sigmas[step + 1], error, sizeof(error))) {
-                fprintf(stderr, "euler: %s\n", error);
+            if (!apply_sampler_step_f32(
+                    sampler_id, latent, velocity, n_lat, sigmas[step],
+                    sigmas[step + 1], renoise_scratch,
+                    seed + 0x1C40000ULL + (uint64_t)step, error,
+                    sizeof(error))) {
+                fprintf(stderr, "sampler: %s\n", error);
                 goto cleanup;
             }
-            if (step == 0)
-                printf("sampler: velocity_euler (X += (σ-σ')·v; "
-                       "Comfy CONST-equivalent)\n");
+            if (step == 0) {
+                if (sampler_id == H3_SAMPLER_LCM_RENOISE)
+                    printf("sampler: lcm_renoise "
+                           "(x0=X+σ·v; X=(1-σ')·x0+σ'·ε; Comfy lcm+simple)\n");
+                else
+                    printf("sampler: velocity_euler (X += (σ-σ')·v; "
+                           "Comfy CONST-equivalent)\n");
+            }
         }
         if (getenv("H3_STEP_LATENT_STATS")) {
             double ss = 0.0, ss2 = 0.0;
@@ -7364,6 +7453,7 @@ cleanup:
     if (vae_th_ok) pthread_join(vae_th, NULL);
     if (host_stage_th_ok) pthread_join(host_stage_th, NULL);
     if (prefetch_done) cudaEventDestroy((cudaEvent_t)prefetch_done);
+    free(renoise_scratch);
     free(latent);
     free(velocity);
     free(sigmas);

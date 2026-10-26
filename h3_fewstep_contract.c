@@ -234,9 +234,9 @@ int h3_fewstep_contract_check_early(const h3_fewstep_contract_in *in, char *err,
         }
         if (!in->has_lcm_renoise) {
             snprintf(buf, sizeof(buf),
-                     "fewstep_contract=dmad4 拒绝：本仓尚无 lcm+re-noise 采样器 "
-                     "（当前 velocity_euler 不算 DMAD 合同通过；见 "
-                     "docs/research/2026-10-09-pdmd-dmad-loras.md）");
+                     "fewstep_contract=dmad4 拒绝：需要 --sampler lcm_renoise "
+                     "（或 H3_SAMPLER=lcm_renoise；velocity_euler 不算 DMAD；"
+                     "见 docs/research/2026-10-26-dmad-lcm-renoise-sampler.md）");
             return fail_msg(err, err_size, buf);
         }
         break;

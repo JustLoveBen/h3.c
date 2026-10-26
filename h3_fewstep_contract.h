@@ -35,9 +35,10 @@ typedef struct h3_fewstep_contract_in {
     float audio_shift;
     float cfg_scale;
     int nvfp4_enabled;
-    /* 1 while only velocity_euler exists; DMAD needs lcm+re-noise. */
+    /* sampler_is_velocity_euler=1 for default Euler path. */
     int sampler_is_velocity_euler;
-    int has_lcm_renoise; /* 0 until implemented */
+    /* has_lcm_renoise=1 when --sampler lcm_renoise (DMAD). */
+    int has_lcm_renoise;
     /* After schedule build: length steps+1. NULL → skip vector check. */
     const float *video_sigmas;
     const float *audio_sigmas;

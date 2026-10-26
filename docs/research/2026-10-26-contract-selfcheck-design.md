@@ -23,7 +23,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | PDMD-4NFE | 4 | Euler | 12 | 3 | 1 | `pdmd_4NFE_lora` 未截断 / 非 Kijai 降秩优先 | 可跑；**正式验收未做** |
 | PDMD-2NFE | 2 | Euler | 12 | 3（观感档曾用 6） | 1 | `pdmd_2NFE_lora` | r2/r3/r4 复验过合同；T3 仍未验证 |
-| DMAD-4 | 4 | **lcm + re-noise** | 12 | **2** | 1 | `full_critic` 非降秩 | **采样器未实现**；Euler 跑 DMAD **不算**通过 |
+| DMAD-4 | 4 | **lcm + re-noise** | 12 | **2** | 1 | `full_critic` 非降秩 | 采样器已落地 `--sampler lcm_renoise`；**GPU 视觉验收未做**；Euler 仍不算通过 |
 
 已有生成日志锚点（勿删）：
 
@@ -44,7 +44,7 @@
 | `pdmd4` 但 `--preset turbo4`（或其它改写 sigma 的 preset） | FAIL | 退出；提示用无 preset + serving shift |
 | `pdmd4` 且 audio shift ≠ 3（`H3_AUDIO_SIGMA_SHIFT`） | FAIL | 默认 3；显式错误值拒绝 |
 | `pdmd2` 且 audio shift ∉ {3,6} | WARN→可配置 FAIL | 论文指标 3；观感档 6 需 META 标明 |
-| `dmad4` 且 sampler 仍是 `velocity_euler`（无 re-noise） | FAIL | 在实现 lcm 前直接拒绝「合同通过」路径 |
+| `dmad4` 且 sampler 仍是 `velocity_euler`（无 re-noise） | FAIL | 须 `--sampler lcm_renoise`（未显式设时 dmad4 自动选） |
 | `dmad4` 且 audio shift ≠ 2 | FAIL | |
 | 任意合同 + `H3_DIT_NVFP4=1` 且未 `H3_FEWSTEP_ALLOW_NVFP4=1` | FAIL | 禁止首轮交叉验收 |
 | LoRA 路径名含 `rank_39` / `rank_57` / `kijai` 且合同为正式金线 | WARN | 降秩不挡跑，标 `non_gold` |
@@ -76,3 +76,4 @@ P0 视觉门 **不启用** 少步合同（无 LoRA、8-step、shift 12/默认 au
 | --- | --- |
 | 2026-10-26 | 初稿：矩阵 + 实现切片；代码未落地。 |
 | 2026-10-26 | Phase-1：`h3_fewstep_contract.c` + `--fewstep-contract` / `H3_FEWSTEP_CONTRACT`；early+sigma 金向量；dmad4 无 lcm 硬拒；Mac `make h3_fewstep_contract_test`。 |
+| 2026-10-26 | Phase-2：`h3_sampler` + `--sampler lcm_renoise`；dmad4 自动选 lcm；见 `2026-10-26-dmad-lcm-renoise-sampler.md`。GPU 验收看该文。 |

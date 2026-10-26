@@ -19,7 +19,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
 	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
-	h3_fewstep_contract_test
+	h3_fewstep_contract_test h3_sampler_test
 
 all: h3 libh3.a
 
@@ -55,6 +55,11 @@ h3_fewstep_contract_test: tests/test_h3_fewstep_contract.c h3_fewstep_contract.c
 		h3_fewstep_contract.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_fewstep_contract.c \
 		h3_fewstep_contract.c -lm
+
+# Host-only LCM+re-noise sampler math (no Metal/CUDA).
+h3_sampler_test: tests/test_h3_sampler.c h3_sampler.c h3_sampler.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_sampler.c \
+		h3_sampler.c -lm
 
 
 h3: $(CLI_OBJ) $(LIB_OBJ)

@@ -665,6 +665,7 @@ add_executable(h3_cuda_generate
   h3_taomate.c
   h3_lora.c
   h3_fewstep_contract.c
+  h3_sampler.c
   h3_tae.c
   h3_tae_cuda.cu
   h3_te_cache.c
@@ -964,6 +965,13 @@ target_include_directories(h3_fewstep_contract_test PRIVATE ${CMAKE_CURRENT_SOUR
 target_compile_features(h3_fewstep_contract_test PRIVATE c_std_11)
 target_link_libraries(h3_fewstep_contract_test PRIVATE m)
 
+add_executable(h3_sampler_test
+  tests/test_h3_sampler.c
+  h3_sampler.c)
+target_include_directories(h3_sampler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(h3_sampler_test PRIVATE c_std_11)
+target_link_libraries(h3_sampler_test PRIVATE m)
+
 add_executable(h3_ulysses_test
   tests/test_h3_ulysses.c
   h3_ulysses.c)
@@ -1154,6 +1162,7 @@ install(TARGETS h3_cuda_info h3_sol_attn_bench h3_w4a8_probe h3_dit_int8_probe h
                 h3_selflift_test
                 h3_lora_test
                 h3_fewstep_contract_test
+                h3_sampler_test
                 h3_ulysses_test
                 h3_te_cache_test
                 h3_tae_test
