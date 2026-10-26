@@ -3368,8 +3368,10 @@ static int block_phase_out_mlp(
      * pairs. Requires the R31 epilogue path AND the act_f16 act path. */
     int epi_fuse = gemm_epi && h3_dit_epi_fuse_wanted() &&
                    h3_dit_w4a8_act_f16() && ctx->convrot_gs > 0;
-    int8_t *fc1_pre_x = NULL;
-    float *fc1_pre_act = NULL;
+    /* P1 (OUT→FC1 via requant of d_x) is intentionally NOT wired: AdaLN sits
+     * between OUT gate and FC1, so FC1's act source is post-AdaLN d_a, not d_x.
+     * Feeding quantized d_x skipped AdaLN and produced latent NaNs on 238.
+     * Only P2 (FC1 swiglu → FC2) is fused. */
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
     h3_cuda_dit_gemm_epi epi;
@@ -3431,24 +3433,11 @@ static int block_phase_out_mlp(
         epi.d_row_map = d_map;
         epi.slots = slots;
         epi.gate_slot = 2;
-        if (epi_fuse) {
-            /* FC1's act source is d_x (the gate residual). Quantize it in
-             * this launch; FC1 then runs pre_q (no ConvRot/act-prep). */
-            epi.requant_mode = 2;
-            epi.requant_gs = (int)hidden;
-            if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                    ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_b, &prep,
-                    &gemm, backend, sizeof(backend), &epi, detail,
-                    sizeof(detail))) {
-                snprintf(error, error_size, "out: %s", detail);
-                return 0;
-            }
-            fc1_pre_x = epi.d_rq_x;
-            fc1_pre_act = epi.d_rq_act;
-        } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                       ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_b,
-                       &prep, &gemm, backend, sizeof(backend), &epi, detail,
-                       sizeof(detail))) {
+        /* P1 disabled: do not requant d_x here (AdaLN → d_a is FC1's act). */
+        if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                ctx->cuda, w_out, d_attn, ctx->convrot_gs, seq, d_b, &prep,
+                &gemm, backend, sizeof(backend), &epi, detail,
+                sizeof(detail))) {
             snprintf(error, error_size, "out: %s", detail);
             return 0;
         }
@@ -3600,48 +3589,36 @@ out_done:
             epi.swiglu = 1;
             epi.d_lora = d_fc1;
             epi.lora_ready = ready;
-            if (epi_fuse) epi.requant_mode = 1;
-            if (epi_fuse && fc1_pre_x && fc1_pre_act) {
-                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
-                        ctx->cuda, w_fc1, fc1_pre_x, fc1_pre_act, seq, d_act,
-                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
-                        sizeof(detail))) {
-                    snprintf(error, error_size, "fc1: %s", detail);
-                    return 0;
-                }
-                fc2_pre_x = epi.d_rq_x;
-                fc2_pre_act = epi.d_rq_act;
-            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                           ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act,
-                           &prep, &gemm, backend, sizeof(backend), &epi,
-                           detail, sizeof(detail))) {
+            if (epi_fuse) {
+                epi.requant_mode = 1;
+                epi.requant_gs = (int)ffn; /* P2: swiglu out width */
+            }
+            if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                    ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act, &prep,
+                    &gemm, backend, sizeof(backend), &epi, detail,
+                    sizeof(detail))) {
                 snprintf(error, error_size, "fc1: %s", detail);
                 return 0;
-            } else if (epi_fuse) {
+            }
+            if (epi_fuse) {
                 fc2_pre_x = epi.d_rq_x;
                 fc2_pre_act = epi.d_rq_act;
             }
         } else if (gemm_epi) {
             memset(&epi, 0, sizeof(epi));
             epi.swiglu = 1;
-            if (epi_fuse) epi.requant_mode = 1;
-            if (epi_fuse && fc1_pre_x && fc1_pre_act) {
-                if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
-                        ctx->cuda, w_fc1, fc1_pre_x, fc1_pre_act, seq, d_act,
-                        &prep, &gemm, backend, sizeof(backend), &epi, detail,
-                        sizeof(detail))) {
-                    snprintf(error, error_size, "fc1: %s", detail);
-                    return 0;
-                }
-                fc2_pre_x = epi.d_rq_x;
-                fc2_pre_act = epi.d_rq_act;
-            } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                           ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act,
-                           &prep, &gemm, backend, sizeof(backend), &epi,
-                           detail, sizeof(detail))) {
+            if (epi_fuse) {
+                epi.requant_mode = 1;
+                epi.requant_gs = (int)ffn;
+            }
+            if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                    ctx->cuda, w_fc1, d_a, ctx->convrot_gs, seq, d_act, &prep,
+                    &gemm, backend, sizeof(backend), &epi, detail,
+                    sizeof(detail))) {
                 snprintf(error, error_size, "fc1: %s", detail);
                 return 0;
-            } else if (epi_fuse) {
+            }
+            if (epi_fuse) {
                 fc2_pre_x = epi.d_rq_x;
                 fc2_pre_act = epi.d_rq_act;
             }

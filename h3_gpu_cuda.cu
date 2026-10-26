@@ -4985,8 +4985,12 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
     int use_f16 = (gs > 0) && dit_act_f16_wanted();
     if (epi && epi->requant_mode && use_f16) {
         /* Fused requant replaces the whole act-prep region: the next GEMM
-         * consumes d_rq_* directly (dev_pre_q), so skip rot/i8 scratch. */
-        size_t i8_bytes = m_pad * k;
+         * consumes d_rq_* directly (dev_pre_q), so skip rot/i8 scratch.
+         * Buffer width is the NEXT act row width (mode1=n/2 swiglu out,
+         * mode2/3=n gate out) — NOT this GEMM's K (FC1 K=hidden << ffn). */
+        size_t rq_width =
+            (epi->requant_mode == 1) ? (n / 2u) : n;
+        size_t i8_bytes = m_pad * rq_width;
         size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
         size_t pre_off;
         size_t gs_eff;
@@ -4994,8 +4998,9 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
         if (epi->requant_mode == 3 && epi->requant_gs > 0)
             gs_eff = (size_t)epi->requant_gs;
         else
-            gs_eff = k > 0 ? k : 1;
-        ngroups = (gs_eff > 0 && k % gs_eff == 0) ? (k / gs_eff) : 1;
+            gs_eff = rq_width > 0 ? rq_width : 1;
+        ngroups = (gs_eff > 0 && rq_width % gs_eff == 0) ? (rq_width / gs_eff)
+                                                        : 1;
         pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
                   ~(size_t)15u;
         tmp_bytes = pre_off + m_pad * sizeof(float);
@@ -5013,7 +5018,9 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
     {
         char *base = (char *)cuda->d_act_scratch;
         if (epi && epi->requant_mode && use_f16) {
-            size_t i8_bytes = m_pad * k;
+            size_t rq_width =
+                (epi->requant_mode == 1) ? (n / 2u) : n;
+            size_t i8_bytes = m_pad * rq_width;
             size_t act_off = (i8_bytes + 15u) & ~(size_t)15u;
             size_t pre_off;
             size_t gs_eff;
@@ -5021,8 +5028,10 @@ int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
             if (epi->requant_mode == 3 && epi->requant_gs > 0)
                 gs_eff = (size_t)epi->requant_gs;
             else
-                gs_eff = k > 0 ? k : 1;
-            ngroups = (gs_eff > 0 && k % gs_eff == 0) ? (k / gs_eff) : 1;
+                gs_eff = rq_width > 0 ? rq_width : 1;
+            ngroups = (gs_eff > 0 && rq_width % gs_eff == 0)
+                          ? (rq_width / gs_eff)
+                          : 1;
             pre_off = (act_off + m_pad * ngroups * sizeof(float) + 15u) &
                       ~(size_t)15u;
             d_rot = NULL;
@@ -5257,8 +5266,10 @@ int h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
     m_pad = (m + 15u) & ~(size_t)15u;
     /* E2 fused requant: _dev_dx writes this GEMM's act source quantized into
      * epi->d_rq_* for the NEXT GEMM, but unlike _w_act_dev_epi there is no
-     * act-prep stage here to own that scratch. Allocate it in act_scratch and
-     * fill d_rq_* / requant_rows before dispatch, mirroring 4655-4667/4863. */
+     * act-prep stage here to own that scratch. Allocate d_rq_scratch and
+     * fill d_rq_* / requant_rows before dispatch. Surface pointers back to
+     * the *caller's* epi (not the stack-local copy used for dx). */
+    h3_cuda_dit_gemm_epi *epi_caller = NULL;
     if (epi && epi->requant_mode) {
         size_t out_width = (epi->requant_mode == 1) ? (n / 2u) : n;
         size_t i8_bytes = m_pad * out_width;
@@ -5270,6 +5281,7 @@ int h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
         base = (char *)cuda->d_rq_scratch;
         d_rq_x = (int8_t *)base;
         d_rq_act = (float *)(base + act_off);
+        epi_caller = (h3_cuda_dit_gemm_epi *)epi;
         epi_local = *epi;
         epi_local.d_rq_x = d_rq_x;
         epi_local.d_rq_act = d_rq_act;
@@ -5284,11 +5296,10 @@ int h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
             error, error_size, epi))
         return 0;
     /* Surface the freshly-quantized act to the caller for the next GEMM. */
-    if (epi && epi->requant_mode) {
-        h3_cuda_dit_gemm_epi *epi_mut = (h3_cuda_dit_gemm_epi *)epi;
-        epi_mut->d_rq_x = d_rq_x;
-        epi_mut->d_rq_act = d_rq_act;
-        epi_mut->requant_rows = m_pad;
+    if (epi_caller) {
+        epi_caller->d_rq_x = d_rq_x;
+        epi_caller->d_rq_act = d_rq_act;
+        epi_caller->requant_rows = m_pad;
     }
     if (h3_sol_profile_on()) {
         double g = 0.0;
