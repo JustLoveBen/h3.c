@@ -29,8 +29,8 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 
 | Rank | ID | Slice | Lossless? | Est. WC | Status after this batch | Notes |
 | ---: | --- | --- | --- | --- | --- | --- |
-| 1 | **C017** | `H3_CUDA_L2_PIN=1` Hadamard AccessPolicyWindow | bit-id | −0.05–0.15s/clip (sm120) | **landed(opt-in)** | Default off; log `l2_pin:` |
-| 2 | **C062** | `H3_TE_CACHE_AUTO=1` + `--repeat>=2` | bit-id emb | te 3.5s→~0.3s on HIT | **partial+** | Still not gold default |
+| 1 | **C017** | `H3_CUDA_L2_PIN=1` Hadamard AccessPolicyWindow | bit-id | −0.05–0.15s/clip (sm120) | **landed(opt-in)** @ `95ab073` | 238 BIT_ID PASS; WC Δ noise; default off |
+| 2 | **C062** | `H3_TE_CACHE_AUTO=1` + `--repeat>=2` | bit-id emb | te 3.5s→~0.3s on HIT | **partial+** @ `95ab073` | AUTO MISS→reuse OK; still not gold default |
 | 3 | C070 | `H3_FORBID_HOT_SYNC` | n/a (hygiene) | low | landed(forbid) | KPI runs |
 | 4 | C068/C069 | RoPE host memo + VAE H2D skip | bit-id | low; GPU WC TBD | landed / partial | Host done; WC verify deferred if smoke tight |
 | 5 | C011 | VAE cast/prescale fuse | bit-id if fuse-only | mid | idea | Needs nsys; disk 99% |
@@ -50,13 +50,21 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 | Beyond-DMAD CLI hint | `tools/h3_cuda_generate.c` help | text only |
 | Pareto report | `tools/fewstep_pareto_report.py` | host |
 
-## 3. Smoke plan (238)
+## 3. Smoke results (238, Asia/Shanghai ~2026-10-27 06:35+)
 
-1. rsync Mac → `/mnt/nvme1n1/workspace/h3_c_main_20261027` (no `--delete`, no models).
-2. Rebuild `build-cuda-sm120/h3_cuda_generate`.
-3. Short INT8 4-step smoke ×2: ctrl vs `H3_CUDA_L2_PIN=1`; expect `l2_pin: OK`, PROTO, same latent checksum if seed/contract fixed (bit-id), dit_ms delta noted (may be noise).
-4. Optional: `H3_TE_CACHE_AUTO=1 --repeat 2` → clip2 HIT.
-5. No NVFP4 chain WIP; no disk wipe.
+Work tree `h3_c_main_20261027` @ `95ab073`. Script `out/scripts/run_c017_l2_pin.sh`. Summaries on Mac: `out/c017_l2_pin_20261027_from238/`.
+
+| Arm | te_ms | dit_ms | total_ms | latent checksum | Notes |
+| --- | ---: | ---: | ---: | --- | --- |
+| ctrl (TE HIT, cold proc) | 5725.9 | 22000.3 | 37624.0 | `0x4c6cb54664fa9586` | PROTO_OK; no `l2_pin` |
+| pin `H3_CUDA_L2_PIN=1` | 4501.6 | 15381.1 | 28947.3 | `0x4c6cb54664fa9586` | PROTO_OK; `l2_pin: OK hadamard_f32` |
+| AUTO clip1 MISS | 3516.0 | 15379.0 | 26684.1 | same | `H3_TE_CACHE_AUTO=1 --repeat 2` wrote `…/te_cache_auto` |
+| AUTO clip2 hot | **0.0** | 15090.5 | 20103.7 | (hot seed path) | emb reuse; RUN_RC=0 |
+
+- **Bit-identical:** ctrl≡pin latent checksum → **BIT_ID=PASS**.
+- **WC claim:** ctrl dit 22s is **cold-first** confound; pin/AUTO ~15.4s matches prior DMAD hot — **no measurable L2 win** in this single A/B (est. −0.05–0.15s within noise). Keep opt-in.
+- **C062 AUTO:** MISS→write then clip2 te=0 (in-process reuse). Still default-off.
+- Disk still ~99% / 58G; no wipe; no NVFP4 chain.
 
 ## 4. Next blockers
 
