@@ -4419,12 +4419,10 @@ __global__ void h3_cuda_quantize_act_per_row_kernel(const float *x, int8_t *y,
  * SF written in the layout measured empirically on sm_120 cuBLASLt
  * (bench/nvfp4_phase0/diag_sf_layout.cu single-marker probe, both row and
  * column decoded): logical (row r, micro-block c) maps to
- *   tile = (r/128)*ncb_rd + c/4   (ncb_rd = ceil(ncb/32)*32, ncb=(K/16)/4)
+ *   tile = (r/128)*ncb + c/4   (ncb=(K/16)/4 = K/64; NO ceil32 row-stride)
  *   off  = tile*512 + 16*((r%128)%32) + 4*((r%128)/32) + (c%4)
- * i.e. within a 512B tile, rows are 32x4-swizzled (NOT linear r*4+cc).
- * Empirically confirmed by bench/nvfp4_phase0/diag_sf_layout.cu on sm_120
- * (phys=3->row0, phys=7->row32, phys=19->row1, ...). Linear (r%128)*4+cc
- * mismatches 504/512 slots and was the C001 NVFP4 mosaic root cause.
+ * In-tile 32x4 from diag_sf_layout; row-block stride=ncb from e2e A/B
+ * (stride_ncb_rd left M>=128 at Y=0). Linear in-tile still wrong.
  * One block per row; 256
  * threads; 16-wide __shfl_xor butterfly amax; lane0 writes SF, even lane packs.
  * ----------------------------------------------------------------------- */
@@ -4511,20 +4509,15 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
     const size_t nc = k >> 4;            /* k/16 */
     const int mb_per_block = 16;         /* 256 threads / 16 lanes */
     const size_t ncb = nc >> 2;          /* k/64; assumes k%64==0 */
-    /* cuBLASLt reads ceil(ncb/32)*32 tile-columns per 128-row tile (2048 K
-     * elems each); cover that padded extent so no stale byte is ever read. */
-    const size_t ncb_rd = (ncb + 31u) & ~(size_t)31u;
-    const size_t tile_base = (row >> 7) * ncb_rd;
+    /* Row-block stride = ncb (e2e-proven). Buffer size = rb*ncb*512. */
+    const size_t tile_base = (row >> 7) * ncb;
     const size_t r128 = row & 127u;      /* row % 128 : major axis in tile */
     if (row >= m) {
-        /* Padding row: zero-fill ALL 4 byte-columns of its SF across the full
-         * padded extent. (tid&3 collapses to 0 for lane_in_mb==0 threads, so
-         * loop cc explicitly — writing only cc=0 leaves cc=1..3 as garbage,
-         * which cuBLASLt reads as UE4M3 NaN.) */
+        /* Padding row: zero-fill ALL 4 byte-columns across ncb tile-cols. */
         if (lane_in_mb == 0) {
             size_t tc;
             int cc;
-            for (tc = (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
+            for (tc = (size_t)(tid >> 4); tc < ncb; tc += 16u)
                 for (cc = 0; cc < 4; cc++)
                     sf[(tile_base + tc) * 512 + h3_nvfp4_sf_off_in_tile(r128, (size_t)cc)] = 0;
         }
@@ -4570,15 +4563,7 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
                 }
             }
         }
-        /* K-tail zero-fill: tile-cols [ncb, ncb_rd) for K%2048!=0. Same cc
-         * collapse caveat as the padding path — write all 4 byte-columns. */
-        if (ncb_rd > ncb && lane_in_mb == 0) {
-            size_t tc;
-            int cc;
-            for (tc = ncb + (size_t)(tid >> 4); tc < ncb_rd; tc += 16u)
-                for (cc = 0; cc < 4; cc++)
-                    sf[(tile_base + tc) * 512 + h3_nvfp4_sf_off_in_tile(r128, (size_t)cc)] = 0;
-        }
+        /* No K-tail pad in SF buffer: size is rb*ncb*512 (stride=ncb). */
     }
 }
 
@@ -5666,12 +5651,13 @@ fail_slot:
  * ----------------------------------------------------------------------- */
 
 size_t h3_cuda_nvfp4_sf_bytes(size_t rows, size_t k) {
-    size_t ncb, ncb_rd, rb;
+    size_t ncb, rb;
     if (rows == 0 || k == 0 || (k & 63u) != 0) return 0;
     ncb = (k / 16u) / 4u;                 /* == k/64; K%64==0 */
-    ncb_rd = (ncb + 31u) & ~(size_t)31u;  /* cuBLASLt 2048-K tile-col pad */
+    /* Row-block stride is ncb (NOT ceil32). e2e on sm_120: stride_ncb_rd
+     * zeroes M>=128; stride_ncb + 32x4 in-tile → rel_l2≈0.0017 PASS. */
     rb = (rows + 127u) / 128u;
-    return rb * ncb_rd * 512u;
+    return rb * ncb * 512u;
 }
 
 int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
@@ -5695,9 +5681,7 @@ int h3_cuda_nvfp4_weight_create(h3_cuda *cuda, const uint8_t *packed_host,
         return 0;
     }
     w_bytes = n * (k / 2);
-    /* MUST match tools/quant_dit_nvfp4.py + act quant (ncb_rd pad). The old
-     * unpadded rb*ncb*512 truncated K=5376 sidecars (ncb=84→need 96) and
-     * scrambled SF for every linear with rb>1 → full-frame mosaic. */
+    /* MUST match tools/quant_dit_nvfp4.py + act quant (rb*ncb*512). */
     sf_bytes = h3_cuda_nvfp4_sf_bytes(n, k);
     if (sf_bytes == 0) {
         h3_cuda_set_error(error, error_size,
@@ -6125,7 +6109,7 @@ static int h3_cuda_fp4_gemm_run(h3_cuda *cuda,
      * back only rows [0,m). SF is sized to cuBLASLt's padded K-extent
      * (ceil(ncb/32)*32 tile-cols = 2048-K-elem granularity). */
     m_pad = (m + 127u) & ~(size_t)127u;
-    sf_ncb = (((k / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    sf_ncb = ((k / 16u) / 4u);  /* ncb = K/64; row-block stride, no ceil32 */
     sf_rb = m_pad / 128u;
     x_bytes = m_pad * (k / 2u);
     sf_bytes = sf_rb * sf_ncb * 512u;
@@ -6238,7 +6222,7 @@ size_t h3_cuda_nvfp4_gemm_scratch_bytes(size_t m, size_t n, size_t k) {
     /* Must match h3_cuda_fp4_gemm_run's padded-M scratch layout. SF uses the
      * padded K-extent (ceil(ncb/32)*32 tile-cols = 2048-K-elem granularity). */
     size_t m_pad = (m + 127u) & ~(size_t)127u;
-    size_t sf_ncb = (((k / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    size_t sf_ncb = ((k / 16u) / 4u);  /* ncb = K/64; row-block stride, no ceil32 */
     size_t sf_rb = m_pad / 128u;
     return m_pad * (k / 2u) + sf_rb * sf_ncb * 512u + m_pad * n * 2u;
 }
@@ -6341,8 +6325,8 @@ int h3_cuda_gemm_fp4_bs_dev(h3_cuda *cuda, const uint8_t *d_w_fp4,
 size_t h3_cuda_nvfp4_chain_scratch_bytes(size_t m, size_t kdim, size_t ffn) {
     size_t m_pad = (m + 127u) & ~(size_t)127u;
     size_t sf_rb = m_pad / 128u;
-    size_t sf_ncb_kdim = (((kdim / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
-    size_t sf_ncb_ffn = (((ffn / 16u) + 3u) / 4u + 31u) & ~(size_t)31u;
+    size_t sf_ncb_kdim = ((kdim / 16u) / 4u);  /* ncb; chain WIP sizing only */
+    size_t sf_ncb_ffn = ((ffn / 16u) / 4u);
     return m_pad * (kdim / 2u)             /* fc1_in_fp4 */
            + sf_rb * sf_ncb_kdim * 512u    /* fc1_in_sf */
            + m_pad * (2u * ffn) * 4u       /* fc1_acc FP32 */

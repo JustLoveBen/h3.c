@@ -1,63 +1,38 @@
-/* Host-only: NVFP4 SF byte formula must pad ncb to 32 tile-cols.
- * K=5376 → ncb=84 → ncb_rd=96 (the mosaic bug: create used unpadded 84).
- *   clang -std=c11 -O2 -I. -o /tmp/t_sf tests/test_h3_nvfp4_sf_bytes.c \\
- *         -DTEST_H3_NVFP4_SF_BYTES_STANDALONE
+/* Host-only lock for h3_cuda_nvfp4_sf_bytes: rb * ncb * 512 (stride=ncb).
+ * K=5376 → ncb=84 (NOT ncb_rd=96). e2e on sm_120 rejected ceil32 row-stride.
  */
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#ifndef TEST_H3_NVFP4_SF_BYTES_STANDALONE
-#include "h3_gpu_cuda.h"
-#else
-/* Mirror of h3_cuda_nvfp4_sf_bytes for host-only proof without CUDA link. */
 static size_t h3_cuda_nvfp4_sf_bytes(size_t rows, size_t k) {
-    size_t ncb, ncb_rd, rb;
+    size_t ncb, rb;
     if (rows == 0 || k == 0 || (k & 63u) != 0) return 0;
     ncb = (k / 16u) / 4u;
-    ncb_rd = (ncb + 31u) & ~(size_t)31u;
     rb = (rows + 127u) / 128u;
-    return rb * ncb_rd * 512u;
-}
-#endif
-
-static size_t unpadded(size_t rows, size_t k) {
-    size_t ncb = (k / 16u) / 4u;
-    size_t rb = (rows + 127u) / 128u;
     return rb * ncb * 512u;
 }
 
 int main(void) {
-    struct { const char *name; size_t n, k; size_t want_pad; int must_differ; } cases[] = {
-        {"qkv", 21504, 5376, 8257536, 1},
-        {"out", 5376, 5376, 2064384, 1},
-        {"fc1", 28672, 5376, 11010048, 1},
-        {"fc2", 5376, 14336, 4816896, 0},
+    struct { const char *name; size_t n, k; size_t want; } cases[] = {
+        {"qkv K=5376 N=21504", 21504, 5376, 168ull * 84ull * 512ull},
+        {"fc2 K=14336 N=5376", 5376, 14336, 42ull * 224ull * 512ull},
+        {"tiny K=64 N=1", 1, 64, 1ull * 1ull * 512ull},
+        {"K=512 N=256", 256, 512, 2ull * 8ull * 512ull},
     };
-    int i, fails = 0;
-    for (i = 0; i < 4; i++) {
+    int fail = 0;
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
         size_t got = h3_cuda_nvfp4_sf_bytes(cases[i].n, cases[i].k);
-        size_t bad = unpadded(cases[i].n, cases[i].k);
-        if (got != cases[i].want_pad) {
-            printf("FAIL %s: got %zu want %zu\n", cases[i].name, got, cases[i].want_pad);
-            fails++;
-        } else if (cases[i].must_differ && got == bad) {
-            printf("FAIL %s: padded==unpadded (%zu) — mosaic bug not gated\n",
-                   cases[i].name, got);
-            fails++;
-        } else if (!cases[i].must_differ && got != bad) {
-            printf("FAIL %s: expected no pad but padded=%zu unpadded=%zu\n",
-                   cases[i].name, got, bad);
-            fails++;
+        if (got != cases[i].want) {
+            printf("FAIL %s: got %zu want %zu\n", cases[i].name, got, cases[i].want);
+            fail = 1;
         } else {
-            printf("ok %s sf_bytes=%zu (unpadded would be %zu)\n",
-                   cases[i].name, got, bad);
+            printf("ok %s sf_bytes=%zu\n", cases[i].name, got);
         }
     }
     if (h3_cuda_nvfp4_sf_bytes(1, 63) != 0 || h3_cuda_nvfp4_sf_bytes(0, 64) != 0) {
         printf("FAIL: bad-args should return 0\n");
-        fails++;
+        fail = 1;
     }
-    printf("%s\n", fails ? "FAIL" : "PASS");
-    return fails ? 1 : 0;
+    return fail;
 }

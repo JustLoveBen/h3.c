@@ -2990,7 +2990,7 @@ static int nvfp4_load_block_weights(h3_dit_w4a8 *ctx, unsigned block,
         float scale2 = 1.0f;
         size_t n = n_expect[p], k = k_expect[p];
         size_t w_bytes = n * (k / 2u);
-        /* Same ncb_rd pad as h3_cuda_nvfp4_sf_bytes / quant_dit_nvfp4.py. */
+        /* Same rb*ncb*512 as h3_cuda_nvfp4_sf_bytes / quant_dit_nvfp4.py. */
         size_t sf_bytes = h3_cuda_nvfp4_sf_bytes(n, k);
         const h3_st_tensor *s2t;
         if (ctx->nvfp4_w[block][p]) continue;

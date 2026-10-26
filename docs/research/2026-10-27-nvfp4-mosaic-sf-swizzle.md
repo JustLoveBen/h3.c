@@ -35,3 +35,8 @@ visual mosaic. INT8 path unaffected (no SF).
 ## Gate
 After reswizzle + rebuild: P0 NVFP4 vs INT8, same-config waffle, OR VL.
 Keep chain BLOCK until visual+user say otherwise.
+
+
+## Update: row-block stride
+See `2026-10-27-nvfp4-sf-row-stride-ncb.md` — 32x4 in-tile was necessary but
+stride must be `ncb` not `ncb_rd`. That residual caused M>=128 Y=0 mosaic.

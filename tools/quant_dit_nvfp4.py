@@ -10,12 +10,10 @@ per-16-element micro-blocks: W_f32[n, g*16+j] ~= E2M1(nib) * UE4M3(SF[n,g]) * 1.
 ConvRot stays baked (rotation preserves per-block geometry; FP4 uses the same
 Hadamard-rotated weights, so act-side rotation is unchanged).
 
-SF swizzle = layout measured empirically on sm_120 cuBLASLt
-(bench/nvfp4_phase0/diag_sf_layout.cu single-marker probe), MUST match the
-runtime quantize kernel h3_cuda_quantize_act_nvfp4_kernel:
-  tile = (r//128)*ncb_rd + (c//4)
-  off  = tile*512 + 16*((r%128)%32) + 4*((r%128)//32) + (c%4)
-  (ncb_rd=ceil(ncb/32)*32; ncb=(K/16)//4; K%64==0). 32x4 row swizzle in-tile.
+SF layout (sm_120 cuBLASLt, e2e-proven):
+  tile = (r//128)*ncb + (c//4)     # row-block stride = ncb (NOT ceil32)
+  off  = tile*512 + 16*((r%128)%32) + 4*((r%128)//32) + (c%4)  # 32x4 in-tile
+  ncb=(K/16)//4; K%64==0. Size = rb*ncb*512.
 
 Usage:
   python quant_dit_nvfp4.py SRC.safetensors DST.safetensors [--blocks N]
@@ -93,19 +91,14 @@ def quant_linear(w_i8, per_row_scale):
     even = nib[:, 0::2]
     odd = nib[:, 1::2]
     packed = ((even << 4) | (odd & 0xF)).astype(np.uint8)   # [N,K/2] hi_first
-    # swizzle SF [N,nc] -> blocked, measured sm_120 layout:
-    # off = tile*512 + 16*((r%128)%32) + 4*((r%128)//32) + (c%4), tile = (r//128)*ncb_rd + c//4
-    # cuBLASLt reads a padded K-extent of ceil(ncb/32)*32 tile-cols per 128-row
-    # tile (2048 K elems each); for K%2048!=0 the tail must exist and be 0
-    # (a stale byte >= 0xFE is UE4M3 NaN and poisons the accumulator).
-    ncb_rd = (ncb + 31) & ~31
+    # swizzle SF [N,nc] -> blocked sm_120 layout (stride=ncb, 32x4 in-tile):
     rb = (N + 127) // 128
-    sf_pad = np.zeros((rb * 128, ncb_rd * 4), dtype=np.uint8)
+    sf_pad = np.zeros((rb * 128, ncb * 4), dtype=np.uint8)
     sf_pad[:N, :nc] = sf
-    out = np.zeros(rb * ncb_rd * 512, dtype=np.uint8)
+    out = np.zeros(rb * ncb * 512, dtype=np.uint8)
     r_idx = np.arange(rb * 128)
-    c_idx = np.arange(ncb_rd * 4)
-    tile = (r_idx // 128)[:, None] * ncb_rd + (c_idx // 4)[None, :]
+    c_idx = np.arange(ncb * 4)
+    tile = (r_idx // 128)[:, None] * ncb + (c_idx // 4)[None, :]
     r128 = r_idx % 128
     off = (tile * 512
            + (16 * (r128 % 32) + 4 * (r128 // 32))[:, None]

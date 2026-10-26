@@ -78,3 +78,10 @@ make            # NVCC/CU13 默认值已对齐 238 的 CUDA 13 pip 栈，可用 
 1. FP4 API 需 cuBLASLt ≥ 12.8；238 生产 binary 链接 `nvidia/cu13/lib/libcublasLt.so.13`（pip 包），Makefile 默认指向该路径（与 E1 一致）。
 2. `CUDA_R_4F_E2M1` 打包为 2 元素/字节，packed buffer 尺寸 = N×K/2；本 bench 用 lo-nibble=偶数 K 约定（纯计时无所谓，Phase 1 需与权重打包约定对齐）。
 3. 若 heuristic 返回 0 算法：先确认 nvcc/运行时确为 CUDA 13（E1 踩过 CUDA 12.4 对 sm_120 拒载的坑），再判 NO-GO。
+
+
+## 9. SF row-block stride correction (2026-10-27 later)
+
+e2e A/B: **stride must be `ncb`**, not `ncb_rd=ceil32(ncb)`.
+`32x4 + stride_ncb` → rel_l2≈0.0017 PASS; `stride_ncb_rd` → M≥128 Y=0.
+See `docs/research/2026-10-27-nvfp4-sf-row-stride-ncb.md`.
