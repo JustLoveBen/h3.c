@@ -24,7 +24,7 @@
 - 默认路径仍是 **INT8 DiT**；`H3_DIT_NVFP4=1` 可切实验臂；基线 `fc1_fused` 守卫已修（`fcd930c`）。INT8 1-step velocity md5 在 graph 关下可复现（`321538a` graph 默认关）。  
 - NVFP4：**能跑完、latent 有限**；公平 1-step 相对稳定 INT8 轨迹差大（velocity rel ~0.94）；**P2.2 视觉门仍未在 238 按现基线重验**；链式 WIP 在工作区（端到端 latent rel ~0.33 未解释），**未提交，等视觉门 + 用户确认**。  
 - T3（PDMD/DMAD）：**仍标未验证（无 GPU 视觉验收）**。PDMD-2NFE 合同复验过；**PDMD-4NFE 原件正式验收未做**。开发侧：`h3_fewstep_contract`（`7fe119c`）、`lcm_renoise`（`e037d42`）、`--fewstep-preset`（`8359dae`）已落地；禁止用 Euler/turbo4 冒充 DMAD 通过。Metal `h3` CLI **未**接 fewstep（无 LoRA/sampler 路径；验收走 `h3_cuda_generate`）。  
-- DeepInfer：只取可复现门禁 + 可选异步重叠审计（**审计笔记已写**）；**不新增算力主线**（见 `2026-10-26-deepinfer-to-h3c-takeaways.md`）。
+- DeepInfer：可复现门禁 + 异步重叠审计已写；**不因 DeepInfer 另开 KV/MoE/serving 核主线**；速度**策略**见 `2026-10-26-deepinfer-speed-strategies.md`，整合落点见 `2026-10-26-optimization-roadmap.md`。
 - student_grid：pdmd2/4·dmad4 冻结 σ 表进 `tests/fixtures/`；合同 `check_sigmas` 对照该表。  
 - 工作区脏：链式源码、`h3_lora.c` 等 + 多份 10-09 研究文档未入库；238 盘接近满；**清盘 / nsys / push / 链式提交均未做**。
 
@@ -130,6 +130,8 @@
 | [`2026-10-09-generation-timing.md`](2026-10-09-generation-timing.md) | 唯一耗时账本 |
 | [`2026-10-09-pdmd-dmad-loras.md`](2026-10-09-pdmd-dmad-loras.md) | T3 合同、2NFE 复验、T3 未验证 |
 | [`2026-10-26-deepinfer-to-h3c-takeaways.md`](2026-10-26-deepinfer-to-h3c-takeaways.md) | DeepInfer 取舍（纪律 / 否定清单） |
+| [`2026-10-26-deepinfer-speed-strategies.md`](2026-10-26-deepinfer-speed-strategies.md) | DeepInfer **速度策略层**（可迁移；纠正 LLM 否决过窄） |
+| [`2026-10-26-optimization-roadmap.md`](2026-10-26-optimization-roadmap.md) | 后续优化整合方案（本文 checklist 的方案视图） |
 | [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md) | P0 INT8/NVFP4 对照命令与纪律 |
 | [`2026-10-26-contract-selfcheck-design.md`](2026-10-26-contract-selfcheck-design.md) | 少步合同 FAIL 矩阵；Phase-1 已落地 |
 | [`2026-10-07-llm-to-dit-transfer.md`](2026-10-07-llm-to-dit-transfer.md) | LLM→DiT 迁移裁决表 |
@@ -156,3 +158,4 @@
 | 2026-10-26 | 离线：TE checksum + P0 硬门扩展 + fewstep audio-env 冲突文案；未开 238 / 未碰链式 WIP。 |
 | 2026-10-26 | 离线：`make fewstep_host_tests` + waffle 同配置门 + Metal 边界 TODO；commit 后 push。 |
 | 2026-10-26 | 离线：合同 JSON/schema、共享 fewstep help、禁配日志检、P0 waffle 接缝示例；commit 后 push。 |
+| 2026-10-26 | 链到 optimization-roadmap + deepinfer-speed-strategies；澄清策略可学 ≠ 核盲搬。 |

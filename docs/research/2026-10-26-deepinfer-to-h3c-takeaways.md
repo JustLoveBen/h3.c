@@ -10,8 +10,10 @@
 
 ## 1. 一句话裁决
 
-DeepInfer 对 `h3.c` **可复用的是工程纪律与流水线意识**，不是算子与 serving 核。  
-算力主杆仍在本仓既有计划：**NVFP4 视觉门** + **768p 显存 / layerwise streaming**；少步质量另走 **PDMD/DMAD 合同臂**（见 `2026-10-09-pdmd-dmad-loras.md`），与 DeepInfer 正交。
+DeepInfer 对 `h3.c`：**算子 / serving 核本体**（FlashMLA、DeepEP、投机进默认…）因问题不同构而**不盲搬**；  
+**速度优化策略**（重叠、内存层级、量化共设计、融合、phase 特化、测量与合同）**仍然高价值**——见 [`2026-10-26-deepinfer-speed-strategies.md`](2026-10-26-deepinfer-speed-strategies.md)。  
+「是 LLM」只能否决同构盲搬，**不能**否决策略学习。  
+算力主杆仍在本仓既有计划：**NVFP4 视觉门** + **768p 显存 / layerwise streaming**；少步质量另走 **PDMD/DMAD 合同臂**；整合方案见 [`2026-10-26-optimization-roadmap.md`](2026-10-26-optimization-roadmap.md)。
 
 ---
 
@@ -121,3 +123,16 @@ DeepInfer 对 `h3.c` **可复用的是工程纪律与流水线意识**，不是�
 |---|---|
 | 2026-10-26 | 初稿：从 DeepInfer 整案筛「启发/复用」与否定清单，对齐既有 transfer 裁决。 |
 | 2026-10-26 | 链到 deeper-pass；新增 §6（A′–C′ / B′–B″）；落地 env 合同打印机。 |
+
+---
+
+## 7. 策略层与优化方案指针（2026-10-26）
+
+| 文档 | 用途 |
+|---|---|
+| [`2026-10-26-deepinfer-speed-strategies.md`](2026-10-26-deepinfer-speed-strategies.md) | **策略层** S1–S12：LLM 收益 → 原则 → DiT 改编 → keep/adapt/defer |
+| [`2026-10-26-optimization-roadmap.md`](2026-10-26-optimization-roadmap.md) | 后续优化整合方案（与 followup-dev-plan 对齐） |
+| [`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md) | 模块级 + §6 核质量/效率（同构否决 ≠ 策略否决） |
+
+**改写：** 早期「不新增算力主线」指 **不因 DeepInfer 另开 FlashMLA/EP 主线**；并不禁止按 S4/S5/S1 强化 NVFP4、融合与重叠——那些本就是 h3.c 主线/P2。
+
