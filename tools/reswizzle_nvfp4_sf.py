@@ -60,17 +60,25 @@ def convert_blob(blob: bytes, N: int, K: int, src_layout: str) -> bytes:
             src_layout = '32x4_ncb'
         else:
             raise SystemExit(f'SF size {len(blob)} not in ({expect_ncb}, {expect_rd}) N={N} K={K}')
-    dst = np.zeros(expect_ncb, dtype=np.uint8)
     if src_layout == '32x4_ncb':
         if len(blob) != expect_ncb:
             raise SystemExit('32x4_ncb size mismatch')
         return blob  # already final
     if len(blob) != expect_rd:
         raise SystemExit(f'{src_layout} expect {expect_rd} got {len(blob)}')
-    reader = off_linear_ncb_rd if src_layout == 'linear_ncb_rd' else off_32x4_ncb_rd
-    for r in range(N):
-        for c in range(nc):
-            dst[off_32x4_ncb(r, c, ncb)] = src[reader(r, c, ncb_rd)]
+    # Vectorized gather/scatter (Python double loop is hours on DiT SF).
+    r = np.arange(N, dtype=np.int64)[:, None]
+    c = np.arange(nc, dtype=np.int64)[None, :]
+    r128 = r % 128
+    tile_src = (r // 128) * ncb_rd + (c // 4)
+    if src_layout == 'linear_ncb_rd':
+        src_off = tile_src * 512 + (r % 128) * 4 + (c % 4)
+    else:  # 32x4_ncb_rd
+        src_off = tile_src * 512 + 16 * (r128 % 32) + 4 * (r128 // 32) + (c % 4)
+    tile_dst = (r // 128) * ncb + (c // 4)
+    dst_off = tile_dst * 512 + 16 * (r128 % 32) + 4 * (r128 // 32) + (c % 4)
+    dst = np.zeros(expect_ncb, dtype=np.uint8)
+    dst[dst_off.ravel()] = src[src_off.ravel()]
     return dst.tobytes()
 
 def main():
