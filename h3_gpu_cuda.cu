@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "h3_cuda_hot_sync.h"
 #include <mma.h>
 
 #include <dirent.h>
@@ -9368,7 +9369,9 @@ static int h3_cuda_sdpa_sol_dev(h3_cuda *cuda, const __half *d_qh,
         cudaEventDestroy(ev0);
         cudaEventDestroy(ev1);
     } else if (sdpa_ms) {
-        cudaDeviceSynchronize();
+        /* KPI timer fallback when CUDA events unavailable — HOT if this
+         * path sits inside per-step SDPA without events. */
+        h3_cuda_device_sync_class(H3_SYNC_HOT, "sol_attn_sdpa_ms_fallback");
         *sdpa_ms = 0.0;
     }
     if (sdpa_ms || !g_sol_logged) {

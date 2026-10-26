@@ -8,6 +8,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include "h3_cuda_hot_sync.h"
+
 #include <limits.h>
 #include <stdint.h>
 #include <math.h>
@@ -66,7 +68,7 @@ static int uly_ksync(const char *kernel, char *err, size_t errn) {
     uly_klog(kernel, "launched");
     if (!g_uly_phase_sync)
         return 1;
-    ce = cudaDeviceSynchronize();
+    ce = h3_cuda_device_sync_class(H3_SYNC_DEBUG, "uly_ksync");
     if (ce != cudaSuccess) {
         snprintf(err, errn, "r%d phase%d %s: %s", g_uly_log_rank,
                  g_uly_log_phase, kernel, cudaGetErrorString(ce));
@@ -716,7 +718,9 @@ int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
                 if (cudaMalloc(&d_h, a_n * 2u) != cudaSuccess ||
                     !h3_cuda_f32_to_f16_dev(ctx->cuda, ctx->d_lora_A[b][p], d_h,
                                             a_n, detail, sizeof(detail)) ||
-                    cudaDeviceSynchronize() != cudaSuccess) {
+                    h3_cuda_device_sync_class(H3_SYNC_LIFECYCLE,
+                                              "dit_set_lora_A_f16") !=
+                        cudaSuccess) {
                     if (d_h) cudaFree(d_h);
                     dit_lora_gpu_clear(ctx);
                     fail(error, error_size, "dit set_lora: A f16");
@@ -728,7 +732,9 @@ int h3_dit_w4a8_set_lora(h3_dit_w4a8 *ctx, const h3_lora_set *lora, char *error,
                 if (cudaMalloc(&d_h, b_n * 2u) != cudaSuccess ||
                     !h3_cuda_f32_to_f16_dev(ctx->cuda, ctx->d_lora_B[b][p], d_h,
                                             b_n, detail, sizeof(detail)) ||
-                    cudaDeviceSynchronize() != cudaSuccess) {
+                    h3_cuda_device_sync_class(H3_SYNC_LIFECYCLE,
+                                              "dit_set_lora_B_f16") !=
+                        cudaSuccess) {
                     if (d_h) cudaFree(d_h);
                     dit_lora_gpu_clear(ctx);
                     fail(error, error_size, "dit set_lora: B f16");

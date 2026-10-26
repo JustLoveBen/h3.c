@@ -68,7 +68,7 @@
 - per DiT block / per denoise step 的无条件 `cudaDeviceSynchronize`
 - 非 diag 的标量 D2H
 
-**本提交不实现 forbid 开关**（C070 = 审计文档落地）。
+**Forbid 开关已落地（2026-10-27 晚）：** `H3_FORBID_HOT_SYNC=1` + `h3_cuda_hot_sync.h`；生产路径已知 `cudaDeviceSynchronize` 已按类包裹（uly=DEBUG，lora f16=LIFECYCLE，sol sdpa_ms fallback=HOT）。默认 unset=不改行为。
 
 ---
 
@@ -76,7 +76,7 @@
 
 | ID | 状态（本提交后） | 说明 |
 |---|---|---|
-| **C070** | **partial**（审计页 landed；forbid 开关未做） | 本文 |
+| **C070** | **partial→landed(forbid)**（审计页 + `H3_FORBID_HOT_SYNC`） | 本文；238 smoke 见 gpu-unified |
 | C040 | partial（插桩 landed；238 未跑） | `H3_VRAM_LEDGER` |
 | C065 | landed 纪律 | KPI 禁 mem_trace / 乱 sync |
 
@@ -87,3 +87,4 @@
 | 日期 | 说明 |
 |---|---|
 | 2026-10-27 | 初版：静态 grep 分类；不改代码热路径；不跑 GPU。 |
+| 2026-10-27 | forbid 开关落地：`h3_cuda_hot_sync.h` + 已知 sync 点分类包裹；默认 off。 |

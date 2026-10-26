@@ -3409,7 +3409,13 @@ int main(int argc, char **argv) {
         dit_int8 = h3_dit_int8_store_open(dit_path, error, sizeof(error));
     if (dit_int8) {
         dit_is_int8 = 1;
-        printf("dit_format: INT8 ConvRot (theme-follow path)\n");
+        /* H3_DIT_NVFP4=1 keeps INT8 ConvRot weights but routes GEMM via FP4
+         * sidecar track — protocol arm=nvfp4 keys off dit_format: NVFP4. */
+        if (getenv("H3_DIT_NVFP4") && getenv("H3_DIT_NVFP4")[0] == '1')
+            printf("dit_format: NVFP4 (H3_DIT_NVFP4=1 GEMM track; "
+                   "weight_store=INT8 ConvRot)\n");
+        else
+            printf("dit_format: INT8 ConvRot (theme-follow path)\n");
         if (n_ref_images || ref_video_path)
             printf("dit_tree: Ref2VA %s (not FL2VA)\n", dit_path);
         if (!h3_dit_w4a8_load_core_int8(dit_int8, &core, error,

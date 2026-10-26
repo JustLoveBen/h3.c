@@ -147,8 +147,8 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步实验 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；roadmap P0；timing graph-关 ~1.14× dit 中位；[`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **partial**（238 PROTO_OK；INT8 waffle PASS；NVFP4 waffle FAIL；**目检未做**） | S4 | 人眼目检 `out/p0_visual_20261027_from238/` |
-| **C002** | DiT NVFP4 | 链式消除 FC1→FC2 激活中转 | CUTLASS 79b FP4-out+SFD | `nvfp4-chained-*`；WIP 未提交 | WC中 Q高 R高 | **C001 视觉结论 + 用户确认** | **blocked**（WIP 不动） | S4/S5 | 视觉门后解释 latent rel~0.33 再议提交 |
+| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；roadmap P0；timing；[`gpu-unified`](2026-10-27-gpu-unified-test-results.md)；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **boundary**（INT8 visual **PASS**；NVFP4 visual **FAIL/BLOCK** mosaic；waffle NVFP4 FAIL；**勿升默认 / 勿交 chain**） | S4 | NVFP4 根因另开；chain 仍 gated |
+| **C002** | DiT NVFP4 | 链式消除 FC1→FC2 激活中转 | CUTLASS 79b FP4-out+SFD | `nvfp4-chained-*`；WIP 未提交 | WC中 Q高 R高 | **C001 NVFP4 visual PASS + 用户确认** | **blocked**（C001 NVFP4 **FAIL**；WIP 不动） | S4/S5 | 先修 C001 NVFP4 观感再议 chain |
 | **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | DESIGN §8 errata；[`skip-convrot-unreachable`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md)；[`nan-fix`](2026-10-27-c003-epi-fuse-nan-fix.md) | WC中 Q高（代数错） | act_f16+convrot | **boundary** @ `3145ba0`（P2 skip-ConvRot **DISARMED**/不可达；NaN 已修；238 waffle PASS as no-op；**默认 OFF**） | S5 | 勿 default-on； redesign 需 in-kernel ConvRot；C004 仍挡 |
 | **C004** | DiT INT8 | E2-P3 跨 phase FC2→QKV | mode 3 requant 接线 | DESIGN.md §5 | WC中 R中高 | C003 数值门 | **idea** | S5 | A1 通过后再开 |
 | **C005** | DiT | Hadamard/ConvRot 与 FP4 共设计 | 激活旋转抑 outlier | transfer 2.2；nvfp4 文 | Q中（绑 C001） | 随 NVFP4 | **partial** | S4 | 不单独开项 |
@@ -172,8 +172,8 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；`--fewstep-preset pdmd4`；gpu-unified-results | WC高（少步） Q高 | INT8；合同开 | **partial**（238 PROTO+waffle PASS @ rank128 原件；**目检未做**） | S7 | 人眼目检 `out/c030_pdmd4_20261027_from238/` |
-| **C031** | fewstep | DMAD 官方采样器需诚实验 | `lcm_renoise`+full_critic+12/2 | sampler `e037d42`；gpu-unified addendum；LoRA `dmad_minimax_h3_4step_full_critic.h3repo.safetensors` | WC高 Q高 | C030 纪律 | **partial**（238 PROTO+waffle PASS；`lcm_renoise` 已确认；**目检未做**） | S7 | 人眼目检 `out/c031_dmad4_20261027_from238/` |
+| **C030** | fewstep | T3 最短路径未 GPU 验 | PDMD-4NFE 原件+Euler+12/3 | pdmd-dmad-loras；gpu-unified；[`or-visual`](2026-10-27-or-visual-review.md) | WC高（少步） Q高 | INT8；合同开 | **landed(visual-OR)**（238 PROTO+waffle PASS；OR-limited 观感可接受） | S7 | 可选人眼抛光；合同继续强制 |
+| **C031** | fewstep | DMAD 官方采样器需诚实验 | `lcm_renoise`+full_critic+12/2 | sampler；gpu-unified；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 Q高 | C030 纪律 | **landed(visual-OR)**（PROTO+waffle PASS；`lcm_renoise`；OR-limited 可接受，有 smear） | S7 | 可选人眼抛光 |
 | **C032** | fewstep | 错合同污染加速叙事 | contract FAIL / preset / σ 金表 | fewstep_contract；fixtures | Q高 R低 | — | **landed**（host） | S11 | GPU 跑时强制 `--fewstep-contract` |
 | **C033** | fewstep | PDMD-2 仅作合同回归 | 大 σ 跳固有发糊 | pdmd 文 r2–r4 | — | — | **landed/边界** | — | 不作 T3 通过尺 |
 | **C034** | fewstep | Metal CLI 无 LoRA/sampler | 边界说明 | fewstep-metal-boundary | — | — | **landed（文档）** | — | 验收走 `h3_cuda_generate` |
@@ -210,7 +210,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
 | **C068** | 不变量 | INT8 路径 RoPE 表每 forward 现算 | per-shape memo | invariant-cache-audit；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低（估0.1–0.3） bit同 | profile 确认调用点 | **landed**（host memo；GPU WC 未验） | 族4 | GPU 测墙钟 |
 | **C069** | 不变量 | VAE RoPE 每 chunk 现算+H2D | host memo + same-key H2D skip | 同上；[rope note](2026-10-27-c068-c069-rope-memo.md) | WC低 bit同 | — | **partial**（host memo+H2D skip；clip 级常驻 defer） | 族4 | GPU 测；全 geometry 常驻 defer |
-| **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；S8 | WC低 | forbid 开关未做 | **partial**（审计页 landed） | S8 | 不挡主线；forbid 另开 |
+| **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；`h3_cuda_hot_sync.h` | WC低 | 默认 off | **landed(forbid)**（opt-in assert；已知 sync 点已分类） | S8 | KPI 跑可开；238 smoke |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
 | **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log；[conventions](2026-10-27-dump-once-score-many.md) | Q | — | **partial**（约定+日志标记+checker landed） | S12 | GPU 上跑 dump→replay 验收 |
@@ -340,7 +340,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 ```csv
 id,axis,stage,title,status,s_link,near_term_pri
-C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,partial,S4,P0
+C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,boundary-nvfp4-block,S4,P0-blocked
 C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
 C003,A,DiT-INT8,E2 epi-fuse A/B,partial-nan-fixed-waffle-fail,S5,P1
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
@@ -348,8 +348,8 @@ C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
 C015,A/C,DiT,act FP16 staging,idea,S2,P3
 C017,A,DiT,L2 pin hot tables,idea,S2,P3
-C030,B,fewstep,PDMD-4NFE GPU accept,partial,S7,P1
-C031,B,fewstep,DMAD lcm_renoise GPU,partial-proto-pass,S7,P2
+C030,B,fewstep,PDMD-4NFE GPU accept,landed-visual-OR,S7,done-dev
+C031,B,fewstep,DMAD lcm_renoise GPU,landed-visual-OR,S7,done-dev
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
 C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
@@ -392,6 +392,8 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | C070 `H3_FORBID_HOT_SYNC` + dit_format NVFP4 日志澄清（INT8 store+GEMM track）。 |
+| 2026-10-27 | OR 目检：C001 INT8 PASS / NVFP4 **BLOCK**；C030/C031 **landed(visual-OR)**；C003 维持 DISARMED。见 [`or-visual-review`](2026-10-27-or-visual-review.md)。 |
 | 2026-10-27 | 238 GPU：C003 NaN 修 @ `1b37f28`（waffle 仍 FAIL，默认 OFF）；C001 PROTO；C030/C031 PROTO+waffle PASS；C062 HIT 硬门 PROTO_OK；均待目检（C062 除外）。见 [`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md)。 |
 | 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
 | 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |

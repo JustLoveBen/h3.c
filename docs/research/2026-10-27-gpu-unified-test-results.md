@@ -36,7 +36,7 @@ Waffle same-config (logs):
 - INT8 `int8_1` vs `int8_2`: **PASS** mean Δ=0.000 max=0.000 (all frames `INVALID_LOWENERGY` — gate “门失效” note; b16 meaningless)
 - NVFP4 `nvfp4_1` vs `nvfp4_2`: **FAIL** mean |Δb16|=12.16 max=16.15 (also INVALID_LOWENERGY)
 
-**Human visual review still required** for both INT8 and NVFP4 mp4s (protocol ≠ quality).
+**Visual (OR 2026-10-27):** INT8 **PASS**; NVFP4 **FAIL/BLOCK** (mosaic). See or-visual-review.
 
 ---
 
@@ -83,7 +83,7 @@ Waffle r1 vs r2: **PASS** mean Δ=0.014 max=0.027 (frames still flagged INVALID_
 
 Contract lines present: `fewstep_preset: id=pdmd4 … sampler=velocity_euler`, `sigma_ok student_grid(nfe=4, video_shift=12, audio_shift=3)`, `av_sync … PASS`.
 
-**Human visual review required** (protocol/waffle ≠ aesthetic gold).
+**Visual (OR-limited 2026-10-27):** PDMD-4 **PASS** fewstep → landed(visual-OR).
 
 ---
 
@@ -129,7 +129,7 @@ Asset (original non-truncated, mirror C030 discipline):
 - waffle same-config (generate.log): **PASS** mean|Δb16|=0.053 max=0.147 (WAFFLE_RC=0); frames still `INVALID_LOWENERGY`
 - log confirms `sampler: selected=lcm_renoise` and `fewstep_contract: id=dmad4 … sampler=lcm+re-noise`
 
-**Protocol verdict:** PASS. **Human visual still required** (protocol ≠ quality).
+**Protocol verdict:** PASS. **Visual (OR-limited 2026-10-27):** DMAD-4 **PASS** fewstep (smear caveats) → landed(visual-OR).
 
 
 
@@ -149,12 +149,23 @@ Reuse C031 warm cache `out/c031_dmad4_20261027/te_cache/` (key=`a150f97b2a58968e
 
 Mac pull: `out/c062_te_cache_hit_20261027_from238/`. Default te_cache policy remains **off**.
 
+## Visual gate (OpenRouter free VL · 2026-10-27 Asia/Shanghai)
+
+See [`2026-10-27-or-visual-review.md`](2026-10-27-or-visual-review.md). Model: `nvidia/nemotron-3.5-super-vl:free` (frames; video_url needs paid balance). C030/C031 OR rate-limited → executor frames+metrics.
+
+| Arm | Visual | Catalog |
+| --- | --- | --- |
+| C001 INT8 | **PASS** | gold visual OK |
+| C001 NVFP4 | **FAIL** (mosaic garbage) | **BLOCK**; chain WIP still untouched |
+| C003 fuse pre-disarm | **FAIL** | keep DISARMED (already @ `3145ba0`) |
+| C003 ctrl / disarm | usable baseline | no-op ≡ ctrl |
+| C030 PDMD-4 | **PASS** fewstep | **landed(visual-OR)** |
+| C031 DMAD-4 | **PASS** fewstep (smear caveats) | **landed(visual-OR)** |
+
 ## Still needs human eyes (updated)
 
-1. C001 INT8 / NVFP4 mp4s (`out/p0_visual_20261027_from238/`) — NVFP4 waffle FAIL + both INVALID_LOWENERGY
-2. C003 historical bad-fuse mp4s (`out/c003_epi_fuse_20261027_scratchfix_from238/fuse_*/*_r2.mp4`) — pre-disarm wrong path; disarm outs match ctrl (`out/c003_epi_fuse_20261027_disarm_from238/`)
-3. C030 PDMD-4 mp4s (`out/c030_pdmd4_20261027_from238/`)
-4. C031 DMAD-4 mp4s (`out/c031_dmad4_20261027_from238/`)
+1. ~~C001 / C003 / C030 / C031~~ — OR+executor visual above. Optional human aesthetic polish only.
+2. NVFP4 quality root-cause (GEMM track vs sidecar) — engineering, not “look again”.
 
 ## Not done / out of scope this pass
 
