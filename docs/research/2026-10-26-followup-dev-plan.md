@@ -24,7 +24,8 @@
 - 默认路径仍是 **INT8 DiT**；`H3_DIT_NVFP4=1` 可切实验臂；基线 `fc1_fused` 守卫已修（`fcd930c`）。INT8 1-step velocity md5 在 graph 关下可复现（`321538a` graph 默认关）。  
 - NVFP4：**能跑完、latent 有限**；公平 1-step 相对稳定 INT8 轨迹差大（velocity rel ~0.94）；**P2.2 视觉门仍未在 238 按现基线重验**；链式 WIP 在工作区（端到端 latent rel ~0.33 未解释），**未提交，等视觉门 + 用户确认**。  
 - T3（PDMD/DMAD）：**仍标未验证（无 GPU 视觉验收）**。PDMD-2NFE 合同复验过；**PDMD-4NFE 原件正式验收未做**。开发侧：`h3_fewstep_contract`（`7fe119c`）、`lcm_renoise`（`e037d42`）、`--fewstep-preset`（`8359dae`）已落地；禁止用 Euler/turbo4 冒充 DMAD 通过。Metal `h3` CLI **未**接 fewstep（无 LoRA/sampler 路径；验收走 `h3_cuda_generate`）。  
-- DeepInfer：只取可复现门禁 + 可选异步重叠审计；**不新增算力主线**（见 `2026-10-26-deepinfer-to-h3c-takeaways.md`）。  
+- DeepInfer：只取可复现门禁 + 可选异步重叠审计（**审计笔记已写**）；**不新增算力主线**（见 `2026-10-26-deepinfer-to-h3c-takeaways.md`）。
+- student_grid：pdmd2/4·dmad4 冻结 σ 表进 `tests/fixtures/`；合同 `check_sigmas` 对照该表。  
 - 工作区脏：链式源码、`h3_lora.c` 等 + 多份 10-09 研究文档未入库；238 盘接近满；**清盘 / nsys / push / 链式提交均未做**。
 
 ### 2.1 已落地（开发，Asia/Singapore）
@@ -52,7 +53,7 @@
 | **P1** | 耗时账本补齐（仅记录，不改产品结论） | 同协议、每臂 ≥2 次、标冷启动；graph 关后数字只追加到 timing 文档 | 视觉门前后都可记；墙钟不得替代视觉门 | 把 graph-on「12%」或错合同计时当宣传加速比 |
 | **P1** | PDMD-**4NFE** 原件合同验收（T3 最短路径） | 未截断 `pdmd_4NFE_lora`；4 步 **Euler**；video/audio shift **12/3**；cfg 1；INT8 底模；480p 同 seed；无网格噪、有限 latent、成片可审；waffle 仅同配置 | LoRA 通路已通；勿叠 NVFP4 做首验 | 用 2NFE 冲观感当 T3 通过；turbo4 sigma；Kijai 降秩当金线 |
 | **P2** | DMAD 采样器（`lcm_renoise`）+ `full_critic` 诚实验收 | **采样器已提交**；GPU 验收：shift 12/2、cfg 1、原件非降秩；Euler 跑 DMAD **不算**通过 | P1 PDMD-4 合同纪律可复用 | 未视觉验收前标 T3 通过；turbo4 错合同计加速 |
-| **P2** | （可选）异步重叠审计 | TE 释放 ↔ DiT 上传；VAE 预热 ↔ 首步权重；记显存峰值与 PDMD 预热 OOM 类竞态 | 不引入 DeepInfer 调度器 | 当多并发 serving 重做 |
+| **P2** | （可选）异步重叠审计 | **笔记已交** [`2026-10-26-te-lifecycle-audit.md`](2026-10-26-te-lifecycle-audit.md)；真机峰值仍待授权跑 | 不引入 DeepInfer 调度器 | 当多并发 serving 重做 |
 | **P3** | 链式 FC1→FC2 提交决策 | 仅当 **NVFP4 视觉门有结论** 且 **用户确认**；端到端 latent rel 0.33 有解释或接受为臂内差 | P0 视觉门 | 视觉前强行 commit；把链式当 INT8/NVFP4 切换或 SKU 主线 |
 | **P3** | 768p / layerwise streaming、PDL、Hadamard（跟 NVFP4） | 沿用 transfer【部分迁移】；768p 全序列 OOM 优先显存账本 | 视觉门后；用户授权剖析工具 | DeepInfer / SM100 / MoE / FlashMLA 进默认路径 |
 
@@ -106,11 +107,12 @@
 5. [x] **∥ 合同自检**：设计 [`2026-10-26-contract-selfcheck-design.md`](2026-10-26-contract-selfcheck-design.md) + 代码 `7fe119c`（`--fewstep-contract` / `H3_FEWSTEP_CONTRACT`）；host 单测过。GPU 少步跑时务必启用。  
 5b. [x] **∥ 少步一键 preset**：`--fewstep-preset` / `H3_FEWSTEP_PRESET`（`8359dae`；[`2026-10-26-fewstep-preset.md`](2026-10-26-fewstep-preset.md)）；绑 steps/cfg/shift/sampler/contract；勿叠 turbo4。离线日志识别见 `tools/p0_protocol_check_log.py --expect-fewstep`。  
 6. [x] **P2 DMAD 采样器**：`h3_sampler` / `--sampler lcm_renoise`（`e037d42`，2026-10-26）；[ ] `full_critic` GPU 验收（仅在你点头后；238 未跑）。  
-7. [ ] **P2 可选**：TE/VAE/DiT 生命周期与预热显存审计一页笔记。  
+7. [x] **P2 可选**：TE/VAE/DiT 生命周期与预热显存审计一页笔记 ([`2026-10-26-te-lifecycle-audit.md`](2026-10-26-te-lifecycle-audit.md))。  
 8. [ ] **P3 门控**：视觉门结论出来后，单独请示：链式是否提交、是否 push 本轮新提交、是否清盘/nsys。  
 9. [ ] **生产债（不插队）**：`c_te_raw` 偶发不确定单独开修；修完前速度场对照继续优先 refine/`H3_TEXT_H_LOAD`。离线辅助已落地：`tools/te_f32_checksum.py` + P0 `--expect-live-te`/`--expect-te-load`（2026-10-26）。
 9b. [x] **∥ P0 日志硬门扩展 + timing 行模板**：seed/skip-audio/live-te/chain；`timing_append_row.py`（不自动改账本）。
 9c. [x] **∥ fewstep-preset × 错误 audio shift 提前 FAIL**：`h3_fewstep_preset_audio_env_compatible`。
+9d. [x] **∥ student_grid golden fixture**：`tests/fixtures/fewstep_student_grid_golden.h` + `tools/dump_fewstep_student_grid`；`check_sigmas` 对照冻结表 (pdmd2/4、dmad4；pdmd2 audio 3|6)。
 
 ---
 
