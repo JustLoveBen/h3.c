@@ -1,0 +1,182 @@
+/* Host-only fewstep contract tests (no CUDA). */
+#include "h3_fewstep_contract.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int fails;
+
+static void expect(int cond, const char *msg) {
+    if (!cond) {
+        fprintf(stderr, "FAIL %s\n", msg);
+        fails++;
+    }
+}
+
+static void fill_grid(int nfe, float shift, float *out) {
+    int i;
+    for (i = 0; i <= nfe; i++) {
+        float base = 1.0f - (float)i / (float)nfe;
+        out[i] = (base > 0.0f)
+                     ? shift * base / (1.0f + (shift - 1.0f) * base)
+                     : 0.0f;
+    }
+    out[nfe] = 0.0f;
+}
+
+int main(void) {
+    h3_fewstep_contract_in in;
+    char err[256];
+    float v[8], a[8];
+
+    unsetenv("H3_FEWSTEP_CONTRACT");
+    unsetenv("H3_FEWSTEP_STRICT");
+    unsetenv("H3_FEWSTEP_ALLOW_NVFP4");
+
+    expect(h3_fewstep_contract_parse(NULL, err, sizeof err) == H3_FEWSTEP_NONE,
+           "parse null");
+    expect(h3_fewstep_contract_parse("pdmd4", err, sizeof err) ==
+               H3_FEWSTEP_PDMD4,
+           "parse pdmd4");
+    expect(h3_fewstep_contract_parse("pdmd2", err, sizeof err) ==
+               H3_FEWSTEP_PDMD2,
+           "parse pdmd2");
+    expect(h3_fewstep_contract_parse("dmad4", err, sizeof err) ==
+               H3_FEWSTEP_DMAD4,
+           "parse dmad4");
+    expect(h3_fewstep_contract_parse("turbo4", err, sizeof err) ==
+               H3_FEWSTEP_NONE,
+           "parse bad → none");
+    expect(err[0] != '\0', "bad parse sets err");
+
+    expect(h3_fewstep_contract_resolve(NULL, err, sizeof err) ==
+               H3_FEWSTEP_NONE,
+           "resolve unset");
+    setenv("H3_FEWSTEP_CONTRACT", "pdmd4", 1);
+    expect(h3_fewstep_contract_resolve(NULL, err, sizeof err) ==
+               H3_FEWSTEP_PDMD4,
+           "resolve env");
+    unsetenv("H3_FEWSTEP_CONTRACT");
+
+    /* NONE: always ok */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_NONE;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "none early");
+
+    /* pdmd4 + turbo4 preset → FAIL */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_PDMD4;
+    in.steps = 4;
+    in.preset_rewrites_sigma = 1;
+    in.preset_name = "turbo4";
+    in.video_shift = 12.0f;
+    in.audio_shift = 3.0f;
+    in.cfg_scale = 1.0f;
+    in.sampler_is_velocity_euler = 1;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "pdmd4+turbo4 fail");
+    expect(strstr(err, "preset") != NULL, "pdmd4+turbo4 msg");
+
+    /* pdmd4 wrong steps */
+    in.preset_rewrites_sigma = 0;
+    in.preset_name = NULL;
+    in.steps = 8;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "pdmd4 steps fail");
+
+    /* pdmd4 wrong audio shift */
+    in.steps = 4;
+    in.audio_shift = 2.0f;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "pdmd4 audio fail");
+
+    /* pdmd4 ok */
+    in.audio_shift = 3.0f;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "pdmd4 ok");
+
+    /* pdmd4 × NVFP4 without allow → FAIL */
+    in.nvfp4_enabled = 1;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "pdmd4 nvfp4 fail");
+    setenv("H3_FEWSTEP_ALLOW_NVFP4", "1", 1);
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "pdmd4 nvfp4 allow");
+    unsetenv("H3_FEWSTEP_ALLOW_NVFP4");
+    in.nvfp4_enabled = 0;
+
+    /* dmad4 without lcm → FAIL even if shifts ok */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_DMAD4;
+    in.steps = 4;
+    in.video_shift = 12.0f;
+    in.audio_shift = 2.0f;
+    in.cfg_scale = 1.0f;
+    in.sampler_is_velocity_euler = 1;
+    in.has_lcm_renoise = 0;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "dmad4 no lcm fail");
+    expect(strstr(err, "lcm") != NULL, "dmad4 lcm msg");
+
+    /* dmad4 wrong audio */
+    in.has_lcm_renoise = 1;
+    in.audio_shift = 3.0f;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "dmad4 audio fail");
+
+    /* pdmd2 audio 6 WARN but ok; strict fail on 5 */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_PDMD2;
+    in.steps = 2;
+    in.video_shift = 12.0f;
+    in.audio_shift = 6.0f;
+    in.cfg_scale = 1.0f;
+    in.sampler_is_velocity_euler = 1;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "pdmd2 lookfeel ok");
+    in.audio_shift = 5.0f;
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "pdmd2 bad audio warn-only");
+    setenv("H3_FEWSTEP_STRICT", "1", 1);
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 0,
+           "pdmd2 strict fail");
+    unsetenv("H3_FEWSTEP_STRICT");
+
+    /* sigma golden: pdmd4 */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_PDMD4;
+    in.steps = 4;
+    in.audio_shift = 3.0f;
+    fill_grid(4, 12.0f, v);
+    fill_grid(4, 3.0f, a);
+    in.video_sigmas = v;
+    in.audio_sigmas = a;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 1,
+           "pdmd4 sigma ok");
+    /* Corrupt mid video sigma (turbo-lookalike mismatch simulation) */
+    v[1] = 0.5f;
+    expect(h3_fewstep_contract_check_sigmas(&in, err, sizeof err) == 0,
+           "pdmd4 sigma mismatch");
+    expect(strstr(err, "student_grid") != NULL, "sigma msg");
+
+    /* kijai path → WARN only (still ok) */
+    memset(&in, 0, sizeof in);
+    in.id = H3_FEWSTEP_PDMD4;
+    in.steps = 4;
+    in.video_shift = 12.0f;
+    in.audio_shift = 3.0f;
+    in.cfg_scale = 1.0f;
+    in.lora_path = "/models/kijai_rank_39_bf16.safetensors";
+    expect(h3_fewstep_contract_check_early(&in, err, sizeof err) == 1,
+           "kijai warn only");
+
+    if (fails) {
+        fprintf(stderr, "%d failure(s)\n", fails);
+        return 1;
+    }
+    printf("ok h3_fewstep_contract_test\n");
+    return 0;
+}

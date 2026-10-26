@@ -18,7 +18,8 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
-	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe
+	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
+	h3_fewstep_contract_test
 
 all: h3 libh3.a
 
@@ -49,6 +50,12 @@ h3_w4a8_blocks_probe: tools/h3_w4a8_blocks_probe.c h3_safetensors.c h3_w4a8.c \
 		h3_w4a8_dequant.c h3_safetensors.h h3_w4a8.h h3_w4a8_dequant.h h3.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/h3_w4a8_blocks_probe.c \
 		h3_safetensors.c h3_w4a8.c h3_w4a8_dequant.c -lm
+# Host-only fewstep contract self-check (no Metal/CUDA).
+h3_fewstep_contract_test: tests/test_h3_fewstep_contract.c h3_fewstep_contract.c \
+		h3_fewstep_contract.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_fewstep_contract.c \
+		h3_fewstep_contract.c -lm
+
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

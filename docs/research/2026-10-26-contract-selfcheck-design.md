@@ -2,7 +2,7 @@
 
 > **日期：** 2026-10-26。  
 > **上游：** followup §4「合同自检」、[`2026-10-09-pdmd-dmad-loras.md`](2026-10-09-pdmd-dmad-loras.md)。  
-> **性质：** 设计说明；**本轮不改** `h3_lora.c` / `h3_generate_preset.c` / 脏 CUDA 源。落地代码另开提交。  
+> **性质：** 设计说明 + Phase-1 已落地（`h3_fewstep_contract.*`）。不改脏 NVFP4 chain / 无关 WIP。  
 > **目标：** 错 preset / 错 shift / 错 sampler / 错 LoRA 身份时 **FAIL 或硬警告**，避免 turbo4 sigma 冒充 PDMD/DMAD 通过。
 
 ---
@@ -75,3 +75,4 @@ P0 视觉门 **不启用** 少步合同（无 LoRA、8-step、shift 12/默认 au
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：矩阵 + 实现切片；代码未落地。 |
+| 2026-10-26 | Phase-1：`h3_fewstep_contract.c` + `--fewstep-contract` / `H3_FEWSTEP_CONTRACT`；early+sigma 金向量；dmad4 无 lcm 硬拒；Mac `make h3_fewstep_contract_test`。 |

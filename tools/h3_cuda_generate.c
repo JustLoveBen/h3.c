@@ -32,6 +32,7 @@
 #include "h3_generate_preset.h"
 #include "h3_latent_upscaler.h"
 #include "h3_lora.h"
+#include "h3_fewstep_contract.h"
 #include "h3_kpi_guard.h"
 #include "h3_sdpa.h"
 #include "h3_selflift.h"
@@ -1764,6 +1765,8 @@ int main(int argc, char **argv) {
     char sdpa_effective[64] = "";
     const char *preset_name = NULL;
     const char *lora_path = NULL;
+    const char *fewstep_contract_cli = NULL;
+    h3_fewstep_id fewstep_id = H3_FEWSTEP_NONE;
     const char *vae_decode = "official";
     const char *tae_path = NULL;
     const char *te_cache_dir = NULL;
@@ -2212,6 +2215,9 @@ int main(int argc, char **argv) {
             lora_path = argv[++iarg];
         else if (!strcmp(argv[iarg], "--lora-scale") && iarg + 1 < argc)
             lora_scale = (float)strtod(argv[++iarg], NULL);
+        else if (!strcmp(argv[iarg], "--fewstep-contract") &&
+                   iarg + 1 < argc)
+            fewstep_contract_cli = argv[++iarg];
         else if (!strcmp(argv[iarg], "--ulysses") && iarg + 1 < argc)
             ulysses = (int)strtol(argv[++iarg], NULL, 10);
         else if (!strcmp(argv[iarg], "--vae-decode") && iarg + 1 < argc)
@@ -2333,6 +2339,11 @@ int main(int argc, char **argv) {
                     "      --preset fast4 已更名为 turbo4。\n"
                     "  --lora FILE.safetensors   turbo4 必填；金线禁止依赖此文件\n"
                     "  --lora-scale S            默认 1.0\n"
+                    "  --fewstep-contract pdmd4|pdmd2|dmad4\n"
+                    "      少步合同自检（或 H3_FEWSTEP_CONTRACT）。未设=off。\n"
+                    "      错 steps/shift/preset(turbo4)/sampler 硬 FAIL。\n"
+                    "      dmad4 在本仓实现 lcm+re-noise 前一律拒绝。\n"
+                    "      H3_FEWSTEP_STRICT=1；H3_FEWSTEP_ALLOW_NVFP4=1。\n"
                     "  --latent-upscaler FILE    lift / taomate-lift 必填；LBH 3D\n"
                     "  --lift-transition K       低分 DiT 次数（8step 默认 6；4step=3；\n"
                     "                            taomate 3-step 默认 2；Z0_ONLY 时=3）\n"
@@ -2517,6 +2528,39 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "h3: preset=%s 非金线（MAE 金线不适用）\n",
                     preset_name && preset_name[0] ? preset_name : "fast");
+    }
+    {
+        char ferr[384];
+        h3_fewstep_contract_in fin;
+        int want_nvfp4;
+        ferr[0] = '\0';
+        fewstep_id = h3_fewstep_contract_resolve(fewstep_contract_cli, ferr,
+                                                 sizeof(ferr));
+        if (ferr[0]) {
+            fprintf(stderr, "h3: %s\n", ferr);
+            return 1;
+        }
+        memset(&fin, 0, sizeof(fin));
+        fin.id = fewstep_id;
+        fin.steps = steps;
+        fin.preset_name = preset_name;
+        fin.preset_rewrites_sigma =
+            (preset_out.id == H3_PRESET_TURBO4 ||
+             preset_out.id == H3_PRESET_TAOMATE) ? 1 : 0;
+        fin.lora_path = lora_path;
+        fin.video_shift = H3_CUDA_VIDEO_SIGMA_SHIFT;
+        fin.audio_shift = audio_sigma_shift_effective();
+        fin.cfg_scale = cfg_scale;
+        want_nvfp4 = (preset_out.id == H3_PRESET_NVFP4) ||
+                     (getenv("H3_DIT_NVFP4") &&
+                      getenv("H3_DIT_NVFP4")[0] == '1');
+        fin.nvfp4_enabled = want_nvfp4 ? 1 : 0;
+        fin.sampler_is_velocity_euler = 1;
+        fin.has_lcm_renoise = 0; /* not implemented yet */
+        if (!h3_fewstep_contract_check_early(&fin, ferr, sizeof(ferr))) {
+            fprintf(stderr, "h3: %s\n", ferr);
+            return 1;
+        }
     }
     if (ulysses < 1)
         ulysses = 1;
@@ -4770,6 +4814,21 @@ int main(int argc, char **argv) {
                "(Metal/vLLM schedule_row_map)\n",
                (double)H3_CUDA_VIDEO_SIGMA_SHIFT,
                (double)audio_sigma_shift_effective());
+    if (fewstep_id != H3_FEWSTEP_NONE) {
+        char ferr[512];
+        h3_fewstep_contract_in fin;
+        memset(&fin, 0, sizeof(fin));
+        fin.id = fewstep_id;
+        fin.steps = steps;
+        fin.audio_shift = audio_sigma_shift_effective();
+        fin.video_sigmas = sigmas;
+        fin.audio_sigmas = audio_sigmas;
+        ferr[0] = '\0';
+        if (!h3_fewstep_contract_check_sigmas(&fin, ferr, sizeof(ferr))) {
+            fprintf(stderr, "h3: %s\n", ferr);
+            goto cleanup;
+        }
+    }
 
     /* cafe 5s: do not unpack DiT weights or JIT DiT SDPA during TE.
      * Cross-thread cuDNN graphs (p5a) made step1 slower; GPU prefetch
