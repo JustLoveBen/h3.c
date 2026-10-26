@@ -88,7 +88,7 @@ DeepInfer 对 `h3.c` **可复用的是工程纪律与流水线意识**，不是�
 
 ## 6. 二次深挖（2026-10-26）
 
-模块级对照见 [`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md)。§1–§4 裁决不变；本轮从 DeepInfer **新抬 / 强化** 的可复用项：
+模块级对照见 [`2026-10-26-deepinfer-deeper-pass.md（含 §6 算子/serving **质量与效率**专项）`](2026-10-26-deepinfer-deeper-pass.md)。§1–§4 裁决不变；本轮从 DeepInfer **新抬 / 强化** 的可复用项：
 
 | 代号 | 项 | 相对 §2 | 本仓落地 |
 |---|---|---|---|

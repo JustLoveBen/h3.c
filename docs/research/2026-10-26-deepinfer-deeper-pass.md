@@ -194,8 +194,84 @@
 
 ---
 
+
+## 6. 算子 / serving 核：质量与效率（专项，回应「搬不动之外」）
+
+> **问题：** DeepInfer 的算子与 serving 核，在**它们自己的领域**里质量和效率到底怎样？为何对 h3.c 仍「搬不动」？有没有不搬核也能带走的薄启发？  
+> **证据源：** DeepInfer / FlashMLA / DeepGEMM / DeepEP / TileKernels README（公开自称数字）；ExplainDeepInfer 目录图（`9bd9cf2`）；本仓 C5b / transfer / deadend-operators。**未在本机复跑他们的微基准。**
+
+### 6.1 他们在优化什么（负载形状）
+
+| 目标负载 | DeepInfer 栈在消什么 |
+|---|---|
+| **自回归 decode** | 每步 1（或少量）token × 全历史 **KV 带宽**；小 kernel 海量、launch/气泡占比高 |
+| **Prefill（长上下文）** | 稀疏 MLA + FP8/FP4 KV；融合 Q-norm/RoPE/attn/cast 消小核往返 |
+| **MoE** | Expert 路由 + **EP all-to-all**（DeepEP）与 grouped GEMM（DeepGEMM Mega MoE）重叠 |
+| **多请求 serving** | Continuous batch / 一步内不混 P+D / 异步调度（ZOS）/ 草稿投机（DSpark） |
+| **硬件** | **SM100（B200 等）+ Ascend 950**；README 明确不把 GeForce sm_120 当支持面 |
+
+一句话：这是 **「decode 带宽 + MoE 通信 + 多请求调度」** 的生产栈，不是「固定大 shape、双向全注意力、无跨步状态」的视频 DiT 栈。
+
+### 6.2 质量（determinism / 数值路径 / 成熟度与风险）
+
+**领域内：高质量，且把「可复现」当产品能力。**
+
+- **Determinism 分层清楚：** `BATCH_INVARIANT=1` → DeepGEMM / TileKernels / FlashMLA 切 deterministic；再要采样可复现必须 `MTP_VARLEN=0` + 固定 `seq_seed`。测试用 batch vs single **零容差** token 轨迹（golden_token_ids），不是「差不多就行」。
+- **数值路径：** 为 V4.1-Flash 定制——FP8/FP4 KV、稀疏 indexer、Mega-MoE、fused TileLang ops；质量合同是 **LLM token/logprob 轨迹**，不是视频 waffle/视觉门。
+- **成熟度证据（公开自称）：** FlashMLA 报 B200 fused sparse 达 **1460 TFLOPS prefill / 950 decode**；Ascend sparse prefill **95% 硬件峰**、decode **83%**；DeepGEMM 自称在多 shape 上匹配或超过 expert-tuned，历史 H800 峰值宣传到 **1550 TFLOPS**；TileKernels 自称「多数近算力或带宽上限」且已进内部训练/推理。DeepInfer 自身给了 4×SM100 prefill / 64× decode 的 Pareto 图（需按 `run_sweep.sh` 复现）。
+- **风险（诚实）：**
+  1. **硬件锁死 SM100/Ascend** —— 对 5090/sm_120 **零直接质量背书**（FlashMLA 2026.09 甚至砍掉 Hopper 与旧模型兼容）。
+  2. **模型锁死 V4.1-Flash** —— 不是通用 DiT/视频引擎。
+  3. **开源不完整** —— vendor 子模块空克隆、缺生产 KV store / E-P-D LB；「生产同款」≠「clone 即跑满」。
+  4. **加速臂与确定性互斥** —— MTP/DSpark 跨请求共享草稿预算会破坏 deterministic；他们自己写进配方，不是隐藏坑。
+  5. **自称 TFLOPS 多为目标硬件微基准** —— 未在本仓交叉验证；引用时只作「领域天花板」证据，不作 h3.c KPI。
+
+**对 h3.c 的质量含义：** 他们的「高质量」= 同输入同 token + batch 组成不变。我们可偷的是 **合同纪律**，不是他们的数值格式或注意力数学。
+
+### 6.3 效率（Amdahl：赢从哪来）
+
+公开叙事里的加速，拆开几乎全落在 LLM serving 的 Amdahl 分母上：
+
+| 赢点 | 机理 | 在 LLM 里为何大 | 在 h3.c DiT 里 |
+|---|---|---|---|
+| FlashMLA / 稀疏 attn + 低精度 KV | 砍 decode/prefill 注意力带宽与 FLOPs | decode 主导延迟 | **无 KV**；注意力是当步双向全量，属另一族问题（sol / SDPA） |
+| DeepGEMM FP8/FP4 + Mega MoE | 更高峰值档 GEMM + 算通重叠 | MoE 层 + 变长 token 组 | **无 MoE**；INT8 GEMM 已 **98–99% sm_120 峰**（C5b），同精度 GEMM **无余量** |
+| DeepEP | EP dispatch/combine 低延迟 | 多卡 MoE 通信墙 | 单卡默认路径 **N/A** |
+| TileKernels 融合 quant/SwiGLU/RoPE | 消小核与中转 | decode 小核海 | **部分同构**：我们痛的是 quant/dequant/cast **链路往返**（~数秒级账本），不是缺一个 LLM 专用 TileLang 核 |
+| ZOS / 异步调度 | CPU 调度与 device 重叠 | 每 token 一步、请求多 | CLI 单请求；阶段重叠已有 TE∥DiT / VAE 门控，ZOS 本体过重 |
+| DSpark 投机 | 少跑 verified forward | decode token 税 | 4 NFE 基数已塌；无 draft 权重 |
+
+**Amdahl 对照本仓（480p 量级记忆）：** DiT 热路径里 INT8 GEMM 本征已近峰；端到端大头还在 SDPA、量化中转、VAE、以及（少步臂上的）步数。DeepInfer 核堆解决的「KV + MoE + 多请求 decode」在这条分母里 **权重接近零**。
+
+### 6.4 与 h3.c 现实对打
+
+| 维度 | DeepInfer 栈 | h3.c（5090 / sm_120） |
+|---|---|---|
+| 形状 | 变长 seq、变 batch、decode 极瘦 | **固定大 shape**（如 16k×大 K） |
+| 状态 | 跨步 KV +（常）MoE 路由 | **无跨步 KV、无 MoE** |
+| GEMM 精度档 | FP8/FP4 原生（SM100） | 默认 **INT8** 已近峰；NVFP4 是**另一更高峰值档**的实验臂 |
+| 产品形态 | 多副本、P/D、LB（开源缺后半） | 离线 **单请求 CLI** |
+| 质量尺 | token / logprob / batch-invariant | waffle / 视觉门 / velocity md5 |
+| 硬件 | SM100 + Ascend | **sm_120**（寄存器 MMA，无 TMEM 子集） |
+
+所以：不是「他们的核差」，是 **问题同构性为零的高效解**。把 FlashMLA/DeepEP 搬进 h3.c = 用错药。
+
+### 6.5 诚实裁决
+
+1. **在 DeepSeek LLM 生产域内：算子与 serving 核可以评为高质量、高效率**——有峰值利用率自称、确定性产品开关、融合与通信重叠设计、且绑死自家模型/硬件做端到端 Pareto。  
+2. **对 h3.c：效率不可迁移的主因是 Amdahl + 硬件 + 无 KV/MoE**，不是「开源质量差所以别碰」。  
+3. **仍值得带走、且不搬核的薄启发（质量/效率卫生）：**
+   - **把确定性当一等公民**（对照门用 golden conditioning，加速臂显式开除确定性合同）——已在 N3/N7。  
+   - **大核旁的小 op 融合 / 消中转**（他们用 fused MLA+cast；我们对应 quant↔GEMM↔SwiGLU 链路与 EVT 候选）——属 transfer【部分迁移】，非 DeepInfer 独家。  
+   - **测量与 env 合同**（测速关日志；profiler 后不作 KPI）——N1/N2。  
+   - **不要在已近峰的同精度 GEMM 上再找「更快的核」**——DeepGEMM 的故事是换精度档/换 shape 族；我们同档已闭环（C5b）。
+
+**一句话补强取舍文：** DeepInfer 核堆 **在域内又快又稳**；对视频 DiT **又快又稳地解决错问题**。继续主线 INT8 稳 → NVFP4 视觉门；算力杆不在搬他们的 serving 核。
+
+---
 ## 5. 修订记录
 
 | 日期 | 说明 |
 |---|---|
 | 2026-10-26 | 初稿：模块级标签 + 8 条非显而易见启发 + 排序行动；落地 env 合同打印机。 |
+| 2026-10-26 | §6：算子/serving 核质量与效率专项（域内高、Amdahl 不迁移、薄启发）。 |
