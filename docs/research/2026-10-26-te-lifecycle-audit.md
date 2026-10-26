@@ -123,3 +123,22 @@ DiT steps…
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：锚到 `h3_cuda_generate.c` / `h3_vae_prewarm.*` / `h3_te_cache.*`；收录 PDMD 2NFE 预热 OOM 检查清单。 |
+
+---
+
+## DeepInfer 旁证（2026-10-26 deeper-pass）
+
+来源：[`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md) §1.3 / §1.12。
+
+**DeferredRelease 白名单（概念）：** 允许「多活到下一阶段 event 之后再 free」的对象须显式列出，避免过早 free（UAF）或过晚 free（顶 resident）。当前建议：
+
+| 对象 | 释放时机 | 可否延后到 DiT step0 launch 后 |
+|---|---|---|
+| TE `text_emb` scratch | encode 返回后立刻 | 否（立刻） |
+| TE store（权重页） | refine 完成后 `store_free` | 否（立刻，除非实测需延后） |
+| DiT host-stage pin 缓冲 | wait_blocks / TE join 后 | 可与 DiT 首 kernel 重叠，但须有 event |
+| VAE device-W | DiT 结束后 / 非 2NFE 抢占路径 | 见既有 NVFP4/2NFE 门控 |
+
+**允许的 host sync 点（白名单）：** TE join、VAE wait、显式 nsys 边界、进程退出。  
+**禁止（热路径）：** DiT 层间遗留的 `cudaDeviceSynchronize` / 阻塞 `cudaMemcpy` 当默认路径。代码级 `H3_FORBID_HOT_SYNC` 守卫 = P3，不挡主线。
+

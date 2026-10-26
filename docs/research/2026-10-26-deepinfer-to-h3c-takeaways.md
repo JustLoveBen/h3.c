@@ -86,18 +86,38 @@ DeepInfer 对 `h3.c` **可复用的是工程纪律与流水线意识**，不是�
 
 ---
 
-## 6. 外部链接
+## 6. 二次深挖（2026-10-26）
+
+模块级对照见 [`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md)。§1–§4 裁决不变；本轮从 DeepInfer **新抬 / 强化** 的可复用项：
+
+| 代号 | 项 | 相对 §2 | 本仓落地 |
+|---|---|---|---|
+| **A′** | Config-as-contract：集中 env + 启动打印生效值；警惕 `off`≠false 类解析陷阱 | 强化 A | `tools/print_h3_env_contract.py` |
+| **A″** | Golden conditioning：速度场/md5 对照强制同一 `H3_TEXT_H_LOAD`；视觉门仍 live TE | 强化 A | P0 runbook 纪律 |
+| **A‴** | 测量卫生：关 mem_trace 再记墙钟；profiler/nsys 后不作 KPI | 新 | timing / runbook 规则 |
+| **B′** | DeferredRelease：缓冲可多活一轮，释放与下一阶段 launch 重叠 | 强化 B | TE lifecycle audit 增补 |
+| **B″** | 热路径 sync 白名单 / forbid hot sync（允许 event sync） | 新 | 文档清单；代码守卫 P3 |
+| **C′** | Graph 政策：独立开关、捕获前 clean、共享 pool、销毁先于通信 teardown；默认仍 off | 强化 C | `sdpa_graph` 硬门 + deeper-pass §1.10 |
+| — | 可变长加速臂开除确定性合同；生成/评分分离（dump-once / score-many） | 新旁证 | fewstep 隔离 + META |
+
+**仍明确不搬：** FlashMLA / DeepEP / ZOS / DSpark / continuous batch / SM100 专属核。
+
+---
+
+## 7. 外部链接
 
 - DeepInfer 仓库：https://github.com/deepseek-ai/DeepInfer  
 - 说明汇总：https://openlm.ai/deepinfer/  
 - 本仓 LLM→DiT 裁决：`docs/research/2026-10-07-llm-to-dit-transfer.md`  
 - 进展主文档：`docs/research/2026-10-09-dev-plan-and-progress.md`  
 - PDMD/DMAD：`docs/research/2026-10-09-pdmd-dmad-loras.md`
+- 二次深挖：`docs/research/2026-10-26-deepinfer-deeper-pass.md`
 
 ---
 
-## 7. 修订记录
+## 8. 修订记录
 
 | 日期 | 说明 |
 |---|---|
 | 2026-10-26 | 初稿：从 DeepInfer 整案筛「启发/复用」与否定清单，对齐既有 transfer 裁决。 |
+| 2026-10-26 | 链到 deeper-pass；新增 §6（A′–C′ / B′–B″）；落地 env 合同打印机。 |

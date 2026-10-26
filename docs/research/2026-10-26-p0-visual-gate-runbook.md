@@ -86,6 +86,16 @@ unset H3_DIT_NVFP4 H3_DIT_NVFP4_FILE H3_DIT_NVFP4_CHAIN \
 export H3_SKIP_PPM=1
 ```
 
+开跑前打印生效合同（DeepInfer environ 启发，见 [`2026-10-26-deepinfer-deeper-pass.md`](2026-10-26-deepinfer-deeper-pass.md) §1.11）：
+
+```bash
+python3 tools/print_h3_env_contract.py --expect-p0-visual --arm int8   # 或 --arm nvfp4
+# 可贴进 META：再加 --markdown
+```
+
+**测量卫生：** 记墙钟 KPI 时保持 `H3_GEN_MEM_TRACE` unset；nsys/EVT 跑完的那次 **不得** 当 timing 行。  
+**速度场 / 1-step md5（非本轮视觉门）：** 两臂强制同一 `H3_TEXT_H_LOAD` refine dump（golden conditioning）；视觉门默认仍 live TE。
+
 ---
 
 ## 3. 命令骨架
