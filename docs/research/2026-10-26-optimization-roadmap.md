@@ -151,6 +151,7 @@
 |---|---|
 | 2026-10-26 | 初稿：整合 P0–P3 优化轴 + DeepInfer 策略落点；与 followup-dev-plan 对齐、不改其优先级。 |
 | 2026-10-27 | 增 §9 指针 → [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md)（E2/显存账本/TE cache 等增量，不改 P0）。 |
+| 2026-10-27 | 增 §10 指针 → [`2026-10-27-full-optimization-catalog.md`](2026-10-27-full-optimization-catalog.md)（长周期全量目录）。 |
 
 ---
 
@@ -169,4 +170,13 @@
 | A5 | sol autotune 是否 per-clip | 可能 cold −1s，或诚实关闭 |
 
 完整 A1–A15、与 S1–S12 对照、否定清单见该文。**仍不跑 GPU 则优先可开发项：A10（generate 内联 env 合同）。**
+
+
+## 10. 全量优化目录指针（2026-10-27）
+
+长周期、穷尽式机会目录（去重 taxonomy + Closed 节 + C001+ 全表 + 2–8 周 backlog + 长地平线）见：
+
+[`2026-10-27-full-optimization-catalog.md`](2026-10-27-full-optimization-catalog.md)
+
+**本文（roadmap）与 followup-dev-plan 仍是近周执行权威**；全量目录用于「还有没有漏的」与数月排期，不替代 P0 视觉门优先级。
 
