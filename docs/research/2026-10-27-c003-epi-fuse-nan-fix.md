@@ -54,3 +54,28 @@ Out: `out/c003_epi_fuse_20261027_scratchfix/` → Mac `out/c003_epi_fuse_2026102
 - Corruption-to-NaN: **FIXED**.
 - Quality / determinism gate: **FAIL** — keep `H3_DIT_EPI_FUSE` **default OFF**; do not treat as landed.
 - Next (not this batch): residual numerical error on P2 path (fused requant vs baseline ConvRot+quant), or accept non-default research arm only after human visual on `fuse_*_r2.mp4`.
+
+
+## 2026-10-27 P2 skip-ConvRot unreachable (waffle Δ root cause)
+
+### Evidence
+- After NaN fixes (`1b37f28`), fuse DiT was run-to-run deterministic (identical latent checksum + `latent.raw` hash r1↔r2) but **same-config waffle FAIL** (mean|Δb16|≈0.39).
+- Fuse vs ctrl latent (same seed): **rel_l2≈1.49**, sign_agree≈0.50 — catastrophic, not f16 noise.
+- Waffle compares mux_rgb after VAE; bad latents amplify VAE/uint8 nondeterminism → mp4 drift despite stable DiT checksums.
+
+### Root cause (algebra)
+Packed INT8 weights are ConvRot-rotated: `W_rot = W @ H`. Correct identity (`h3_w4a8_dequant.h`):
+
+`Y = X @ W.T == (X @ H) @ W_rot.T`
+
+P2 fused requant fed `quant(X)` into `pre_q` (skip act ConvRot) → `quant(X) @ W_rot.T`, which is **not** equivalent. DESIGN §3 proved `quant(X·H)·W_rot.T ≡ …` then incorrectly claimed skip-rot is OK.
+
+Host Hadamard (H4 normalized): skip-rot vs true rel_l2≈0.40; quant+skip vs quant+rot≈0.40.
+
+### Fix / boundary
+- **Disarm** P2 in `h3_dit_w4a8.c`: `epi_fuse` hard-forced 0; log keeps `epi_fuse_req` when env set. No `requant_mode` / no `pre_q`.
+- Default remains **OFF**. Env=1 is currently a **no-op** (fuse≡ctrl) until in-kernel ConvRot+requant redesign.
+- Tracked note + catalog; DESIGN §8 errata under gitignored `out/review-…/DESIGN.md`.
+
+### Not race / scratch
+DiT fuse path itself was deterministic; prior scratch/AdaLN bugs were separate and already fixed. Remaining waffle FAIL was numerical wrongness of skip-ConvRot, not a race.

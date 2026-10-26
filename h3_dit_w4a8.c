@@ -3364,14 +3364,21 @@ static int block_phase_out_mlp(
      * epilogues, which take over the INT8 R31 epilogue's role; keep the
      * INT8 GEMM epilogue off so the non-FP4 fallback paths stay separate. */
     int gemm_epi = fused && !ctx->nvfp4_on;
-    /* E2 opt-in (H3_DIT_EPI_FUSE=1): collapse dequant→FP32 round-trip→requant
-     * pairs. Requires the R31 epilogue path AND the act_f16 act path. */
-    int epi_fuse = gemm_epi && h3_dit_epi_fuse_wanted() &&
-                   h3_dit_w4a8_act_f16() && ctx->convrot_gs > 0;
-    /* P1 (OUT→FC1 via requant of d_x) is intentionally NOT wired: AdaLN sits
-     * between OUT gate and FC1, so FC1's act source is post-AdaLN d_a, not d_x.
-     * Feeding quantized d_x skipped AdaLN and produced latent NaNs on 238.
-     * Only P2 (FC1 swiglu → FC2) is fused. */
+    /* E2 opt-in (H3_DIT_EPI_FUSE=1): intended to collapse dequant→requant pairs.
+     * Requires R31 gemm_epi + act_f16 + convrot.
+     *
+     * P1 (OUT→FC1) NOT wired: AdaLN sits between OUT gate and FC1; requant of
+     * d_x skipped AdaLN → NaN on 238 (see c003 nan-fix).
+     *
+     * P2 (FC1 swiglu→FC2) skip-ConvRot pre_q is DISARMED: packed weights are
+     * W_rot=W@H, so Y=X@W.T == (X@H)@W_rot.T. Feeding quant(X) into pre_q
+     * (skip act ConvRot) computes quant(X)@W_rot.T ≠ baseline. DESIGN §3
+     * equated those; host Hadamard proof + 238 fuse↔ctrl latent rel_l2≈1.49
+     * refute it. Keep env bit for logging; do not arm requant_mode/pre_q until
+     * an in-kernel ConvRot+requant redesign. Default remains OFF. */
+    int epi_fuse_req = gemm_epi && h3_dit_epi_fuse_wanted() &&
+                       h3_dit_w4a8_act_f16() && ctx->convrot_gs > 0;
+    const int epi_fuse = 0; /* armed path unreachable without ConvRot-in-kernel */
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
     h3_cuda_dit_gemm_epi epi;
@@ -3382,10 +3389,12 @@ static int block_phase_out_mlp(
         fused_logged = 1;
         fprintf(stderr,
                 "dit_fused_epi: %s gate_adaln=%d gemm_epi=%d lora=%d scale=%.4g "
-                "overlap=%d epi_fuse=%d nvfp4=%d\n",
+                "overlap=%d epi_fuse_req=%d epi_fuse=%d (P2 skip-ConvRot "
+                "DISARMED) nvfp4=%d\n",
                 fused ? "on" : "off", fused ? 1 : 0, gemm_epi ? 1 : 0,
                 ctx->lora ? 1 : 0, ctx->lora ? ctx->lora->scale : 0.0,
-                ctx->lora ? h3_dit_w4a8_lora_overlap() : 0, epi_fuse ? 1 : 0,
+                ctx->lora ? h3_dit_w4a8_lora_overlap() : 0,
+                epi_fuse_req ? 1 : 0, epi_fuse ? 1 : 0,
                 ctx->nvfp4_on ? 1 : 0);
         fflush(stderr);
     }

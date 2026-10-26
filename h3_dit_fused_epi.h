@@ -18,9 +18,10 @@ static inline int h3_dit_fused_epilogue_wanted(void) {
     return 1;
 }
 
-/* E2: collapse "dequant(epi) → FP32 round-trip → requant" pairs in the DiT
- * block into single kernels (act source produced + quantized in one launch).
- * opt-in, default 0 (zero behavior change): H3_DIT_EPI_FUSE=1. */
+/* E2: intended to collapse "dequant(epi) → FP32 round-trip → requant" pairs
+ * in the DiT block. opt-in, default 0: H3_DIT_EPI_FUSE=1.
+ * 2026-10-27: P2 skip-ConvRot arm is DISARMED in h3_dit_w4a8.c (invalid with
+ * packed W_rot). Env bit still readable for tests/logging; no numerical change. */
 static inline int h3_dit_epi_fuse_wanted(void) {
     const char *e = getenv("H3_DIT_EPI_FUSE");
     return e && e[0] == '1' && e[1] == '\0';
