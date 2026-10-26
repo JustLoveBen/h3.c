@@ -52,6 +52,20 @@ H3_FEWSTEP_PRESET=pdmd2 ./h3_cuda_generate ... --lora /path/pdmd_2NFE_lora.safet
 make h3_fewstep_contract_test && ./h3_fewstep_contract_test
 ```
 
+## 离线日志协议检
+
+`tools/p0_protocol_check_log.py` 识别 `fewstep_preset` / `fewstep_contract` / `fewstep_bound` / `sampler:` 行：
+
+```bash
+python3 tools/p0_protocol_check_log.py --self-test
+python3 tools/p0_protocol_check_log.py --arm fewstep --expect-fewstep pdmd4 "$OUT/generate.log"
+python3 tools/p0_protocol_check_log.py --arm fewstep --expect-fewstep dmad4 "$OUT/generate.log"
+```
+
+P0 臂（`--arm int8|nvfp4`）若日志里冒出 fewstep 行会 WARN（臂隔离）；`--expect-fewstep=none` 则硬拒。
+
+**Metal `h3` CLI 不接** `--fewstep-preset`（无 LoRA / sampler 路径）；少步验收只走 `h3_cuda_generate`。
+
 ## 非目标
 
 - 不改 turbo4 语义；不提交 NVFP4 chain WIP；不在 238 跑生成。  
