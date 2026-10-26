@@ -205,3 +205,19 @@ Code forces `epi_fuse=0` even when env=1; log shows `epi_fuse_req` + `DISARMED`.
 ### Verdict
 **Boundary landed.** Skip-ConvRot P2 unreachable for quality; disarmed; waffle PASS as ctrl-equivalent. Do **not** default-on; do **not** claim E2 speedup. C004 still blocked. Human visual list unchanged for aesthetic review of prior fuse mp4s (historical wrong path) — current disarm mp4s match ctrl.
 
+## Addendum — C070 FORBID + dit_format annotate (238 · SHA `e40d649`)
+
+Tree: `/mnt/nvme1n1/workspace/h3_c_main_20261027` · bin sha256 `e1a51be0…` (post-rsync rebuild BUILD_RC=0).  
+`H3_DIT_NVFP4_CHAIN` unset · `H3_DIT_EPI_FUSE` unset · disk still ~99%/58G free · **no wipe**.
+
+Out: `out/c070_forbid_smoke_20261027/{int8_forbid,nvfp4_format}/`
+
+| arm | env | steps | RUN_RC | dit_format line | notes |
+| --- | --- | ---: | ---: | --- | --- |
+| int8_forbid | `H3_FORBID_HOT_SYNC=1` | 4 | **0** | `INT8 ConvRot (theme-follow path)` | env contract prints FORBID; no HOT abort; mux ~1.4MB; phase total≈22.6s |
+| nvfp4_format | FORBID=1 + `H3_DIT_NVFP4=1` + sidecar | 4 | **0** | `NVFP4 (H3_DIT_NVFP4=1 GEMM track; weight_store=INT8 ConvRot)` | **PROTO_OK** (prior WARN on INT8 dit_format gone) |
+
+### Verdict
+- **C070:** opt-in forbid **landed + 238 smoke PASS** (generate completes under FORBID=1).
+- **dit_format:** NVFP4 arm no longer misreports as INT8-only; protocol check clean.
+- Visual/quality of NVFP4 arm unchanged → still **BLOCK** (see OR review); chain WIP still untouched / not committed.
