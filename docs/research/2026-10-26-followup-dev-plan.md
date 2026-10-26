@@ -117,6 +117,9 @@
 9f. [x] **∥ 同配置 waffle 接缝门**：[`2026-10-26-waffle-same-config-gate.md`](2026-10-26-waffle-same-config-gate.md) + 离线脚本（禁跨配置比）。
 9g. [x] **∥ Metal/CUDA fewstep 边界 + TODO 表**：[`2026-10-26-fewstep-metal-boundary.md`](2026-10-26-fewstep-metal-boundary.md)。
 
+9h. [x] **∥ fewstep 合同 JSON 表 + schema + dump/validate**；共享 `--fewstep-*` help 抽到 `h3_fewstep_help_fprint`（不碰脏 `h3_cuda_generate.c`）。
+9i. [x] **∥ turbo4×fewstep 禁配日志检** `tools/fewstep_forbidden_combo_check.py`；P0 runbook §4.3.1 接 waffle 同配置门示例。
+
 ---
 
 ## 7. 相关文档
@@ -152,3 +155,4 @@
 
 | 2026-10-26 | 离线：TE checksum + P0 硬门扩展 + fewstep audio-env 冲突文案；未开 238 / 未碰链式 WIP。 |
 | 2026-10-26 | 离线：`make fewstep_host_tests` + waffle 同配置门 + Metal 边界 TODO；commit 后 push。 |
+| 2026-10-26 | 离线：合同 JSON/schema、共享 fewstep help、禁配日志检、P0 waffle 接缝示例；commit 后 push。 |

@@ -196,7 +196,30 @@ python3 tools/p0_protocol_check_log.py --arm nvfp4 \
 - **768×1344：** block_ratio 门已知对 AI 768p 误报；人审优先，waffle 只作同配置回归备忘。  
 - 若 INT8 金线自己也全面 `INVALID_LOWENERGY`，记「门失效」而非「NVFP4 独有失败」。
 
----
+#### 4.3.1 同配置接缝门（离线脚本）
+
+真机跑完两份同协议 `generate.log` 后，用 [`tools/waffle_same_config_gate.py`](../../tools/waffle_same_config_gate.py) 做接缝 / 回归（**不**跨臂）：
+
+```bash
+# 先协议门
+python3 tools/p0_protocol_check_log.py --arm int8 \
+  --expect-seed 0x76800002 --expect-skip-audio --expect-live-te \
+  "$OUT_ROOT/int8_1/generate.log"
+python3 tools/p0_protocol_check_log.py --arm int8 \
+  --expect-seed 0x76800002 --expect-skip-audio --expect-live-te \
+  "$OUT_ROOT/int8_2/generate.log"
+
+# 同臂冷热 / 今日 vs 昨日 binary（META 必须一致）
+python3 tools/waffle_same_config_gate.py \
+  "$OUT_ROOT/int8_1/generate.log" "$OUT_ROOT/int8_2/generate.log"
+
+# NVFP4 只与同臂二次跑比，禁止 int8_1 vs nvfp4_1
+python3 tools/waffle_same_config_gate.py \
+  "$OUT_ROOT/nvfp4_1/generate.log" "$OUT_ROOT/nvfp4_2/generate.log"
+```
+
+细节与阈值：[`2026-10-26-waffle-same-config-gate.md`](2026-10-26-waffle-same-config-gate.md)。`make fewstep_host_tests` 含 `--self-test`。
+
 
 ## 5. 明确不要做
 
@@ -238,3 +261,4 @@ python3 tools/p0_protocol_check_log.py --arm nvfp4 \
 | --- | --- |
 | 2026-10-26 | 初稿。 |
 | 2026-10-26 | 注明 238 Phase A/B 未开跑；链到 followup §2.1。 |
+| 2026-10-26 | §4.3.1 接上 `waffle_same_config_gate.py` 示例命令。 |

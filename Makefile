@@ -20,6 +20,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 .PHONY: all test parity real-parity clean h3_w4a8_probe h3_dit_int8_probe \
 	h3_st_inventory h3_w4a8_matmul_probe h3_w4a8_blocks_probe \
 	h3_fewstep_contract_test h3_sampler_test dump_fewstep_student_grid \
+	dump_fewstep_contracts print_fewstep_help \
 	h3_waffle_test fewstep_host_tests
 
 all: h3 libh3.a
@@ -63,6 +64,17 @@ dump_fewstep_student_grid: tools/dump_fewstep_student_grid.c h3_fewstep_contract
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/dump_fewstep_student_grid.c \
 		h3_fewstep_contract.c -lm
 
+# Machine-readable fewstep contract table (JSON) + shared --help text.
+dump_fewstep_contracts: tools/dump_fewstep_contracts.c h3_fewstep_contract.c \
+		h3_fewstep_contract.h tests/fixtures/fewstep_contracts.json
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/dump_fewstep_contracts.c \
+		h3_fewstep_contract.c -lm
+
+print_fewstep_help: tools/print_fewstep_help.c h3_fewstep_contract.c \
+		h3_fewstep_contract.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tools/print_fewstep_help.c \
+		h3_fewstep_contract.c -lm
+
 # Host-only LCM+re-noise sampler math (no Metal/CUDA).
 h3_sampler_test: tests/test_h3_sampler.c h3_sampler.c h3_sampler.h
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -o $@ tests/test_h3_sampler.c \
@@ -76,12 +88,20 @@ h3_waffle_test: tests/test_h3_waffle.c h3_waffle.c h3_waffle.h
 # CI-ish: all offline fewstep / sampler / waffle host checks (no GPU).
 # See docs/research/2026-10-26-fewstep-metal-boundary.md
 fewstep_host_tests: h3_fewstep_contract_test h3_sampler_test \
-		dump_fewstep_student_grid h3_waffle_test
+		dump_fewstep_student_grid dump_fewstep_contracts print_fewstep_help \
+		h3_waffle_test
 	./h3_fewstep_contract_test
 	./h3_sampler_test
 	./dump_fewstep_student_grid >/dev/null
+	./dump_fewstep_contracts --check tests/fixtures/fewstep_contracts.json
+	./print_fewstep_help | grep -q -- '--fewstep-contract'
+	./print_fewstep_help | grep -q -- '--fewstep-preset'
+	./print_fewstep_help | grep -q -- 'lcm_renoise'
 	./h3_waffle_test
 	python3 tools/waffle_same_config_gate.py --self-test
+	python3 tools/fewstep_contracts_validate.py --self-test
+	python3 tools/fewstep_forbidden_combo_check.py --self-test
+	python3 tools/p0_protocol_check_log.py --self-test
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

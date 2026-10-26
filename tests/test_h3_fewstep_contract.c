@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int fails;
 
@@ -354,10 +355,37 @@ int main(void) {
         unsetenv("H3_AUDIO_SIGMA_SHIFT");
     }
 
+    /* Shared help text must mention the three CLI knobs (host; no generate.c). */
+    {
+        char tmp[] = "/tmp/h3_fewstep_help_XXXXXX";
+        int fd = mkstemp(tmp);
+        FILE *tf;
+        char buf[4096];
+        size_t n = 0;
+        expect(fd >= 0, "help mkstemp");
+        if (fd >= 0) {
+            tf = fdopen(fd, "w+");
+            expect(tf != NULL, "help fdopen");
+            if (tf) {
+                h3_fewstep_help_fprint(tf);
+                fflush(tf);
+                rewind(tf);
+                n = fread(buf, 1, sizeof buf - 1, tf);
+                buf[n] = '\0';
+                fclose(tf);
+                unlink(tmp);
+                expect(strstr(buf, "--fewstep-contract") != NULL, "help contract");
+                expect(strstr(buf, "--fewstep-preset") != NULL, "help preset");
+                expect(strstr(buf, "lcm_renoise") != NULL, "help sampler");
+            }
+        }
+    }
+
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);
         return 1;
     }
+
     printf("ok h3_fewstep_contract_test\n");
     return 0;
 }

@@ -2,6 +2,7 @@
 #define H3_FEWSTEP_CONTRACT_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,6 +120,18 @@ void h3_fewstep_preset_print(const h3_fewstep_preset_out *out);
  */
 int h3_fewstep_preset_audio_env_compatible(float want_audio, char *err,
                                            size_t err_size);
+
+/* Shared CLI help for --fewstep-* / --sampler (CUDA generate; host tools).
+ * Keep here so dirty tools/h3_cuda_generate.c WIP need not be staged for help.
+ * Callers may fputs this into --help; Metal CLI does not wire fewstep.
+ */
+void h3_fewstep_help_fprint(FILE *out);
+
+/* Machine-readable contract table for tooling (JSON document).
+ * pretty=1 → indented; pretty=0 → compact single line.
+ */
+void h3_fewstep_contracts_json_fprint(FILE *out, int pretty);
+
 
 #ifdef __cplusplus
 }

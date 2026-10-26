@@ -53,3 +53,10 @@ make fewstep_host_tests
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：Metal/CUDA 边界 + TODO 表 + `make fewstep_host_tests`。 |
+
+## Offline tooling (2026-10-26)
+
+- Shared help: `h3_fewstep_help_fprint` / `./print_fewstep_help`
+- Contract JSON: `tests/fixtures/fewstep_contracts.json` + `./dump_fewstep_contracts`
+- Forbidden turbo4×fewstep log grep: `tools/fewstep_forbidden_combo_check.py`
+

@@ -495,3 +495,112 @@ int h3_fewstep_preset_audio_env_compatible(float want_audio, char *err,
     }
     return 1;
 }
+
+
+void h3_fewstep_help_fprint(FILE *out) {
+    if (!out)
+        out = stderr;
+    fputs(
+        "  --fewstep-contract pdmd4|pdmd2|dmad4\n"
+        "      少步合同自检（或 H3_FEWSTEP_CONTRACT）。未设=off。\n"
+        "      错 steps/shift/preset(turbo4)/sampler 硬 FAIL。\n"
+        "      dmad4 需要 --sampler lcm_renoise（未显式设时自动选）。\n"
+        "      H3_AUDIO_SIGMA_SHIFT=2；H3_FEWSTEP_STRICT=1；\n"
+        "      H3_FEWSTEP_ALLOW_NVFP4=1。\n"
+        "  --fewstep-preset pdmd4|pdmd2|dmad4\n"
+        "      一键绑合同：steps/cfg/shift/sampler/--fewstep-contract。\n"
+        "      或 H3_FEWSTEP_PRESET=。勿与 --preset turbo4/taomate 叠。\n"
+        "      pdmd4: 4-step Euler shift 12/3 cfg1；pdmd2: 2-step；\n"
+        "      dmad4: 4-step lcm_renoise shift 12/2 cfg1。\n"
+        "      仍须 --lora 原件；显式 --steps/--cfg/--sampler 优先。\n"
+        "  --sampler velocity_euler|lcm_renoise\n"
+        "      或 H3_SAMPLER=。默认 velocity_euler。\n"
+        "      lcm_renoise = Comfy lcm+simple（DMAD 合同）。\n"
+        "      别名：euler / lcm / lcm+simple。\n",
+        out);
+    fflush(out);
+}
+
+void h3_fewstep_contracts_json_fprint(FILE *out, int pretty) {
+    /* Canonical table; keep in sync with check_early / preset_apply. */
+    static const char *pretty_doc =
+        "{\n"
+        "  \"schema_version\": 1,\n"
+        "  \"source\": \"h3_fewstep_contract\",\n"
+        "  \"forbidden_speed_presets\": [\"turbo4\", \"taomate\", \"fast4\"],\n"
+        "  \"notes\": {\n"
+        "    \"nvfp4_cross\": \"default FAIL unless H3_FEWSTEP_ALLOW_NVFP4=1\",\n"
+        "    \"pdmd2_audio\": \"paper=3 lookfeel=6; STRICT fails other\",\n"
+        "    \"metal_cli\": \"Metal h3 does not wire fewstep\"\n"
+        "  },\n"
+        "  \"contracts\": [\n"
+        "    {\n"
+        "      \"id\": \"pdmd4\",\n"
+        "      \"nfe\": 4,\n"
+        "      \"steps\": 4,\n"
+        "      \"sampler\": \"velocity_euler\",\n"
+        "      \"sampler_aliases\": [\"euler\"],\n"
+        "      \"video_shift\": 12.0,\n"
+        "      \"audio_shift\": 3.0,\n"
+        "      \"audio_shift_alt\": [],\n"
+        "      \"cfg\": 1.0,\n"
+        "      \"want_lcm_renoise\": false,\n"
+        "      \"lora_required\": true,\n"
+        "      \"sigma_schedule\": \"student_grid\"\n"
+        "    },\n"
+        "    {\n"
+        "      \"id\": \"pdmd2\",\n"
+        "      \"nfe\": 2,\n"
+        "      \"steps\": 2,\n"
+        "      \"sampler\": \"velocity_euler\",\n"
+        "      \"sampler_aliases\": [\"euler\"],\n"
+        "      \"video_shift\": 12.0,\n"
+        "      \"audio_shift\": 3.0,\n"
+        "      \"audio_shift_alt\": [6.0],\n"
+        "      \"cfg\": 1.0,\n"
+        "      \"want_lcm_renoise\": false,\n"
+        "      \"lora_required\": true,\n"
+        "      \"sigma_schedule\": \"student_grid\"\n"
+        "    },\n"
+        "    {\n"
+        "      \"id\": \"dmad4\",\n"
+        "      \"nfe\": 4,\n"
+        "      \"steps\": 4,\n"
+        "      \"sampler\": \"lcm_renoise\",\n"
+        "      \"sampler_aliases\": [\"lcm\", \"lcm+simple\"],\n"
+        "      \"video_shift\": 12.0,\n"
+        "      \"audio_shift\": 2.0,\n"
+        "      \"audio_shift_alt\": [],\n"
+        "      \"cfg\": 1.0,\n"
+        "      \"want_lcm_renoise\": true,\n"
+        "      \"lora_required\": true,\n"
+        "      \"sigma_schedule\": \"student_grid\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n";
+    static const char *compact_doc =
+        "{\"schema_version\":1,\"source\":\"h3_fewstep_contract\","
+        "\"forbidden_speed_presets\":[\"turbo4\",\"taomate\",\"fast4\"],"
+        "\"notes\":{\"nvfp4_cross\":\"default FAIL unless H3_FEWSTEP_ALLOW_NVFP4=1\","
+        "\"pdmd2_audio\":\"paper=3 lookfeel=6; STRICT fails other\","
+        "\"metal_cli\":\"Metal h3 does not wire fewstep\"},"
+        "\"contracts\":["
+        "{\"id\":\"pdmd4\",\"nfe\":4,\"steps\":4,\"sampler\":\"velocity_euler\","
+        "\"sampler_aliases\":[\"euler\"],\"video_shift\":12.0,\"audio_shift\":3.0,"
+        "\"audio_shift_alt\":[],\"cfg\":1.0,\"want_lcm_renoise\":false,"
+        "\"lora_required\":true,\"sigma_schedule\":\"student_grid\"},"
+        "{\"id\":\"pdmd2\",\"nfe\":2,\"steps\":2,\"sampler\":\"velocity_euler\","
+        "\"sampler_aliases\":[\"euler\"],\"video_shift\":12.0,\"audio_shift\":3.0,"
+        "\"audio_shift_alt\":[6.0],\"cfg\":1.0,\"want_lcm_renoise\":false,"
+        "\"lora_required\":true,\"sigma_schedule\":\"student_grid\"},"
+        "{\"id\":\"dmad4\",\"nfe\":4,\"steps\":4,\"sampler\":\"lcm_renoise\","
+        "\"sampler_aliases\":[\"lcm\",\"lcm+simple\"],\"video_shift\":12.0,"
+        "\"audio_shift\":2.0,\"audio_shift_alt\":[],\"cfg\":1.0,"
+        "\"want_lcm_renoise\":true,\"lora_required\":true,"
+        "\"sigma_schedule\":\"student_grid\"}"
+        "]}\n";
+    if (!out)
+        out = stdout;
+    fputs(pretty ? pretty_doc : compact_doc, out);
+    fflush(out);
+}

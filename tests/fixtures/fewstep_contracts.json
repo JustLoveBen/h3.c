@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "source": "h3_fewstep_contract",
+  "forbidden_speed_presets": ["turbo4", "taomate", "fast4"],
+  "notes": {
+    "nvfp4_cross": "default FAIL unless H3_FEWSTEP_ALLOW_NVFP4=1",
+    "pdmd2_audio": "paper=3 lookfeel=6; STRICT fails other",
+    "metal_cli": "Metal h3 does not wire fewstep"
+  },
+  "contracts": [
+    {
+      "id": "pdmd4",
+      "nfe": 4,
+      "steps": 4,
+      "sampler": "velocity_euler",
+      "sampler_aliases": ["euler"],
+      "video_shift": 12.0,
+      "audio_shift": 3.0,
+      "audio_shift_alt": [],
+      "cfg": 1.0,
+      "want_lcm_renoise": false,
+      "lora_required": true,
+      "sigma_schedule": "student_grid"
+    },
+    {
+      "id": "pdmd2",
+      "nfe": 2,
+      "steps": 2,
+      "sampler": "velocity_euler",
+      "sampler_aliases": ["euler"],
+      "video_shift": 12.0,
+      "audio_shift": 3.0,
+      "audio_shift_alt": [6.0],
+      "cfg": 1.0,
+      "want_lcm_renoise": false,
+      "lora_required": true,
+      "sigma_schedule": "student_grid"
+    },
+    {
+      "id": "dmad4",
+      "nfe": 4,
+      "steps": 4,
+      "sampler": "lcm_renoise",
+      "sampler_aliases": ["lcm", "lcm+simple"],
+      "video_shift": 12.0,
+      "audio_shift": 2.0,
+      "audio_shift_alt": [],
+      "cfg": 1.0,
+      "want_lcm_renoise": true,
+      "lora_required": true,
+      "sigma_schedule": "student_grid"
+    }
+  ]
+}

@@ -56,8 +56,13 @@ waffle: frame=24 b16=0.900 INVALID_LOWENERGY block_ratio=1.2 gate=10.00
 
 ---
 
+## 3b. P0 runbook
+
+命令块与 Phase A/B 接缝见 [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md) §4.3.1。
+
 ## 4. 修订
 
 | 日期 | 说明 |
 | --- | --- |
 | 2026-10-26 | 初稿：离线同配置接缝门 + `--self-test`。 |
+| 2026-10-26 | 链到 P0 runbook §4.3.1 示例。 |
