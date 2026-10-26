@@ -263,6 +263,32 @@ int main(void) {
         expect(strstr(err, "fewstep-preset") != NULL, "bad name msg");
     }
 
+
+    /* --- fewstep-preset vs pre-set H3_AUDIO_SIGMA_SHIFT --- */
+    {
+        unsetenv("H3_AUDIO_SIGMA_SHIFT");
+        expect(h3_fewstep_preset_audio_env_compatible(2.0f, err, sizeof err) ==
+                   1,
+               "audio env unset ok");
+        setenv("H3_AUDIO_SIGMA_SHIFT", "2", 1);
+        expect(h3_fewstep_preset_audio_env_compatible(2.0f, err, sizeof err) ==
+                   1,
+               "audio env match dmad");
+        setenv("H3_AUDIO_SIGMA_SHIFT", "3.0", 1);
+        expect(h3_fewstep_preset_audio_env_compatible(2.0f, err, sizeof err) ==
+                   0,
+               "audio env 3 vs dmad2 fail");
+        expect(strstr(err, "冲突") != NULL, "audio env conflict msg");
+        expect(h3_fewstep_preset_audio_env_compatible(3.0f, err, sizeof err) ==
+                   1,
+               "audio env 3 vs pdmd ok");
+        setenv("H3_AUDIO_SIGMA_SHIFT", "not-a-float", 1);
+        expect(h3_fewstep_preset_audio_env_compatible(3.0f, err, sizeof err) ==
+                   0,
+               "audio env garbage fail");
+        unsetenv("H3_AUDIO_SIGMA_SHIFT");
+    }
+
     if (fails) {
         fprintf(stderr, "%d failure(s)\n", fails);
         return 1;

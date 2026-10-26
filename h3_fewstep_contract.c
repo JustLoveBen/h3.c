@@ -451,3 +451,34 @@ void h3_fewstep_preset_print(const h3_fewstep_preset_out *out) {
            h3_fewstep_contract_name(out->id));
     fflush(stdout);
 }
+
+int h3_fewstep_preset_audio_env_compatible(float want_audio, char *err,
+                                           size_t err_size) {
+    const char *e = getenv("H3_AUDIO_SIGMA_SHIFT");
+    char *endp = NULL;
+    float v;
+    char buf[384];
+
+    if (err && err_size)
+        err[0] = '\0';
+    if (!e || !e[0])
+        return 1;
+    endp = NULL;
+    v = strtof(e, &endp);
+    if (endp == e || !isfinite(v)) {
+        snprintf(buf, sizeof(buf),
+                 "H3_AUDIO_SIGMA_SHIFT='%s' 无法解析；"
+                 "--fewstep-preset 需要 audio_shift=%.3g（请 unset 或设为 %.3g）",
+                 e, (double)want_audio, (double)want_audio);
+        return fail_msg(err, err_size, buf);
+    }
+    if (fabsf(v - want_audio) > 0.051f) {
+        snprintf(buf, sizeof(buf),
+                 "H3_AUDIO_SIGMA_SHIFT=%s 与 --fewstep-preset 要求的 "
+                 "audio_shift=%.3g 冲突（请 unset 或改为 %.3g；"
+                 "pdmd4/pdmd2→3，dmad4→2）",
+                 e, (double)want_audio, (double)want_audio);
+        return fail_msg(err, err_size, buf);
+    }
+    return 1;
+}

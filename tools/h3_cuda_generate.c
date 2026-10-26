@@ -2630,8 +2630,16 @@ int main(int argc, char **argv) {
             cfg_scale = pout.cfg_scale;
             if (!cfg_explicit)
                 cfg_explicit = 1; /* treat as bound so later F2VA default skips */
-            if (pout.set_audio_env && pout.audio_env_value)
+            if (pout.set_audio_env && pout.audio_env_value) {
+                /* setenv(...,0) keeps a pre-set env; refuse wrong shift early. */
+                if (!h3_fewstep_preset_audio_env_compatible(pout.audio_shift,
+                                                            perr,
+                                                            sizeof(perr))) {
+                    fprintf(stderr, "h3: %s\n", perr);
+                    return 1;
+                }
                 setenv("H3_AUDIO_SIGMA_SHIFT", pout.audio_env_value, 0);
+            }
             if (!fewstep_contract_cli || !fewstep_contract_cli[0])
                 fewstep_contract_cli = h3_fewstep_contract_name(pout.id);
             if (!sampler_explicit && pout.want_lcm_renoise) {

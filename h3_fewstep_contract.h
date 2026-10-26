@@ -105,6 +105,15 @@ int h3_fewstep_preset_apply(const h3_fewstep_preset_in *in,
 
 void h3_fewstep_preset_print(const h3_fewstep_preset_out *out);
 
+/*
+ * After --fewstep-preset expands: if H3_AUDIO_SIGMA_SHIFT is already set to a
+ * value that differs from want_audio, FAIL with a clear conflict message.
+ * Unset or matching (eps 0.051) → ok. Call before setenv(..., 0) so a stale
+ * env cannot silently keep the wrong audio shift under a named preset.
+ */
+int h3_fewstep_preset_audio_env_compatible(float want_audio, char *err,
+                                           size_t err_size);
+
 #ifdef __cplusplus
 }
 #endif
