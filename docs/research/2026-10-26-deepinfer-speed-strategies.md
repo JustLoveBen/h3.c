@@ -6,6 +6,10 @@
 > **不做：** 把核名字列成拒绝清单当作分析终点（那是 [`2026-10-07-llm-to-dit-transfer.md`](2026-10-07-llm-to-dit-transfer.md) 的同构裁决）；本文补的是 **策略层**。  
 > **上游：** [DeepInfer](https://github.com/deepseek-ai/DeepInfer)、[deployment QA](https://raw.githubusercontent.com/deepseek-ai/DeepInfer/main/doc/inference_deployment_qa.md)、[ExplainDeepInfer](https://explaindeepinfer.projects.thomaspaul.dev/)、本仓 deeper-pass / takeaways / 加速机理文。
 
+
+
+> **2026-10-27 续：** 源码级思维模式（T01–T14，含文件/开关/坑/Cxxx）见 [`2026-10-27-deepinfer-thinking-to-h3c.md`](2026-10-27-deepinfer-thinking-to-h3c.md)。本文仍是策略抽象权威。
+
 ---
 
 ## 0. 框架校正

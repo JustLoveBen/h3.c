@@ -180,3 +180,12 @@
 
 **本文（roadmap）与 followup-dev-plan 仍是近周执行权威**；全量目录用于「还有没有漏的」与数月排期，不替代 P0 视觉门优先级。
 
+## 11. DeepInfer 思维深挖指针（2026-10-27）
+
+策略层 S1–S12 之外，按源码/部署 QA 拆出的**优化思路**（配置即合同、profile-后切预算、禁热路径 sync、DeferredRelease、量化共设计、少做前向的经济学…）见：
+
+[`2026-10-27-deepinfer-thinking-to-h3c.md`](2026-10-27-deepinfer-thinking-to-h3c.md)
+
+**不改变** §3 P0–P3 执行顺序；该文用于「如何像 DeepInfer 一样做决策」，并映射到 Catalog Cxxx。
+
+

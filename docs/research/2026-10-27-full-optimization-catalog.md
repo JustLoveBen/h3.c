@@ -374,6 +374,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | [`2026-10-26-optimization-roadmap.md`](2026-10-26-optimization-roadmap.md) | 四周优化方案；应链到本文 |
 | [`2026-10-27-additional-optimization-opportunities.md`](2026-10-27-additional-optimization-opportunities.md) | A1–A15 增量扫掠 |
 | [`2026-10-26-deepinfer-speed-strategies.md`](2026-10-26-deepinfer-speed-strategies.md) | S1–S12 |
+| [`2026-10-27-deepinfer-thinking-to-h3c.md`](2026-10-27-deepinfer-thinking-to-h3c.md) | DeepInfer **思维模式** T01–T14 → 文件/开关/Cxxx（非拒绝清单） |
 | [`2026-10-05-acceleration-mechanisms.md`](2026-10-05-acceleration-mechanisms.md) | 族 1–8 |
 | [`2026-10-07-sm120-operator-frontier.md`](2026-10-07-sm120-operator-frontier.md) | E/L/M 原始方案 |
 | [`2026-10-07-deadend-audit-*.md`](2026-10-07-deadend-audit-operators.md) | 关闭项证据 |
@@ -387,6 +388,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 
 | 日期 | 说明 |
 |---|---|
+| 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |
 | 2026-10-27 | 初版：合并 research 目录 + 管线扫掠；五轴 taxonomy；Closed Z*；机会 C001–C099（含占位/交叉）；2–8 周 backlog + 长地平线；CSV 摘要。不跑 GPU；不碰链式 WIP。 |
 
 ---
