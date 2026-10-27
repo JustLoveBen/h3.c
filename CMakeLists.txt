@@ -275,6 +275,16 @@ if(_h3_chain_ok)
   target_compile_definitions(h3_gpu_cuda PUBLIC H3_ENABLE_NVFP4_CHAIN=1)
 else()
   message(STATUS "NVFP4 chain (P4.2): OFF (CUTLASS not found; set H3_CUTLASS_DIR)")
+  # Stub TU provides h3_cutlass_nvfp4_fc1_f32_run / h3_nvfp4_swiglu_requant_dev
+  # so h3_dit_w4a8.c still links when H3_ENABLE_NVFP4_CHAIN is unset (Ada/4090).
+  add_library(h3_dit_nvfp4_chain_stub STATIC h3_dit_nvfp4_chain.cu)
+  target_include_directories(h3_dit_nvfp4_chain_stub PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  set_target_properties(h3_dit_nvfp4_chain_stub PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(h3_dit_nvfp4_chain_stub PUBLIC CUDA::cudart)
+  target_link_libraries(h3_gpu_cuda PUBLIC h3_dit_nvfp4_chain_stub)
 endif()
 
 if(H3_ENABLE_CUDNN)
