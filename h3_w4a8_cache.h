@@ -136,7 +136,8 @@ int h3_w4a8_cache_refit_after_workspace(h3_w4a8_cache *cache, char *error,
  * Used before a large activation workspace (true 5s/10s seq) so overlap
  * prefetch of a 41-block window cannot starve DiT rope/act/cuDNN.
  * No-op after freeze_window (cafe p0: make_room after step 1 dropped 29→16).
- * H3_DIT_INT8_ALLOW_SHRINK=1 re-enables eviction. */
+ * H3_DIT_INT8_ALLOW_SHRINK=1 re-enables eviction.
+ * H3_DIT_INT8_WINDOW=N (8..50) caps residence (C041 probe; unset=off). */
 int h3_w4a8_cache_make_room(h3_w4a8_cache *cache, size_t keep_free_bytes,
                             char *error, size_t error_size);
 

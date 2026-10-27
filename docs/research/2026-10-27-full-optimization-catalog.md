@@ -186,7 +186,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
 | **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 + delta | deadend-memory 条目1；A2；`H3_VRAM_LEDGER`；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **landed+**（480p+768p@4090；768 peak_dit≈22.7GiB no OOM；见 [`c040-768p`](2026-10-28-c040-768p-ledger.md)）（480p buckets+delta @4090；peak_dit≈22.4GiB；768p probe仍可选） | S2 | C015/C041/C043 按 ~0.8GiB headroom 决策 |
-| **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **idea** | S2 | 一次性实验，不解默认 |
+| **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **probed**（480p@4090；Euler peak −3.1GiB；默认不变；[`c041`](2026-10-28-c041-window24-probe.md)） | S2 | 默认不变；opt-in sol headroom |
 | **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2 | VRAM高 | C040 | **idea** | S2 | waffle 非 bit-identical |
 | **C043** | DiT | Layerwise weight streaming | 权重按层驻留+prefetch | transfer 4.3；SGLang −30GB 指针 | VRAM高 WC中性~负 | C040；视觉后 | **idea** | S1/S2 | 768p 全序列能力优先 |
 | **C044** | DiT | NVFP4 权重体积治本 | 与 C001 同刀显存维 | sm120 M1 | VRAM高 | C001 | **blocked** | S4 | 视觉门绑定 |
@@ -352,7 +352,7 @@ C030,B,fewstep,PDMD-4NFE GPU accept,landed-visual-OR,S7,done-dev
 C031,B,fewstep,DMAD lcm_renoise GPU,landed-visual-OR,S7,done-dev
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
 C040,C,768p,VRAM ledger instrumentation,landed-480p-768p-4090,S2,P2
-C041,C,DiT,window 30to24 probe,idea,S2,P3
+C041,C,DiT,window 30to24 probe,probed-480p-4090,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial-plus-kpi-480p,S1/S9,P1

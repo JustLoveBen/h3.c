@@ -162,6 +162,25 @@ static double cache_now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
+/* C041 probe: optional INT8 weight-window cap (not product default).
+ * H3_DIT_INT8_WINDOW=N (8..50) clamps residence to <=N. Unset = no change. */
+static unsigned h3_dit_int8_window_env_cap(unsigned n) {
+    const char *e = getenv("H3_DIT_INT8_WINDOW");
+    long v;
+    if (!e || !e[0])
+        return n;
+    v = strtol(e, NULL, 10);
+    if (v < 8 || v > 50)
+        return n;
+    if ((unsigned)v < n) {
+        printf("dit_int8_window_cap: H3_DIT_INT8_WINDOW=%ld clamps %u->%ld\n", v, n,
+               v);
+        fflush(stdout);
+        return (unsigned)v;
+    }
+    return n;
+}
+
 void h3_w4a8_cache_config_init(h3_w4a8_cache_config *cfg) {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
@@ -910,6 +929,7 @@ h3_w4a8_cache *h3_w4a8_cache_open(h3_cuda *cuda, h3_w4a8_store *store,
             cache->window_size = cache->max_blocks_fit;
     }
 
+    cache->window_size = h3_dit_int8_window_env_cap(cache->window_size);
     return cache;
 }
 
@@ -1022,6 +1042,7 @@ h3_w4a8_cache *h3_w4a8_cache_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
                (1024.0 * 1024.0 * 1024.0),
            cache->auto_downgraded ? " auto_downgraded=1" : "");
     fflush(stdout);
+    cache->window_size = h3_dit_int8_window_env_cap(cache->window_size);
     cache->open_window_cap = cache->window_size;
     h3_w4a8_cache_log_window(cache, "open");
 
@@ -1134,6 +1155,7 @@ h3_w4a8_cache *h3_w4a8_cache_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
            (double)cache->vram_reserve_bytes / (1024.0 * 1024.0 * 1024.0),
            cache->auto_downgraded ? " auto_downgraded=1" : "");
     fflush(stdout);
+    cache->window_size = h3_dit_int8_window_env_cap(cache->window_size);
     cache->open_window_cap = cache->window_size;
     return cache;
 }
@@ -1235,6 +1257,7 @@ int h3_w4a8_cache_refit_after_workspace(h3_w4a8_cache *cache, char *error,
             if (fit > cache->n_blocks) fit = cache->n_blocks;
         }
     }
+    fit = h3_dit_int8_window_env_cap(fit);
     if (fit == cache->window_size &&
         (fit < cache->n_blocks ||
          cache->effective_policy != H3_W4A8_CACHE_RESIDENT_ALL)) {
@@ -1316,6 +1339,7 @@ void h3_w4a8_cache_set_window_size(h3_w4a8_cache *cache, unsigned n) {
         n = 1;
     if (n > cache->n_blocks)
         n = cache->n_blocks;
+    n = h3_dit_int8_window_env_cap(n);
     cache->window_size = n;
     cache->max_blocks_fit = n;
     cache->effective_policy = H3_W4A8_CACHE_WINDOW;
