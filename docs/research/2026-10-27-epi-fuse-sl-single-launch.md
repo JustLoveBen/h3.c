@@ -71,3 +71,14 @@ Out: `out/c003_epi_fuse_sl_fwht_20261027/` SHA binary `c506524e…` (FWHT-as-def
 - **BIT_ID:** **FAIL** (checksum≠ctrl; std drift). Host `fwht_sl_vs_dense` still PASS on one-shot quant — DiT amplifies float≠dense.  
 - **Fix:** default SL path = **smem-x dense tiled** (ink algebra). FWHT only if `H3_DIT_EPI_FUSE_SL_FWHT=1`. Still default OFF overall (`H3_DIT_EPI_FUSE_SL`).
 
+## Dense-tiled A/B (after FWHT gate, 2026-10-27 Asia/Shanghai)
+
+Binary `f5955dcd…`. Same protocol as FWHT table. `sl_dense_r1`: `H3_DIT_EPI_FUSE_SL=1` **without** `SL_FWHT`.
+
+| arm | dit_ms | checksum | vs ctrl |
+|---|---|---|---|
+| ctrl_r2 | 25200.1 | `0x349ec79e4d1cd0e1` | — |
+| sl_dense_r1 | 32706.1 | `0x349ec79e4d1cd0e1` | **BIT_ID PASS**; WC **+30%** |
+
+Still slower than ctrl (smem-x helps vs naive +46%, not enough). **Default remains OFF.** Next WC lever: fix FWHT float≡dense (or TC/cublas path inside SL) without breaking BIT_ID.
+
