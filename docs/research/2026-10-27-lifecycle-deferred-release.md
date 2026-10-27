@@ -32,3 +32,10 @@ Date: 2026-10-27 (Asia/Shanghai). **No hot-path overlap change.**
 | -1 | Gated / experimental (default skip or arm forbid) |
 
 Real overlap remains gated by existing generate / prewarm logic (e.g. NVFP4 join, `latent_t≥32` skip prefetch, VAE `resident=0` → host-only).
+
+## Changelog
+
+| Date | Note |
+|---|---|
+| 2026-10-27 | Whitelist + `H3_LIFECYCLE_TRACE` landed; no hot-path overlap change. |
+| 2026-10-28 | C064: `H3_DIT_TE_OVERLAP_BLOCKS=N>0` + `H3_DIT_HOST_STAGE_TE=0` opts in TE GPU prefetch for `latent_t≥32` (default still skips). Probe [`2026-10-28-c064-te-overlap-probe`](2026-10-28-c064-te-overlap-probe.md). |

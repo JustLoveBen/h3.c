@@ -204,7 +204,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **landed**（内联；238 generate 日志有 `# H3_ENV_CONTRACT` + FORBID 行） | S9/S11 | 继续强制过检 |
 | **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 + `H3_TE_CACHE_AUTO` | timing；productization；[`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial+ / KPI-closed@480p**（AUTO clip2 te=0 on p10；默认仍 off） | S1/S9/S12 | 默认保持 off；多 prompt 后再议 |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
-| **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h` | VRAM/WC | 真机峰值 | **partial**（白名单+trace landed；真重叠仍门控） | S1 | 安全条件满足再重叠 H2D |
+| **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h`；[`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md) | VRAM/WC | 真机峰值 | **partial+**（Track-A；白名单+trace；`TE_OVERLAP_BLOCKS=N` opt-in @latent_t≥32；4090 ov8 **NO_WC_WIN** vs HOST_STAGE → keep opt-in） | S1 | 勿 default-on；并发 HS+pref 另切片 |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
 | **C066** | 测量 | P0 日志协议 | `p0_protocol_check_log.py` | tools | Q | — | **landed** | S9 | GPU 日志强制过检 |
 | **C067** | 测量 | waffle 同配置门 | 禁跨臂 | waffle-same-config-gate | Q | — | **landed** | S9 | — |
@@ -356,7 +356,7 @@ C041,C,DiT,window 30to24 probe,probed-480p-4090,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial-plus-kpi-480p,S1/S9,P1
-C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
+C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial-plus-trackA-no-wc-win,S1,P2
 C073,D,eval,dump-once score-many conventions,landed-480p-euler8,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed-default-on,fam4,closed-kpi
 C069,D,VAE,VAE RoPE memo+H2D skip,partial-plus,fam4,closed-kpi
@@ -411,6 +411,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
 | 2026-10-27 | 链到 [`deepinfer-thinking-to-h3c`](2026-10-27-deepinfer-thinking-to-h3c.md)：T01–T14 思维深挖；不改 C 表优先级。 |
 | 2026-10-27 | 初版：合并 research 目录 + 管线扫掠；五轴 taxonomy；Closed Z*；机会 C001–C099（含占位/交叉）；2–8 周 backlog + 长地平线；CSV 摘要。不跑 GPU；不碰链式 WIP。 |
+| 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---
 

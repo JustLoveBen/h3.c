@@ -5149,13 +5149,31 @@ int main(int argc, char **argv) {
     /* cafe 5s: do not unpack DiT weights or JIT DiT SDPA during TE.
      * Cross-thread cuDNN graphs (p5a) made step1 slower; GPU prefetch
      * during TE stole VRAM/SM from encode. Multi-slot plans still keep
-     * TE 576 and DiT 16k after encode. H3_DIT_TE_OVERLAP_BLOCKS opts in. */
+     * TE 576 and DiT 16k after encode.
+     * C064: H3_DIT_TE_OVERLAP_BLOCKS=N>0 opts in GPU prefetch even when
+     * latent_t>=32 (default still skips). Mutually exclusive with
+     * H3_DIT_HOST_STAGE_TE (unset/on): set HOST_STAGE_TE=0 to arm overlap. */
     t0 = now_ms();
     if (!skip_dit && !skip_te && te_path) {
-        if (latent_t >= 32)
-            printf("dit_prefetch: skip TE-overlap GPU window (latent_t=%d; "
-                   "leave VRAM for 24fps activations)\n",
-                   latent_t);
+        {
+            const char *ov_gate = getenv("H3_DIT_TE_OVERLAP_BLOCKS");
+            long ov_n = -1;
+            if (ov_gate && ov_gate[0]) {
+                ov_n = strtol(ov_gate, NULL, 10);
+                if (ov_n < 0 || ov_n > 50) ov_n = -1;
+            }
+            if (latent_t >= 32 && !(ov_n > 0))
+                printf("dit_prefetch: skip TE-overlap GPU window (latent_t=%d; "
+                       "leave VRAM for 24fps activations; set "
+                       "H3_DIT_TE_OVERLAP_BLOCKS=N>0 + H3_DIT_HOST_STAGE_TE=0 "
+                       "to opt in)\n",
+                       latent_t);
+            else if (latent_t >= 32 && ov_n > 0)
+                printf("dit_prefetch: C064 opt-in TE-overlap gate "
+                       "latent_t=%d H3_DIT_TE_OVERLAP_BLOCKS=%ld "
+                       "(default skip overridden)\n",
+                       latent_t, ov_n);
+        }
         printf("te_open: %s\n", te_path);
         fflush(stdout);
         if (!h3_nvfp4_store_open(te_path, &te_store, error, sizeof(error))) {
@@ -5182,24 +5200,41 @@ int main(int argc, char **argv) {
                                                     &host_stage_kick_job);
             }
         }
-        if (!skip_dit && overlap && dit && latent_t < 32 && !host_stage_th_ok) {
-            double ignore = 0.0;
-            unsigned win = h3_w4a8_cache_window_size(h3_dit_w4a8_cache(dit));
-            unsigned n_pref = dit_layers;
+        {
             const char *ov = getenv("H3_DIT_TE_OVERLAP_BLOCKS");
+            long ov_n = -1;
+            int want_gpu_pref = 0;
             if (ov && ov[0]) {
-                long v = strtol(ov, NULL, 10);
-                if (v >= 0 && v <= 50) n_pref = (unsigned)v;
+                ov_n = strtol(ov, NULL, 10);
+                if (ov_n < 0 || ov_n > 50) ov_n = -1;
             }
-            if (win > 0 && win < n_pref) n_pref = win;
-            if (n_pref >= 1) {
-                (void)h3_dit_w4a8_prefetch(dit, 0, n_pref, &ignore, error,
-                                           sizeof(error));
-                (void)h3_cuda_event_record_default(cuda, &prefetch_done, error,
-                                                   sizeof(error));
-                printf("dit_prefetch: TE-overlap GPU window blocks=%u "
-                       "latent_t=%d\n",
-                       n_pref, latent_t);
+            /* Default: only when latent_t<32. C064: explicit N>0 overrides. */
+            if (ov_n > 0)
+                want_gpu_pref = 1;
+            else if (latent_t < 32)
+                want_gpu_pref = 1;
+            if (!skip_dit && overlap && dit && want_gpu_pref &&
+                !host_stage_th_ok) {
+                double ignore = 0.0;
+                unsigned win = h3_w4a8_cache_window_size(h3_dit_w4a8_cache(dit));
+                unsigned n_pref = dit_layers;
+                if (ov_n > 0)
+                    n_pref = (unsigned)ov_n;
+                if (win > 0 && win < n_pref) n_pref = win;
+                if (n_pref >= 1) {
+                    (void)h3_dit_w4a8_prefetch(dit, 0, n_pref, &ignore, error,
+                                               sizeof(error));
+                    (void)h3_cuda_event_record_default(cuda, &prefetch_done,
+                                                       error, sizeof(error));
+                    printf("dit_prefetch: TE-overlap GPU window blocks=%u "
+                           "latent_t=%d ov_env=%ld\n",
+                           n_pref, latent_t, ov_n);
+                    fflush(stdout);
+                }
+            } else if (ov_n > 0 && host_stage_th_ok) {
+                printf("dit_prefetch: TE-overlap requested but host_stage "
+                       "armed; set H3_DIT_HOST_STAGE_TE=0 to use GPU "
+                       "prefetch (mutual exclusive)\n");
                 fflush(stdout);
             }
         }

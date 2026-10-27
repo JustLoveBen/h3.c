@@ -51,7 +51,8 @@ static const h3_lifecycle_whitelist_row k_h3_lifecycle_whitelist[] = {
      "Non-gold: dequant realloc UAF if overlapped; must join"},
     {"DiT TE GPU prefetch", "TE encode (opt)", "stream wait before DiT",
      "cuda event prefetch_done", -1,
-     "H3_DIT_TE_OVERLAP_BLOCKS; latent_t>=32 default skip"},
+     "H3_DIT_TE_OVERLAP_BLOCKS=N>0 + HOST_STAGE_TE=0 opts in; "
+     "latent_t>=32 default skip (C064)"},
     {"DiT INT8 resident_all W", "DiT step0 upload", "after DiT / cache policy",
      "-", 0, "Do not prefill VAE device-W over resident peak"},
     {"VAE prewarm host mmap/hostreg", "kick_vae_prewarm (last-NFE default)",
