@@ -270,10 +270,11 @@
 
 #### 栈 S0 — 今日可卖（已落地）
 
-- DiT：**INT8 ConvRot** + **cuDNN SDPA**  
+- DiT：**INT8 ConvRot** + **cuDNN SDPA** + **C015 act-FP16 stage default ON** (`b99d56b`)  
 - 轨迹：**DMAD-4**（速度）或 **Euler-8**（质量金线）  
+- VRAM opt-in：`H3_DIT_INT8_WINDOW=24`（C041；sol 必需）  
 - 卫生：TE HIT / RoPE memo / C073 dump-replay 可复现  
-- 远脸：抬画布 SKU（PDMD/DMAD≤1152；Euler@1344），**不** FaceRefine  
+- 远脸：抬画布 SKU（[`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md)：DMAD≤1152；Euler@1344），**不** FaceRefine  
 
 #### 栈 S1 — Track A 下一装船包（目标：同合同墙钟↓ 或 VRAM↑，waffle/BIT_ID）
 
@@ -289,10 +290,13 @@
 
 #### 栈 S2 — Track B 质量/速度 Pareto（opt-in，显式下限）
 
+**Packaged recipe:** [`track-b-s2-sellable-recipe`](2026-10-28-track-b-s2-sellable-recipe.md) + `tools/h3_track_b_s2_env.sh`. **Product SDPA default remains cudnn.**
+
 | 层 | 选择 | 门 |
 | --- | --- | --- |
 | 少步 | 保持 DMAD；研究臂 PDMD 同日对照 | fewstep-contract + 人眼运动 |
-| 注意力 | **仅当** lib 武装后：`sol_cute` + `FIRST_DENSE_LAYERS=2`（优先于 STEPS） | waffle ≤ dense+δ；人眼无首尾糊；dit 仍明显快于 dense |
+| 注意力 | **仅当** lib 武装后：`sol_cute` + `FIRST_DENSE_LAYERS=2` + **window=24**（优先于 STEPS） | G1 PASS；waffle ≤ dense+δ；人眼无首尾糊；dit 仍明显快于 dense |
+| VRAM | C015 default ON + C041 window=24 | sol headroom；勿窗41+sol |
 | 抛光 | `H3_REFINER_LORA` 末 1–2 步 · scale∈{0.5,0.7} | 过饱和↓、无全局糊；收益 ≥ 半档抬画布才产品化 |
 | 空间 | 抬画布 / 二采正式 SKU | face-px + 可辨五官 |
 | 训练演进 | 稀疏感知学生 / SLA（非 FastH3 权） | 新合同；RAFT/运动指标 ≥ dense 少步基线 |
@@ -388,3 +392,4 @@
 | 2026-10-28 | **§G 增补：** sol-h3 / FastH3 / VDN / TaoMate / DMD 族竞品吸收 → Track A/B 映射 → shippable 栈 S0–S3 → Exp-G1…G6 可证伪门。分析-only。 |
 | 2026-10-28 | **Exp-G3 FAIL**：C018/C019 stale closed；C015 dig+；[`deepseek-derived-track-a-status`](2026-10-28-deepseek-derived-track-a-status.md)。 |
 | 2026-10-28 | **Exp-G1 PASS（护栏）**：4090 DMAD-4 sol LAYERS=2 vs cudnn；全稀疏 FAIL；默认不改。[`exp-g1`](2026-10-28-exp-g1-sol-guard-vs-cudnn-dmad4-4090.md)。 |
+| 2026-10-28 | S2 recipe packaged + raise-canvas SKU policy；C015 default ON 并入 S0。 |

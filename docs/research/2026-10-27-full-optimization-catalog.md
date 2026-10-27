@@ -186,7 +186,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
 | **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 + delta | deadend-memory 条目1；A2；`H3_VRAM_LEDGER`；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **landed+**（480p+768p@4090；768 peak_dit≈22.7GiB no OOM；见 [`c040-768p`](2026-10-28-c040-768p-ledger.md)）（480p buckets+delta @4090；peak_dit≈22.4GiB；768p probe仍可选） | S2 | C015/C041/C043 按 ~0.8GiB headroom 决策 |
-| **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **probed**（480p@4090；Euler peak −3.1GiB；默认不变；[`c041`](2026-10-28-c041-window24-probe.md)） | S2 | 默认不变；opt-in sol headroom |
+| **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ②；[`s2-recipe`](2026-10-28-track-b-s2-sellable-recipe.md) | VRAM中 WC可能负 | C040 | **probed**（480p@4090；Euler peak −3.1GiB；默认不变；[`c041`](2026-10-28-c041-window24-probe.md)） | S2 | opt-in；**required** for Track-B sol |
 | **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2；[`default-on`](2026-10-28-c015-default-on-decision.md) | VRAM高 | C040 | **default ON**（同 C015） | S2 | shipped |
 | **C043** | DiT | Layerwise weight streaming | 权重按层驻留+prefetch | transfer 4.3；[`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md) | — | — | **stale closed (covered by window+C041)** | S1/S2 | 勿新建；用 C041/C015 杠杆 |
 | **C044** | DiT | NVFP4 权重体积治本 | 与 C001 同刀显存维 | sm120 M1 | VRAM高 | C001 | **blocked** | S4 | 视觉门绑定 |
@@ -421,6 +421,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-28 | **C016 CLOSED** NO_WC_WIN/HW_UNAVAILABLE@4090（CC 8.9；无 cublasLt PDL）；next DeepSeek **C043 streaming dig**. |
 | 2026-10-28 | **C043 CLOSED** covered-by-window+C041；next DeepSeek **C015 default-on decision dig**. |
 | 2026-10-28 | **C015/C042 default ON** after decision dig (multi-prompt waffle+warm WC+Euler −1.41 GiB). |
+| 2026-10-28 | Track-B **S2 recipe packaged** (window24+sol LAYERS=2 opt-in; cudnn default unchanged) + raise-canvas SKU policy doc. |
 | 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---
@@ -452,3 +453,17 @@ C081,E,serving,continuous batching,defer,S3,defer
 - **C030/C031:** unchanged (PDMD-4 preferred over DMAD-4).
 
 - **C003 EPI_FUSE_INK:** partial landed (`H3_DIT_EPI_FUSE_INK`, default OFF). See `2026-10-27-epi-fuse-ink-partial.md`.
+
+
+## Shipped this round (2026-10-28 · Asia/Shanghai)
+
+| track | item | SHA / evidence | product default? |
+|---|---|---|---|
+| **A** | **C015/C042** act-FP16 stage | `b99d56b` decision dig YES；Euler −1.41 GiB；multi-prompt waffle PASS | **ON** (opt-out `H3_DIT_ACT_FP16_STAGE=0`) |
+| **A** | C011 / C016 / C043 / C018 / C019 | closed (NO_WC_WIN / HW / covered / Exp-G3) | n/a — do not reopen |
+| **B** | **S2 sellable recipe** packaged | G1 PASS sol LAYERS=2 @`eb805b4`；doc+`tools/h3_track_b_s2_env.sh` | **NO** — cudnn stays；opt-in sol+window24 |
+| **B** | C041 window=24 | probed；required under S2 sol | **NO** — opt-in |
+| product | Raise-canvas SKU policy | [`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md) DMAD≤1152 / Euler@1344 | policy doc only |
+
+**User-facing one-liners:** see [`track-b-s2-sellable-recipe`](2026-10-28-track-b-s2-sellable-recipe.md).
+
