@@ -134,6 +134,18 @@ $BIN ... --width 864 --height 480 --steps 16 --cfg 1 ...
 | 未跑 | 1344×768；steps=16 负对照 |
 | 人眼（t=2.5s 单帧 + 成片） | PDMD 与 Euler-8 **不是同轨迹**（同 seed 构图/身份会漂，属合同差异）。相对 Euler-8：PDMD-4 **暖 DiT 约 −37%**（17.1 vs 27.2s）；发丝/下颌边缘 smear **有减轻、未清零**。960 PDMD 主脸锐度优于 480 Euler；小脸仍靠抬画布为主因。 |
 
+### 5.1 高分抬画布（1344×768 / 1152×640，同日续跑）
+
+| 臂 | dit_ms | WALL | INT8 cache | waffle mean_b16 | 观感 |
+| --- | ---: | ---: | --- | ---: | --- |
+| **PDMD-4 1344×768** | 60727 | 104.9s | **window=6**（auto_downgraded） | **9.25** | **FAIL 噪声马赛克**（非 OOM；RUN_RC=0 但不可用）。成片已标 `_FAIL_NOISE` |
+| Euler-8 1344×768 | 105744 | 142.9s | window=17 | 0.637 | PASS；主脸可辨、细节明显高于 480 |
+| **PDMD-4 1152×640** | 37005 | 74.2s | window=18 | 0.742 | PASS；脸细节优于 960-PDMD，弱于 1344-Euler |
+| 1280×720 | — | — | — | — | CLI 拒：`pixel % 32 == 0`（720 不合） |
+
+**结论：** 4090 24G 上 PDMD+1344 会把 INT8 resident 压到 window≈6，成片噪声；**可用高分 PDMD 上限约 1152×640**。同 1344 的小脸预算用 **Euler-8** 能出片（更慢）。产物：`~/grokbot-share/ghost_fix_ab_20261027/talking_head_{1344x768_pdmd4_FAIL_NOISE,1344x768_s8,1152x640_pdmd4}.mp4`。
+
+
 ## 6. 给产品的一句话
 
 - **虚影：** 先当 **8-step + 480p 的时间/空间预算问题**，不要当成 INT8 坏权或 4090 flash 回退。
