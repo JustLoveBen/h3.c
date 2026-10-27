@@ -1553,20 +1553,60 @@ void h3_dit_w4a8_release_block_workspace(h3_dit_w4a8 *ctx) {
 }
 
 /* Keep in sync with h3_dit_w4a8_layers_forward_f32 all-aux `need`. */
+/* C015: env request (may still refuse at pack if U>1 / nvfp4 / !fused_epi). */
+static int dit_fp16_stage_env(void) {
+    const char *e = getenv("H3_DIT_ACT_FP16_STAGE");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+/* C015 arm: pack/phase use F16 d_qkv (+ F16 d_wide when !lora). */
+static int dit_fp16_stage_pack(const h3_dit_w4a8 *ctx) {
+    static int refuse_logged;
+    if (!dit_fp16_stage_env()) return 0;
+    if (!ctx) return 0;
+    if (ctx->nvfp4_on || ctx->uly_u > 1 || !h3_dit_w4a8_fused_epilogue()) {
+        if (!refuse_logged) {
+            refuse_logged = 1;
+            fprintf(stderr,
+                    "dit_act_fp16_stage: requested but not armed "
+                    "(nvfp4=%d uly_u=%d fused_epi=%d); keep F32 pack\n",
+                    ctx->nvfp4_on ? 1 : 0, ctx->uly_u,
+                    h3_dit_w4a8_fused_epilogue() ? 1 : 0);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+/* wide F16 only when stage armed and LoRA absent (FC1 LoRA needs F32 wide). */
+static int dit_fp16_wide_pack(const h3_dit_w4a8 *ctx) {
+    return dit_fp16_stage_pack(ctx) && !(ctx && ctx->lora);
+}
+
+static size_t dit_qkv_ws_bytes(size_t seq, int stage) {
+    size_t n = seq * (size_t)H3_DIT_W4A8_INNER * 3u;
+    return stage ? (n * sizeof(uint16_t)) : (n * sizeof(float));
+}
+
+static size_t dit_wide_ws_bytes(size_t seq, int wide_f16) {
+    size_t n = seq * ((size_t)H3_DIT_W4A8_FFN * 2u);
+    return wide_f16 ? (n * sizeof(uint16_t)) : (n * sizeof(float));
+}
+
 static size_t layers_dev_chain_ws_bytes(const h3_dit_w4a8 *ctx, size_t seq,
                                         unsigned n_blocks, int use_ext_act) {
     const size_t hidden = H3_DIT_W4A8_HIDDEN;
-    const size_t inner = H3_DIT_W4A8_INNER;
-    const size_t ffn = H3_DIT_W4A8_FFN;
     const size_t slots = H3_DIT_W4A8_SLOTS;
     const size_t mod_rows = dit_adaln_mod_rows(ctx);
     const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
     const size_t mod_elems = mod_rows * slots * hidden;
     const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
-    const size_t wide = ffn * 2;
     const size_t aux_stride = mod_elems + hidden * 2 + head_dim * 2;
     const size_t act_bytes =
         use_ext_act ? 0 : (seq * hidden * sizeof(float) * 2);
+    int stage = dit_fp16_stage_pack(ctx);
+    int wide_f16 = dit_fp16_wide_pack(ctx);
     size_t need = 0;
     if (n_blocks < 1)
         n_blocks = 1;
@@ -1577,8 +1617,8 @@ static size_t layers_dev_chain_ws_bytes(const h3_dit_w4a8 *ctx, size_t seq,
     need += seq * rope_half * sizeof(float) * 2;
     need += (size_t)n_blocks * aux_stride * sizeof(float);
     need += seq * hidden * sizeof(float) * 2;
-    need += seq * inner * 3 * sizeof(float);
-    need += seq * wide * sizeof(float);
+    need += dit_qkv_ws_bytes(seq, stage);
+    need += dit_wide_ws_bytes(seq, wide_f16);
     return need;
 }
 
@@ -1609,19 +1649,26 @@ void h3_dit_w4a8_ws_component_ledger_fprint(FILE *out, const h3_dit_w4a8 *ctx,
     rope_b = seq * rope_half * sizeof(float) * 2;
     aux_b = (size_t)n_blocks * aux_stride * sizeof(float);
     ab_b = seq * hidden * sizeof(float) * 2;
-    qkv_b = seq * inner * 3 * sizeof(float);
-    wide_b = seq * wide * sizeof(float);
-    total = act_b + map_b + rope_b + aux_b + ab_b + qkv_b + wide_b;
-    c015_save = (qkv_b + wide_b) / 2u;
-    fprintf(out,
-            "dit_ws_ledger: seq=%zu n_blocks=%u use_ext_act=%d "
-            "act=%.3f map=%.3f rope=%.3f aux=%.3f a_b=%.3f "
-            "qkv_f32=%.3f wide_f32=%.3f total=%.3f GiB | "
-            "C015_qkv+wide_half_save=%.3f GiB "
-            "(≠ H3_DIT_ACT_F16 ConvRot; stage stub default OFF)\n",
-            seq, n_blocks, use_ext_act ? 1 : 0, act_b / GiB, map_b / GiB,
-            rope_b / GiB, aux_b / GiB, ab_b / GiB, qkv_b / GiB, wide_b / GiB,
-            total / GiB, c015_save / GiB);
+    {
+        int stage = dit_fp16_stage_pack(ctx);
+        int wide_f16 = dit_fp16_wide_pack(ctx);
+        size_t qkv_f32_b = seq * inner * 3 * sizeof(float);
+        size_t wide_f32_b = seq * wide * sizeof(float);
+        qkv_b = dit_qkv_ws_bytes(seq, stage);
+        wide_b = dit_wide_ws_bytes(seq, wide_f16);
+        total = act_b + map_b + rope_b + aux_b + ab_b + qkv_b + wide_b;
+        c015_save = (qkv_f32_b - qkv_b) + (wide_f32_b - wide_b);
+        fprintf(out,
+                "dit_ws_ledger: seq=%zu n_blocks=%u use_ext_act=%d "
+                "act=%.3f map=%.3f rope=%.3f aux=%.3f a_b=%.3f "
+                "qkv=%.3f wide=%.3f total=%.3f GiB | "
+                "C015_stage=%d wide_f16=%d save=%.3f GiB "
+                "(≠ H3_DIT_ACT_F16 ConvRot; default OFF)\n",
+                seq, n_blocks, use_ext_act ? 1 : 0, act_b / GiB, map_b / GiB,
+                rope_b / GiB, aux_b / GiB, ab_b / GiB, qkv_b / GiB,
+                wide_b / GiB, total / GiB, stage ? 1 : 0, wide_f16 ? 1 : 0,
+                c015_save / GiB);
+    }
     fflush(out);
 }
 
@@ -1684,11 +1731,11 @@ int h3_dit_w4a8_act_f16(void) {
 }
 
 /* C015/C042 workspace FP16 staging — NOT the same as H3_DIT_ACT_F16.
- * Construction pending: never arms packing / GEMM C dtype. Env=1 only logs. */
+ * Default OFF. Env=1 requests arm; pack/phase also require fused_epi, U=1,
+ * !nvfp4. Keep OFF until waffle PASS + E2 peak_dit ≤ −0.5 GiB. */
 int h3_dit_w4a8_act_fp16_stage(void) {
-    const char *e = getenv("H3_DIT_ACT_FP16_STAGE");
     static int logged;
-    if (!(e && e[0] == '1' && e[1] == '\0')) return 0;
+    if (!dit_fp16_stage_env()) return 0;
     if (!logged) {
         const double GiB = 1024.0 * 1024.0 * 1024.0;
         const size_t inner = (size_t)H3_DIT_W4A8_INNER;
@@ -1700,14 +1747,15 @@ int h3_dit_w4a8_act_fp16_stage(void) {
             (double)(s768 * (inner * 3u + wide) * sizeof(float) / 2u) / GiB;
         logged = 1;
         fprintf(stderr,
-                "dit_act_fp16_stage: H3_DIT_ACT_FP16_STAGE=1 requested but "
-                "NOT CONSTRUCTED (C015 Track-A dig); expected qkv+wide "
-                "half-save ≈%.2f GiB @seq=%zu / ≈%.2f GiB @seq=%zu; "
-                "packing remains F32; ≠ H3_DIT_ACT_F16 ConvRot\n",
+                "dit_act_fp16_stage: H3_DIT_ACT_FP16_STAGE=1 — C015 F16 "
+                "d_qkv (+ d_wide if !lora) carve armed when fused_epi+U=1+"
+                "!nvfp4; theoretical half-save ≈%.2f GiB @seq=%zu / ≈%.2f "
+                "GiB @seq=%zu; default product OFF until waffle+E2; "
+                "≠ H3_DIT_ACT_F16 ConvRot\n",
                 save480, s480, save768, s768);
         fflush(stderr);
     }
-    return 0;
+    return 1;
 }
 
 int h3_dit_w4a8_fused_epilogue(void) {
@@ -3544,7 +3592,7 @@ static const h3_cuda_w4a8_weight *dit_lazy_int8(h3_dit_w4a8 *ctx,
 static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
                            const h3_cuda_w4a8_weight *w_qkv, float *d_x,
                            float *d_mod, uint32_t *d_map, float *d_n1,
-                           float *d_a, float *d_qkv, size_t seq,
+                           float *d_a, float *d_qkv, float *d_wide, size_t seq,
                            h3_dit_w4a8_block_stats *stats, char *error,
                            size_t error_size) {
     const size_t hidden = H3_DIT_W4A8_HIDDEN;
@@ -3586,6 +3634,34 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
                               error_size);
         if (!w_qkv) return 0;
     }
+    if (dit_fp16_stage_pack(ctx)) {
+        h3_cuda_dit_gemm_epi epi_q;
+        memset(&epi_q, 0, sizeof(epi_q));
+        epi_q.y_f16 = 1;
+        if (ctx->lora) {
+            void *ready = NULL;
+            if (!d_wide) {
+                snprintf(error, error_size, "qkv_f16: need F32 wide for LoRA");
+                return 0;
+            }
+            uly_klog("qkv_lora", "enter");
+            if (!dit_lora_kick(ctx, block, 0, d_a, d_wide, seq, 0.0f, 1, &ready,
+                               error, error_size))
+                return 0;
+            if (!ready && !uly_ksync("qkv_lora", error, error_size))
+                return 0;
+            epi_q.d_lora = d_wide;
+            epi_q.lora_ready = ready;
+        }
+        if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
+                ctx->cuda, w_qkv, d_a, ctx->convrot_gs, seq, d_qkv, &prep,
+                &gemm, backend, sizeof(backend), &epi_q, detail,
+                sizeof(detail))) {
+            snprintf(error, error_size, "qkv_f16: %s", detail);
+            return 0;
+        }
+        goto qkv_done;
+    }
     if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
             ctx->cuda, w_qkv, d_a, ctx->convrot_gs, seq, d_qkv, &prep, &gemm,
             backend, sizeof(backend), detail, sizeof(detail))) {
@@ -3595,7 +3671,7 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
 qkv_done:
     if (!uly_ksync("qkv_gemm", error, error_size))
         return 0;
-    if (ctx->lora) {
+    if (ctx->lora && !dit_fp16_stage_pack(ctx)) {
         uly_klog("qkv_lora", "enter");
         if (!dit_lora_residual_dev(ctx, block, 0, d_a, d_qkv, seq, 1.0f, error,
                                    error_size))
@@ -3645,12 +3721,24 @@ static int block_phase_attn(h3_dit_w4a8 *ctx, unsigned block, const float *d_qkv
                                      ctx->ckv_save_n);
         }
     }
-    /* RoPE → FP16 scratch + SDPA (skip f32 Q/K/V materialize + cast). */
+    /* RoPE → FP16 scratch + SDPA (skip f32 Q/K/V materialize + cast).
+     * C015: when d_qkv is FP16 staged, use half-input rope (消中转). */
     uly_klog("rope_sdpa", "enter");
-    if (!h3_cuda_qkv_rope_sdpa_f16_dev(
-            ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq_attn, heads_attn,
-            head_dim, rope_half, eps, attn_scale, attn_window, d_attn, &rope_ms,
-            &op, be, sizeof(be), detail, sizeof(detail))) {
+    if (dit_fp16_stage_pack(ctx)) {
+        if (!h3_cuda_qkv_rope_sdpa_f16_dev_f16qkv(
+                ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq_attn,
+                heads_attn, head_dim, rope_half, eps, attn_scale, attn_window,
+                d_attn, &rope_ms, &op, be, sizeof(be), detail,
+                sizeof(detail))) {
+            h3_cuda_sdpa_clear_kvext();
+            snprintf(error, error_size, "rope_sdpa_f16qkv: %s", detail);
+            return 0;
+        }
+    } else if (!h3_cuda_qkv_rope_sdpa_f16_dev(
+                   ctx->cuda, d_qkv, d_qn, d_kn, d_cos, d_sin, seq_attn,
+                   heads_attn, head_dim, rope_half, eps, attn_scale,
+                   attn_window, d_attn, &rope_ms, &op, be, sizeof(be), detail,
+                   sizeof(detail))) {
         h3_cuda_sdpa_clear_kvext();
         snprintf(error, error_size, "rope_sdpa: %s", detail);
         return 0;
@@ -3876,6 +3964,14 @@ out_done:
         float *d_fc1 = d_wide;
         float *d_act = d_qkv;
         int fc1_fused = 0;
+        int stage = dit_fp16_stage_pack(ctx);
+        float *d_fc2_act = d_act; /* F32 act for FC2; cast dest when stage */
+
+        if (stage && !gemm_epi) {
+            snprintf(error, error_size,
+                     "act_fp16_stage requires fused gemm_epi");
+            return 0;
+        }
 
         prep = gemm = 0.0;
         uly_klog("fc1_gemm", "enter");
@@ -3950,6 +4046,7 @@ out_done:
                 return 0;
             memset(&epi, 0, sizeof(epi));
             epi.swiglu = 1;
+            epi.y_f16 = stage ? 1 : 0;
             epi.d_lora = d_fc1;
             epi.lora_ready = ready;
             if (epi_fuse) {
@@ -3970,6 +4067,7 @@ out_done:
         } else if (gemm_epi) {
             memset(&epi, 0, sizeof(epi));
             epi.swiglu = 1;
+            epi.y_f16 = stage ? 1 : 0;
             if (epi_fuse) {
                 epi.requant_mode = 1;
                 epi.requant_gs = (int)ffn;
@@ -4031,12 +4129,31 @@ fc1_done:
          * scratch; FC2 pre_q skips act ConvRot (weights are W_rot). */
         if (epi_fuse_ink && gemm_epi) {
             char ink_err[256];
+            if (stage) {
+                snprintf(error, error_size,
+                         "epi_fuse_ink incompatible with act_fp16_stage");
+                return 0;
+            }
             if (!h3_cuda_epi_fuse_ink_prep_fc2(
                     ctx->cuda, d_act, seq, ffn, ctx->convrot_gs, &fc2_pre_x,
                     &fc2_pre_act, ink_err, sizeof(ink_err))) {
                 snprintf(error, error_size, "epi_fuse_ink: %s", ink_err);
                 return 0;
             }
+        }
+
+        if (stage) {
+            /* SwiGLU wrote FP16 into d_act (=d_qkv); FC2 act-prep needs F32.
+             * Cast into d_wide prefix [seq,ffn] (fits even when wide is F16-sized). */
+            uly_klog("act_f16_to_f32", "enter");
+            if (!h3_cuda_f16_to_f32_dev(ctx->cuda, d_act, d_wide, seq * ffn,
+                                        detail, sizeof(detail))) {
+                snprintf(error, error_size, "fc2 cast f16→f32: %s", detail);
+                return 0;
+            }
+            if (!uly_ksync("act_f16_to_f32", error, error_size))
+                return 0;
+            d_fc2_act = d_wide;
         }
 
         prep = gemm = 0.0;
@@ -4066,8 +4183,8 @@ fc1_done:
         if (gemm_epi && ctx->lora) {
             void *ready = NULL;
             uly_klog("fc2_lora", "enter");
-            if (!dit_lora_kick(ctx, block, 3, d_act, d_a, seq, 0.0f, 1, &ready,
-                               error, error_size))
+            if (!dit_lora_kick(ctx, block, 3, d_fc2_act, d_a, seq, 0.0f, 1,
+                               &ready, error, error_size))
                 return 0;
             if (!ready && !uly_ksync("fc2_lora", error, error_size))
                 return 0;
@@ -4089,8 +4206,8 @@ fc1_done:
                     return 0;
                 }
             } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                           ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_y,
-                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           ctx->cuda, w_fc2, d_fc2_act, ctx->convrot_gs, seq,
+                           d_y, &prep, &gemm, backend, sizeof(backend), &epi,
                            detail, sizeof(detail))) {
                 snprintf(error, error_size, "fc2: %s", detail);
                 return 0;
@@ -4112,14 +4229,14 @@ fc1_done:
                     return 0;
                 }
             } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
-                           ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_y,
-                           &prep, &gemm, backend, sizeof(backend), &epi,
+                           ctx->cuda, w_fc2, d_fc2_act, ctx->convrot_gs, seq,
+                           d_y, &prep, &gemm, backend, sizeof(backend), &epi,
                            detail, sizeof(detail))) {
                 snprintf(error, error_size, "fc2: %s", detail);
                 return 0;
             }
         } else if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
-                       ctx->cuda, w_fc2, d_act, ctx->convrot_gs, seq, d_a,
+                       ctx->cuda, w_fc2, d_fc2_act, ctx->convrot_gs, seq, d_a,
                        &prep, &gemm, backend, sizeof(backend), detail,
                        sizeof(detail))) {
             snprintf(error, error_size, "fc2: %s", detail);
@@ -4130,7 +4247,7 @@ fc2_done:
             return 0;
         if (!gemm_epi && ctx->lora) {
             uly_klog("fc2_lora", "enter");
-            if (!dit_lora_residual_dev(ctx, block, 3, d_act, d_a, seq, 1.0f,
+            if (!dit_lora_residual_dev(ctx, block, 3, d_fc2_act, d_a, seq, 1.0f,
                                        error, error_size))
                 return 0;
             if (!uly_ksync("fc2_lora", error, error_size))
@@ -4175,7 +4292,7 @@ static int block_device_compute(
     float *d_wide, size_t seq, h3_dit_w4a8_block_stats *stats, char *error,
     size_t error_size) {
     if (!block_phase_qkv(ctx, block, w_qkv, d_x, d_mod, d_map, d_n1, d_a,
-                         d_qkv, seq, stats, error, error_size))
+                         d_qkv, d_wide, seq, stats, error, error_size))
         return 0;
     if (!block_phase_attn(ctx, block, d_qkv, d_qn, d_kn, d_cos, d_sin, seq,
                           (size_t)H3_DIT_W4A8_HEADS, d_wide, stats, error,
@@ -4365,8 +4482,8 @@ static int block_forward_gpu_resident(
     need += (hidden * 2 + head_dim * 2) * sizeof(float);  /* norms */
     need += seq * hidden * sizeof(float);                 /* a */
     need += seq * hidden * sizeof(float);                 /* b */
-    need += seq * inner * 3 * sizeof(float);              /* qkv / act */
-    need += seq * wide * sizeof(float);                   /* qkva / fc1 */
+    need += dit_qkv_ws_bytes(seq, dit_fp16_stage_pack(ctx)); /* qkv / act */
+    need += dit_wide_ws_bytes(seq, dit_fp16_wide_pack(ctx)); /* qkva / fc1 */
     if (!ensure_block_ws(ctx, need, error, error_size)) return 0;
     {
         static int dit_ws_ledger_once;
@@ -4401,8 +4518,27 @@ static int block_forward_gpu_resident(
     d_kn = H3_WS_F32(head_dim);
     d_a = H3_WS_F32(seq * hidden);
     d_b = H3_WS_F32(seq * hidden);
-    d_qkv = H3_WS_F32(seq * inner * 3);
-    d_wide = H3_WS_F32(seq * wide);
+    {
+        int stg = dit_fp16_stage_pack(ctx);
+        int wf = dit_fp16_wide_pack(ctx);
+        size_t qkv_b = dit_qkv_ws_bytes(seq, stg);
+        size_t wide_b = dit_wide_ws_bytes(seq, wf);
+        d_qkv = (float *)(base + off);
+        off += qkv_b;
+        d_wide = (float *)(base + off);
+        off += wide_b;
+        if (stg) {
+            static int pack_logged;
+            if (!pack_logged) {
+                pack_logged = 1;
+                fprintf(stderr,
+                        "dit_act_fp16_stage: pack qkv_f16=%d wide_f16=%d "
+                        "qkv_bytes=%zu wide_bytes=%zu seq=%zu\n",
+                        1, wf ? 1 : 0, qkv_b, wide_b, seq);
+                fflush(stderr);
+            }
+        }
+    }
 #undef H3_WS_F32
     if (off > need) {
         fail(error, error_size, "block workspace packing overflow");
@@ -5728,8 +5864,8 @@ static int uly_do_phase(uly_job *j) {
             return 0;
         }
         if (!block_phase_qkv(rc, j->block, j->w_qkv, w->d_x, w->d_mod, w->d_map,
-                             w->d_n1, w->d_a, w->d_qkv, j->seq_local, NULL,
-                             detail, sizeof(detail))) {
+                             w->d_n1, w->d_a, w->d_qkv, w->d_wide, j->seq_local,
+                             NULL, detail, sizeof(detail))) {
             snprintf(j->err, sizeof j->err, "ulysses r%d phase1: %s", j->rank,
                      detail);
             return 0;
@@ -6213,8 +6349,8 @@ static int layers_forward_ulysses(
         need += seq_real * rope_half * sizeof(float) * 2;
         need += (hidden * 2 + head_dim * 2) * sizeof(float);
         need += seq_local * hidden * sizeof(float) * 2;
-        need += seq_local * inner * 3 * sizeof(float);
-        need += seq_local * wide * sizeof(float);
+        need += dit_qkv_ws_bytes(seq_local, dit_fp16_stage_pack(rc));
+        need += dit_wide_ws_bytes(seq_local, dit_fp16_wide_pack(rc));
         if (!ensure_block_ws(rc, need, error, error_size))
             goto done;
         if ((rc->int8_store || rc->nvfp4_store) && rc->cache &&
@@ -6269,8 +6405,16 @@ static int layers_forward_ulysses(
         ws[r].d_kn = H3_ULY_F32(head_dim);
         ws[r].d_a = H3_ULY_F32(seq_local * hidden);
         ws[r].d_b = H3_ULY_F32(seq_local * hidden);
-        ws[r].d_qkv = H3_ULY_F32(seq_local * inner * 3);
-        ws[r].d_wide = H3_ULY_F32(seq_local * wide);
+        {
+            int stg = dit_fp16_stage_pack(rc);
+            int wf = dit_fp16_wide_pack(rc);
+            size_t qkv_b = dit_qkv_ws_bytes(seq_local, stg);
+            size_t wide_b = dit_wide_ws_bytes(seq_local, wf);
+            ws[r].d_qkv = (float *)(base + off);
+            off += qkv_b;
+            ws[r].d_wide = (float *)(base + off);
+            off += wide_b;
+        }
 #undef H3_ULY_F32
         start = (size_t)r * seq_local;
         nreal = 0;
@@ -6633,8 +6777,8 @@ int h3_dit_w4a8_layers_forward_f32(
         need += seq * rope_half * sizeof(float) * 2;
         need += n_blocks * aux_stride * sizeof(float);
         need += seq * hidden * sizeof(float) * 2;
-        need += seq * inner * 3 * sizeof(float);
-        need += seq * wide * sizeof(float);
+        need += dit_qkv_ws_bytes(seq, dit_fp16_stage_pack(ctx));
+        need += dit_wide_ws_bytes(seq, dit_fp16_wide_pack(ctx));
         /* Do not proactively evict for (WS+8GiB) — that collapsed cafe
          * window 29→16 after step 1. Allocate WS; only make_room when
          * there is no existing block WS at all. A slightly-short old WS
@@ -6659,8 +6803,8 @@ int h3_dit_w4a8_layers_forward_f32(
             need_bank += seq * rope_half * sizeof(float) * 2;
             need_bank += (hidden * 2 + head_dim * 2) * sizeof(float) * 2;
             need_bank += seq * hidden * sizeof(float) * 2;
-            need_bank += seq * inner * 3 * sizeof(float);
-            need_bank += seq * wide * sizeof(float);
+            need_bank += dit_qkv_ws_bytes(seq, dit_fp16_stage_pack(ctx));
+            need_bank += dit_wide_ws_bytes(seq, dit_fp16_wide_pack(ctx));
             if (!ensure_block_ws(ctx, need_bank, error, error_size)) goto done;
             /* Dual-bank path with cached host aux (no safetensors reload). */
             ctx->aux_prestage_mode = 2;
@@ -6710,8 +6854,16 @@ int h3_dit_w4a8_layers_forward_f32(
                 d_kn[1] = H3_WS_F32(head_dim);
                 d_a = H3_WS_F32(seq * hidden);
                 d_b = H3_WS_F32(seq * hidden);
-                d_qkv = H3_WS_F32(seq * inner * 3);
-                d_wide = H3_WS_F32(seq * wide);
+                {
+                    int stg = dit_fp16_stage_pack(ctx);
+                    int wf = dit_fp16_wide_pack(ctx);
+                    size_t qkv_b = dit_qkv_ws_bytes(seq, stg);
+                    size_t wide_b = dit_wide_ws_bytes(seq, wf);
+                    d_qkv = (float *)(base + off);
+                    off += qkv_b;
+                    d_wide = (float *)(base + off);
+                    off += wide_b;
+                }
 #undef H3_WS_F32
                 modulation =
                     (float *)malloc(dit_adaln_mod_elems(ctx) * sizeof(float));
@@ -6964,8 +7116,16 @@ int h3_dit_w4a8_layers_forward_f32(
         d_aux_base = H3_WS_F32(n_blocks * aux_stride);
         d_a = H3_WS_F32(seq * hidden);
         d_b = H3_WS_F32(seq * hidden);
-        d_qkv = H3_WS_F32(seq * inner * 3);
-        d_wide = H3_WS_F32(seq * wide);
+        {
+            int stg = dit_fp16_stage_pack(ctx);
+            int wf = dit_fp16_wide_pack(ctx);
+            size_t qkv_b = dit_qkv_ws_bytes(seq, stg);
+            size_t wide_b = dit_wide_ws_bytes(seq, wf);
+            d_qkv = (float *)(base + off);
+            off += qkv_b;
+            d_wide = (float *)(base + off);
+            off += wide_b;
+        }
 #undef H3_WS_F32
 
         /* Host pack: [mod | n1 | n2 | qn | kn] × n_blocks (pinned if possible). */

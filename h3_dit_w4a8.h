@@ -230,8 +230,9 @@ int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx);
 /* DiT INT8 act ConvRot in F16. Default ON after AdaLN-range prescale
  * (5090 KPI-B finite). Rollback = H3_DIT_ACT_F16=0. */
 int h3_dit_w4a8_act_f16(void);
-/* C015/C042: store d_qkv/d_wide as FP16 in block WS (≠ ACT_F16 ConvRot).
- * Default OFF. Stub until construction lands — getter never arms packing. */
+/* C015/C042: store d_qkv (+ d_wide if !lora) as FP16 in block WS
+ * (≠ ACT_F16 ConvRot). Default OFF until waffle PASS + E2 peak ≤ −0.5 GiB.
+ * Requires fused_epi + U=1 + !nvfp4 to arm packing/phases. */
 int h3_dit_w4a8_act_fp16_stage(void);
 /* Opt-in / VRAM_LEDGER companion: print block-WS component GiB + C015 save. */
 void h3_dit_w4a8_ws_component_ledger_fprint(FILE *out, const h3_dit_w4a8 *ctx,

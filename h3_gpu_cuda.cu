@@ -465,6 +465,44 @@ __global__ void h3_cuda_dequant_i32_vec4_kernel(const int32_t *acc,
     y4[col4] = o;
 }
 
+/* C015: dequant INT32 → FP16 (plain). */
+__global__ void h3_cuda_dequant_i32_to_f16_kernel(const int32_t *acc,
+                                                  const float *act_scales,
+                                                  int per_tensor,
+                                                  const float *s_channel,
+                                                  __half *y, size_t m,
+                                                  size_t n) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    if (row >= m || col >= n) return;
+    size_t idx = row * n + col;
+    float a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    y[idx] = __float2half(a_scale * s_channel[col] * (float)acc[idx]);
+}
+
+/* C015: SwiGLU dequant → FP16 out[m,width]. */
+__global__ void h3_cuda_dequant_i32_swiglu_to_f16_kernel(
+    const int32_t *acc, const float *act_scales, int per_tensor,
+    const float *s_channel, const float *lora, __half *out, size_t m,
+    size_t width) {
+    size_t col = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t row = (size_t)blockIdx.y;
+    size_t n;
+    float a_scale, gate, up;
+    if (row >= m || col >= width)
+        return;
+    n = width * 2u;
+    a_scale = per_tensor ? act_scales[0] : act_scales[row];
+    gate = a_scale * s_channel[col] * (float)acc[row * n + col];
+    up = a_scale * s_channel[width + col] * (float)acc[row * n + width + col];
+    if (lora) {
+        gate += lora[row * n + col];
+        up += lora[row * n + width + col];
+    }
+    out[row * width + col] =
+        __float2half((gate / (1.0f + expf(-gate))) * up);
+}
+
 /* R31: dequant INT32 acc[m, 2*width] + optional LoRA delta → SwiGLU. */
 __global__ void h3_cuda_dequant_i32_swiglu_kernel(
     const int32_t *acc, const float *act_scales, int per_tensor,
@@ -4961,6 +4999,11 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
         h3_cuda_set_error(error, error_size, "dit gemm gate epi args");
         return 0;
     }
+    if (epi && epi->y_f16 && (epi->gate || epi->requant_mode)) {
+        h3_cuda_set_error(error, error_size,
+                          "dit gemm y_f16 incompatible with gate/requant");
+        return 0;
+    }
     if (m_gemm < m) m_gemm = m;
     int rq_mode = epi ? epi->requant_mode : 0;
     if (rq_mode && !(epi->d_rq_x && epi->d_rq_act && epi->requant_rows >= m_gemm)) {
@@ -5046,7 +5089,10 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
             if (m0 + mh_pad > m_gemm)
                 mh_pad = m_gemm - m0;
             x_row = d_x + m0 * k;
-            if (epi && epi->swiglu)
+            if (epi && epi->y_f16) {
+                /* d_y is really __half*; keep float* null — use y_row_h below. */
+                y_row = NULL;
+            } else if (epi && epi->swiglu)
                 y_row = d_y + m0 * (n / 2u);
             else
                 y_row = d_y + m0 * n;
@@ -5139,10 +5185,19 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
                         (unsigned)((width + (size_t)threads - 1) /
                                    (size_t)threads),
                         (unsigned)mh, 1);
-                    h3_cuda_dequant_i32_swiglu_kernel<<<dq_grid, threads, 0,
-                                                        h3_cuda_op_st(cuda)>>>(
-                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
-                        lora_row, y_row, mh, width);
+                    if (epi && epi->y_f16) {
+                        __half *y_h =
+                            (__half *)d_y + m0 * width;
+                        h3_cuda_dequant_i32_swiglu_to_f16_kernel<<<
+                            dq_grid, threads, 0, h3_cuda_op_st(cuda)>>>(
+                            d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                            lora_row, y_h, mh, width);
+                    } else {
+                        h3_cuda_dequant_i32_swiglu_kernel<<<
+                            dq_grid, threads, 0, h3_cuda_op_st(cuda)>>>(
+                            d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc,
+                            lora_row, y_row, mh, width);
+                    }
                 } else if (use_gate) {
                     const float *lora_row =
                         (epi && epi->d_lora) ? (epi->d_lora + m0 * n) : NULL;
@@ -5155,6 +5210,15 @@ static int h3_cuda_gemm_i8_dequant_f32_dev_dx(
                         epi->d_residual + m0 * n, epi->d_modulation,
                         epi->d_row_map, lora_row, y_row, mh, n, m0, epi->slots,
                         epi->gate_slot);
+                } else if (epi && epi->y_f16) {
+                    dim3 dq_grid(
+                        (unsigned)((n + (size_t)threads - 1) / (size_t)threads),
+                        (unsigned)mh, 1);
+                    __half *y_h = (__half *)d_y + m0 * n;
+                    h3_cuda_dequant_i32_to_f16_kernel<<<dq_grid, threads, 0,
+                                                         h3_cuda_op_st(cuda)>>>(
+                        d_acc, act_row, per_tensor_scale ? 1 : 0, d_sc, y_h, mh,
+                        n);
                 } else if (vec4) {
                     size_t n4 = n >> 2;
                     dim3 dq_grid(
@@ -10927,6 +10991,138 @@ __global__ void h3_cuda_qkv_rope_f16_kernel(
     }
 }
 
+/* C015: RoPE+QKNorm from FP16 QKV (消中转; no F32 QKV roundtrip). */
+__global__ void h3_cuda_qkv_rope_f16_from_half_kernel(
+    const __half *__restrict__ qkv, const float *__restrict__ q_norm,
+    const float *__restrict__ k_norm, const float *__restrict__ rope_cos,
+    const float *__restrict__ rope_sin, __half *__restrict__ query,
+    __half *__restrict__ key, __half *__restrict__ value, size_t seq,
+    size_t seq_padded, size_t heads, size_t head_dim, size_t rope_half,
+    float epsilon, int grouped, int split_half) {
+    size_t row = (size_t)blockIdx.y;
+    size_t head = (size_t)blockIdx.x;
+    if (head >= heads) return;
+    if (seq_padded < seq) seq_padded = seq;
+    if (row >= seq_padded) return;
+    __half *q_out = query + (row * heads + head) * head_dim;
+    __half *k_out = key + (row * heads + head) * head_dim;
+    __half *v_out = value + (row * heads + head) * head_dim;
+    if (row >= seq) {
+        for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_out[d] = __float2half(0.0f);
+            k_out[d] = __float2half(0.0f);
+            v_out[d] = __float2half(0.0f);
+        }
+        return;
+    }
+    size_t inner = heads * head_dim;
+    const __half *qkv_row = qkv + row * inner * 3;
+    const float *c_row = rope_cos + row * rope_half;
+    const float *s_row = rope_sin + row * rope_half;
+    const __half *q_base;
+    const __half *k_base;
+    const __half *v_base;
+    if (grouped) {
+        q_base = qkv_row + head * head_dim * 3;
+        k_base = q_base + head_dim;
+        v_base = k_base + head_dim;
+    } else {
+        q_base = qkv_row + head * head_dim;
+        k_base = q_base + inner;
+        v_base = q_base + inner * 2;
+    }
+    __shared__ float sq[128], sk[128];
+
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float qv = __half2float(q_base[d]);
+        float kv = __half2float(k_base[d]);
+        q_sum += qv * qv;
+        k_sum += kv * kv;
+        v_out[d] = v_base[d];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q_sum += __shfl_down_sync(0xffffffffu, q_sum, offset);
+        k_sum += __shfl_down_sync(0xffffffffu, k_sum, offset);
+    }
+    __shared__ float qk[2];
+    __shared__ float wq[8], wk[8];
+    int warp = (int)(threadIdx.x >> 5);
+    int lane = (int)(threadIdx.x & 31);
+    if (lane == 0) {
+        wq[warp] = q_sum;
+        wk[warp] = k_sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tq = 0.0f, tk = 0.0f;
+        int nwarps = ((int)blockDim.x + 31) >> 5;
+        for (int w = 0; w < nwarps; w++) {
+            tq += wq[w];
+            tk += wk[w];
+        }
+        qk[0] = tq;
+        qk[1] = tk;
+    }
+    __syncthreads();
+    float q_inv = rsqrtf(qk[0] / (float)head_dim + epsilon);
+    float k_inv = rsqrtf(qk[1] / (float)head_dim + epsilon);
+
+    if (rope_half > 0 && split_half) {
+        for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float q0 = __half2float(q_base[d]) * q_inv * q_norm[d];
+            float k0 = __half2float(k_base[d]) * k_inv * k_norm[d];
+            if (d < rope_half) {
+                size_t pair = d + rope_half;
+                float q1 = __half2float(q_base[pair]) * q_inv * q_norm[pair];
+                float k1 = __half2float(k_base[pair]) * k_inv * k_norm[pair];
+                float c = c_row[d];
+                float s = s_row[d];
+                q0 = q0 * c - q1 * s;
+                k0 = k0 * c - k1 * s;
+            } else if (d < rope_half * 2) {
+                size_t pair = d - rope_half;
+                float q1 = __half2float(q_base[pair]) * q_inv * q_norm[pair];
+                float k1 = __half2float(k_base[pair]) * k_inv * k_norm[pair];
+                float c = c_row[pair];
+                float s = s_row[pair];
+                q0 = q0 * c + q1 * s;
+                k0 = k0 * c + k1 * s;
+            }
+            q_out[d] = __float2half(q0);
+            k_out[d] = __float2half(k0);
+        }
+    } else if (rope_half > 0) {
+        for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            sq[d] = __half2float(q_base[d]) * q_inv * q_norm[d];
+            sk[d] = __half2float(k_base[d]) * k_inv * k_norm[d];
+        }
+        __syncthreads();
+        for (size_t p = threadIdx.x; p < rope_half; p += blockDim.x) {
+            size_t i0 = p * 2u;
+            size_t i1 = i0 + 1u;
+            float c = c_row[p];
+            float s = s_row[p];
+            float q0 = sq[i0], q1 = sq[i1];
+            float k0 = sk[i0], k1 = sk[i1];
+            sq[i0] = q0 * c - q1 * s;
+            sq[i1] = q0 * s + q1 * c;
+            sk[i0] = k0 * c - k1 * s;
+            sk[i1] = k0 * s + k1 * c;
+        }
+        __syncthreads();
+        for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_out[d] = __float2half(sq[d]);
+            k_out[d] = __float2half(sk[d]);
+        }
+    } else {
+        for (size_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            q_out[d] = __float2half(__half2float(q_base[d]) * q_inv * q_norm[d]);
+            k_out[d] = __float2half(__half2float(k_base[d]) * k_inv * k_norm[d]);
+        }
+    }
+}
+
 static int h3_cuda_op_begin(h3_cuda *cuda, cudaEvent_t *ev0, cudaEvent_t *ev1,
                             char *error, size_t error_size) {
     cudaError_t status;
@@ -12021,6 +12217,161 @@ int h3_cuda_qkv_rope_sdpa_f16_dev_layout(
         cuda, NULL, NULL, NULL, seq, heads, head_dim, scale, attn_window,
         d_attn_out, sdpa_ms, backend_out, backend_out_size, error, error_size,
         1);
+}
+
+/* C015: FP16 QKV → RoPE+SDPA (消中转; no F32 QKV store). */
+int h3_cuda_qkv_rope_sdpa_f16_dev_layout_f16qkv(
+    h3_cuda *cuda, const void *d_qkv_half, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
+    float scale, int attn_window, int grouped, int split_half,
+    float *d_attn_out, double *rope_ms, double *sdpa_ms, char *backend_out,
+    size_t backend_out_size, char *error, size_t error_size) {
+    const __half *d_qkv = (const __half *)d_qkv_half;
+    __half *d_qh, *d_kh, *d_vh;
+    size_t elems;
+    size_t seq_padded = seq;
+    size_t tok_stride;
+    cudaError_t status;
+
+    if (rope_ms) *rope_ms = 0.0;
+    if (sdpa_ms) *sdpa_ms = 0.0;
+    if (!cuda || !d_qkv || !d_q_norm || !d_k_norm || !d_rope_cos ||
+        !d_rope_sin || !d_attn_out || seq == 0 || heads == 0 || head_dim == 0) {
+        h3_cuda_set_error(error, error_size, "invalid qkv_rope_sdpa_f16qkv args");
+        return 0;
+    }
+    if (rope_half * 2 > head_dim) {
+        h3_cuda_set_error(error, error_size, "rope_half too large");
+        return 0;
+    }
+    elems = seq * heads * head_dim;
+    tok_stride = heads * head_dim;
+    {
+        size_t half_n = elems * 3;
+        size_t stride = elems;
+#if defined(H3_HAVE_CUDNN_FRONTEND)
+        if (h3_cuda_sdpa_want_cudnn()) {
+            size_t padded = h3_cuda_sdpa_cudnn_align_seq(seq);
+            size_t pe = padded * heads * head_dim;
+            half_n = pe * 4;
+            if (h3_cuda_sdpa_cudnn_want_padded(seq, heads, head_dim, 0)) {
+                stride = pe;
+                seq_padded = padded;
+            }
+        }
+#endif
+        if (!h3_cuda_ensure_scratch(cuda, half_n * sizeof(__half), error,
+                                    error_size))
+            return 0;
+        d_qh = (__half *)cuda->d_sdpa_scratch;
+        d_kh = d_qh + stride;
+        d_vh = d_kh + stride;
+    }
+
+    {
+        dim3 grid((unsigned)heads, (unsigned)seq_padded, 1);
+        cudaEvent_t rev0 = NULL, rev1 = NULL;
+        if (h3_sol_profile_on()) {
+            cudaEventCreate(&rev0);
+            cudaEventCreate(&rev1);
+            if (rev0) cudaEventRecord(rev0, 0);
+        }
+        h3_cuda_qkv_rope_f16_from_half_kernel<<<grid, 128, 0,
+                                                 h3_cuda_op_st(cuda)>>>(
+            d_qkv, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, d_qh, d_kh, d_vh,
+            seq, seq_padded, heads, head_dim, rope_half, epsilon, grouped,
+            split_half);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            if (rev0) cudaEventDestroy(rev0);
+            if (rev1) cudaEventDestroy(rev1);
+            h3_cuda_set_error_cuda(error, error_size, "qkv_rope_f16qkv",
+                                   status);
+            return 0;
+        }
+        if (rev0 && rev1) {
+            float rms = 0.0f;
+            cudaEventRecord(rev1, 0);
+            cudaEventSynchronize(rev1);
+            if (cudaEventElapsedTime(&rms, rev0, rev1) == cudaSuccess) {
+                if (rope_ms) *rope_ms = (double)rms;
+                h3_sp_add_n(&g_sp_step.rope, &g_sp_tot.rope, &g_sp_step.n_rope,
+                            &g_sp_tot.n_rope, (double)rms);
+            }
+            cudaEventDestroy(rev0);
+            cudaEventDestroy(rev1);
+        }
+    }
+
+    if (g_kvsave_n && g_kvsave_idx && g_kvsave_k && g_kvsave_v) {
+        size_t row = heads * head_dim;
+        size_t n = g_kvsave_n * row;
+        unsigned nblk = (unsigned)((n + 255u) / 256u);
+        if (nblk == 0) nblk = 1;
+        h3_f16_gather_thd_rows_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_kh, (__half *)g_kvsave_k, g_kvsave_idx, g_kvsave_n, tok_stride,
+            row);
+        h3_f16_gather_thd_rows_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_vh, (__half *)g_kvsave_v, g_kvsave_idx, g_kvsave_n, tok_stride,
+            row);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "kvsave gather", status);
+            return 0;
+        }
+    }
+
+    if (g_kvcat_n > 0 && g_kvcat_k && g_kvcat_v) {
+        size_t row = heads * head_dim;
+        size_t kv_seq = seq + g_kvcat_n;
+        size_t kv_elems = kv_seq * row;
+        size_t q_elems = seq * row;
+        size_t cat_bytes =
+            kv_elems * 2u * sizeof(__half) + q_elems * sizeof(__half);
+        __half *k_cat, *v_cat, *o_half;
+        unsigned nblk;
+        if (!h3_cuda_ensure_expand(cuda, cat_bytes, error, error_size))
+            return 0;
+        k_cat = (__half *)cuda->d_sdpa_expand;
+        v_cat = k_cat + kv_elems;
+        o_half = v_cat + kv_elems;
+        nblk = (unsigned)((kv_elems + 255u) / 256u);
+        if (nblk == 0) nblk = 1;
+        h3_f16_cat_kv_kernel<<<nblk, 256, 0, h3_cuda_op_st(cuda)>>>(
+            d_kh, d_vh, seq, tok_stride, (const __half *)g_kvcat_k,
+            (const __half *)g_kvcat_v, g_kvcat_n, k_cat, v_cat, row);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "kvcat kv", status);
+            return 0;
+        }
+        if (!h3_cuda_sdpa_rect_f16(cuda, d_qh, k_cat, v_cat, o_half, d_attn_out,
+                                   seq, kv_seq, heads, head_dim, scale,
+                                   attn_window, sdpa_ms, backend_out,
+                                   backend_out_size, error, error_size))
+            return 0;
+        return 1;
+    }
+
+    return h3_cuda_sdpa_f16_launch_dev_ex(
+        cuda, NULL, NULL, NULL, seq, heads, head_dim, scale, attn_window,
+        d_attn_out, sdpa_ms, backend_out, backend_out_size, error, error_size,
+        1);
+}
+
+int h3_cuda_qkv_rope_sdpa_f16_dev_f16qkv(
+    h3_cuda *cuda, const void *d_qkv_half, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
+    float scale, int attn_window, float *d_attn_out, double *rope_ms,
+    double *sdpa_ms, char *backend_out, size_t backend_out_size, char *error,
+    size_t error_size) {
+    return h3_cuda_qkv_rope_sdpa_f16_dev_layout_f16qkv(
+        cuda, d_qkv_half, d_q_norm, d_k_norm, d_rope_cos, d_rope_sin, seq,
+        heads, head_dim, rope_half, epsilon, scale, attn_window,
+        h3_cuda_dit_qkv_grouped(), h3_cuda_dit_rope_split_half(), d_attn_out,
+        rope_ms, sdpa_ms, backend_out, backend_out_size, error, error_size);
 }
 
 static char g_vae_sdpa_backend[32] = "";

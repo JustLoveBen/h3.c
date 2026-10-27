@@ -13,7 +13,7 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 |---|---|---|---|---|
 | Absorb / merge projections | QKV 3→1 GEMM | C018 | **stale closed** | Exp-G3 proof 2026-10-28 |
 | Fused Q-norm+RoPE+cast | `qkv_rope_f16_kernel` | C019 | **stale closed** | Same proof |
-| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **dig+ stub** | Next construct; waffle; default OFF |
+| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **built OFF** | waffle+E2 before default; U=1 |
 | GEMM+epilogue / ConvRot+requant | EPI_FUSE / INK / SL | C003 | **landed OFF** | SL +46% dit; ink ~0%; keep OFF |
 | DeferredRelease overlap | TE↔DiT prefetch | C064 | **partial+ NO_WC_WIN** | Opt-in only |
 | Config-as-contract / golden TE | env contract, te_cache | C061/C062 | **landed+** | Hygiene |
@@ -37,5 +37,6 @@ Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; remaining «DeepSee
 ## This commit deliverables
 
 - Exp-G3 evidence doc; catalog C018/C019 → stale closed.  
-- C015 dig (claim→mechanism→metric) + `dit_ws_ledger` + `H3_DIT_ACT_FP16_STAGE` stub (never arms).  
+- C015 dig + ledger + stub (prior).  
+- **C015 construction:** F16 qkv(+wide!lora) pack, `epi.y_f16`, F16qkv rope, FC2 cast; env default OFF.  
 - This status table.

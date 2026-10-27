@@ -40,22 +40,26 @@ C015_half_save = (qkv_f32 + wide_f32) / 2
 
 768p Euler-8; stage on vs F32 baseline; **waffle PASS** (non BIT_ID OK); no mosaic; peak_dit ≤ −0.5 GiB. FAIL → keep OFF.
 
-## Landed this slice (default-safe)
+## Landed construction (default OFF)
 
 | Item | Status |
 |---|---|
-| `dit_ws_ledger` component print | code; opt-in via `H3_VRAM_LEDGER` / `H3_DIT_WS_LEDGER` |
-| `H3_DIT_ACT_FP16_STAGE` | env + getter; **never arms** packing; logs expected GiB |
-| Full F16 pack / cast / Ulysses | **not constructed** |
+| `dit_ws_ledger` component print | landed; shows stage/wide_f16/save |
+| `H3_DIT_ACT_FP16_STAGE` | env; arms pack/phases when fused_epi + U=1 + !nvfp4 |
+| F16 `d_qkv` carve | landed; GEMM `epi.y_f16` dequant + F16-input rope |
+| F16 `d_wide` carve | landed when **!lora** (LoRA FC1 needs F32 wide) |
+| FC2 F16→F32 cast into wide prefix | landed |
+| Ulysses pack sizes | byte helpers shared; **U>1 refuses arm** (A2A half TBD) |
+| Default | **OFF** until waffle PASS + E2 peak_dit ≤ −0.5 GiB |
 
-## Construction checklist (next engineering slice)
+## Construction checklist (v1 done → gate)
 
-1. Dual-size `layers_dev_chain_ws_bytes` + pack macros (`H3_WS_F16` for qkv/wide).  
-2. After QKV/FC1 GEMM: tile F32 C → `h3_cuda_f32_to_f16` into stage buf **or** cuBLAS F16 C.  
-3. Rope/SDPA already F16 — prefer consume stage QKV without full F32 roundtrip.  
-4. MLP readers: F16→F32 cast or half algebra.  
-5. Ulysses A2A sizes.  
-6. 480p waffle + 768p peak ledger; only then consider default.
+1. Dual-size WS bytes + pack — **done** (`dit_qkv_ws_bytes` / `dit_wide_ws_bytes`).  
+2. GEMM F16 C via `h3_cuda_dit_gemm_epi.y_f16` — **done** (plain + SwiGLU).  
+3. F16-input rope `…_f16qkv` — **done**.  
+4. FC2 cast F16→F32 — **done**.  
+5. Ulysses sizes — pack math ready; runtime arm U=1 only.  
+6. 480p waffle + 768p peak ledger — **this gate**; then default.
 
 ## Related closed / non-goals
 

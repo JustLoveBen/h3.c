@@ -56,7 +56,7 @@ static const h3_env_entry k_contract[] = {
     {"H3_TE_CACHE_AUTO", "1=auto te_cache under out/ when --repeat>=2 (C062)", "info"},
     {"H3_VRAM_LEDGER", "1=C040 cudaMemGetInfo VRAM buckets (after_cuda..after_vae)", "info"},
     {"H3_DIT_WS_LEDGER", "1=print dit_ws_ledger component GiB (C015 dig)", "info"},
-    {"H3_DIT_ACT_FP16_STAGE", "1=request C015 FP16 d_qkv/d_wide staging (stub; not armed)", "info"},
+    {"H3_DIT_ACT_FP16_STAGE", "1=C015 FP16 d_qkv(+wide!lora) WS staging (default OFF; need fused_epi U=1 !nvfp4; waffle+E2 before product)", "info"},
 };
 
 static const char *fmt_val(const char *val, char *buf, size_t buf_size) {

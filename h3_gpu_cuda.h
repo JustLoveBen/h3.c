@@ -395,6 +395,9 @@ typedef struct h3_cuda_dit_gemm_epi {
     float *d_rq_act;        /* [m_pad_rows] per-group scale */
     float *d_rq_pre;        /* [m_pad_rows] per-row pre_scale (mode 2) */
     size_t requant_rows;    /* m_pad: total rows incl. zero-padded tail */
+    /* C015: when set, plain/swiglu dequant writes __half to d_y (cast from
+     * float*). Gate epi ignores this (out/fc2 stay F32). */
+    int y_f16;
 } h3_cuda_dit_gemm_epi;
 
 int h3_cuda_gemm_i8_dequant_f32_w_act_dev_epi(
@@ -767,6 +770,22 @@ int h3_cuda_qkv_rope_split_half_f32_dev(
 /* RoPE writes FP16 Q/K/V into SDPA scratch then runs SDPA (no f32 QKV store). */
 int h3_cuda_qkv_rope_sdpa_f16_dev(
     h3_cuda *cuda, const float *d_qkv, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
+    float scale, int attn_window, float *d_attn_out, double *rope_ms,
+    double *sdpa_ms, char *backend_out, size_t backend_out_size, char *error,
+    size_t error_size);
+/* C015: same as layout SDPA path but QKV activation is FP16 (消中转). */
+int h3_cuda_qkv_rope_sdpa_f16_dev_layout_f16qkv(
+    h3_cuda *cuda, const void *d_qkv_half, const float *d_q_norm,
+    const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
+    size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
+    float scale, int attn_window, int grouped, int split_half,
+    float *d_attn_out, double *rope_ms, double *sdpa_ms, char *backend_out,
+    size_t backend_out_size, char *error, size_t error_size);
+/* C015: DiT defaults for grouped/split_half (mirrors h3_cuda_qkv_rope_sdpa_f16_dev). */
+int h3_cuda_qkv_rope_sdpa_f16_dev_f16qkv(
+    h3_cuda *cuda, const void *d_qkv_half, const float *d_q_norm,
     const float *d_k_norm, const float *d_rope_cos, const float *d_rope_sin,
     size_t seq, size_t heads, size_t head_dim, size_t rope_half, float epsilon,
     float scale, int attn_window, float *d_attn_out, double *rope_ms,
