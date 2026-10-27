@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Burn a TOP-LEFT scheme label into an eval clip so A/B arms stay identifiable.
 # Usage: tools/burn_eval_label.sh <in.mp4> <out.mp4> <label>
-# Example label: "1344x768 Euler-8 INT8"
+# Example label: "864x480 PDMD-4 INT8 | warm 68.0s"  (scheme + warm end-to-end WALL_SEC, not dit-only)
 set -euo pipefail
 if [[ $# -lt 3 ]]; then
   echo "usage: $0 <in.mp4> <out.mp4> <label>" >&2
