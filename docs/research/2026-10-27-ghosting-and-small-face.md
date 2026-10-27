@@ -73,7 +73,7 @@ sdpa_strict: PASS hits==want backend=cuda_cudnn_sdpa
 | Rank | 动作 | 目的 | 代价 | 状态 |
 | ---: | --- | --- | --- | --- |
 | **1** | **抬画布** `960×544` 或金线评测 `1344×768`，仍 `--steps 8 --cfg 1` INT8 | 小脸 + 边缘锐度 | DiT ∝ token；4090 暖 DiT 从 ~27s 升到 ~1.3–4× | **本轮跑 960×544 talking_head** |
-| **2** | **PDMD-4** `--fewstep-preset pdmd4 --lora <pdmd_4NFE h3repo>` | 同 NFE=4 质量优于 DMAD（beyond-dmad 表） | 需下载/转换 LoRA；非 8-step 金线 | LoRA 未在 4090；拿到权再跑 |
+| **2** | **PDMD-4** `--fewstep-preset pdmd4 --lora <pdmd_4NFE h3repo>` | 同 NFE=4 质量优于 DMAD（beyond-dmad 表） | 需下载/转换 LoRA；非 8-step 金线 | **本轮已跑** 864×480 + 960×544 talking_head；见 §5 |
 | **3** | 产品档：**低分草稿 + latent 超分/二采**（Comfy Upscaler / FL2VA 条件图） | 480→高分比直出便宜 | 非无损；二采少步伤小脸 | 本仓无产品级 ×2 latent upsample |
 | **4** | `--steps 16` 同 480p **仅作负对照** | 证伪「加步去虚影」 | 墙钟↑、可能拉歪轨迹 | 可选；勿默认 |
 | — | 修 sm_89 cuDNN F32 plan | 消旁路日志 / 真 F32 路径 | 与本轮虚影弱相关 | 工程债，另开 |
@@ -125,11 +125,14 @@ $BIN ... --width 864 --height 480 --steps 16 --cfg 1 ...
 | 项 | 值 |
 | --- | --- |
 | 基线 | 4090 INT8 864×480×8 · seed `0x76800002` · `bd330d2` · warm dit ≈27.2s · WALL≈52.7s |
-| DiT SDPA | 基线与 A/B 均为 `cuda_cudnn_sdpa` hits=400（虚影≠naive flash） |
-| A/B | talking_head **960×544 · 8-step** · dit=37.46s · WALL=65.82s · latent std=1.082 · RUN_RC=0 · SHA doc `cd6b1c6` |
-| 产物 | 4090 `out/ghost_fix_ab_20261027/`；Mac `~/grokbot-share/ghost_fix_ab_20261027/{talking_head_960x544_s8,baseline_864x480_s8_talking_head}.mp4` |
-| 未跑 | PDMD-4（4090 无 LoRA）；1344×768；steps=16 负对照 |
-| 人眼 | 待消息列表贴片：预期小脸/背景五官相对 480p 更可辨；运动虚影可能仍在（时间预算未改） |
+| DiT SDPA | 各臂均为 `cuda_cudnn_sdpa`（8-step hits=400；PDMD-4 hits=200）；虚影≠naive flash |
+| A/B 抬画布 | talking_head **960×544 · 8-step** · dit=37.46s · WALL=65.82s · latent std=1.082 · RUN_RC=0 |
+| **A/B PDMD-4** | LoRA：`pdmd2026/pdmd_4NFE_lora` → `convert_pdmd_lora_h3repo.py` → `models/loras/pdmd_4NFE_lora_model_0.h3repo.safetensors`（416 keys / pairs=200）；`--fewstep-preset pdmd4` · `sigma_ok` · Euler 4 · shift 12/3 · cfg1 |
+| PDMD 864×480 | dit_ms=**17116.5** · WALL_SEC=67.95（冷 TE 重）· latent std=1.044 · RUN_RC=0 · 2026-10-27 17:46 +08 |
+| PDMD 960×544 | dit_ms=**23118.7** · WALL_SEC=59.84 · latent std=1.029 · RUN_RC=0 · 同机同日 17:48 +08 |
+| 产物 | 4090 `out/ghost_fix_ab_20261027/`；Mac `~/grokbot-share/ghost_fix_ab_20261027/{baseline_864x480_s8_talking_head,talking_head_960x544_s8,talking_head_864x480_pdmd4,talking_head_960x544_pdmd4}.mp4` |
+| 未跑 | 1344×768；steps=16 负对照 |
+| 人眼（t=2.5s 单帧 + 成片） | PDMD 与 Euler-8 **不是同轨迹**（同 seed 构图/身份会漂，属合同差异）。相对 Euler-8：PDMD-4 **暖 DiT 约 −37%**（17.1 vs 27.2s）；发丝/下颌边缘 smear **有减轻、未清零**。960 PDMD 主脸锐度优于 480 Euler；小脸仍靠抬画布为主因。 |
 
 ## 6. 给产品的一句话
 
