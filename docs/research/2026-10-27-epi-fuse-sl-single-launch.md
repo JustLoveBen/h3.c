@@ -58,3 +58,16 @@ Naive O(gs²) recompute caused **~+46% hot dit**. Replacement in `h3_cuda_epi_fu
 
 **Still default OFF.** Next: sync+rebuild 238, INT8 turbo4 A/B (ctrl vs SL) for BIT_ID + WC. Do not default-on until WC ≤ ctrl and waffle green.
 
+## FWHT A/B + dense-tiled default (2026-10-27 Asia/Shanghai)
+
+Out: `out/c003_epi_fuse_sl_fwht_20261027/` SHA binary `c506524e…` (FWHT-as-default briefly). Protocol: INT8, 864×480, seed `0x48000001`, `H3_DIT_ACT_F16=0`, 8 steps.
+
+| arm | SL | dit_ms | latent checksum | std |
+|---|---|---|---|---|
+| ctrl_r1/r2 | 0 | 25251.7 / 25200.1 | `0x349ec79e4d1cd0e1` | 0.9915 |
+| sl_r1/r2 (FWHT) | 1 | 25317.7 / 25104.8 | `0xf8b53ac7ba008c61` | 1.337 |
+
+- **WC:** FWHT ≈ ctrl (~0%, vs naive +46%).  
+- **BIT_ID:** **FAIL** (checksum≠ctrl; std drift). Host `fwht_sl_vs_dense` still PASS on one-shot quant — DiT amplifies float≠dense.  
+- **Fix:** default SL path = **smem-x dense tiled** (ink algebra). FWHT only if `H3_DIT_EPI_FUSE_SL_FWHT=1`. Still default OFF overall (`H3_DIT_EPI_FUSE_SL`).
+

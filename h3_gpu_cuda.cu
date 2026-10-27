@@ -4689,7 +4689,7 @@ __device__ __forceinline__ void h3_cuda_sl_fwht_normalized(float *buf, int gs,
 __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     const float *__restrict__ x, const float *__restrict__ H,
     int8_t *__restrict__ y, float *__restrict__ scales, size_t m, size_t k,
-    int gs) {
+    int gs, int use_fwht) {
     const size_t row = (size_t)blockIdx.x;
     const int tid = (int)threadIdx.x;
     const int nthreads = (int)blockDim.x;
@@ -4698,8 +4698,6 @@ __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     float *buf = smem;
     float *red = smem + gs;
     int8_t *dst = y + row * k;
-    /* Sylvester H is always power-of-2 gs from ensure_hadamard; FWHT ≡ H@x. */
-    const int use_fwht = (gs >= 2) && ((gs & (gs - 1)) == 0);
     if (row >= m) {
         for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads)
             dst[col] = 0;
@@ -4820,12 +4818,20 @@ int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
         if (!h3_cuda_ensure_hadamard(cuda, convrot_groupsize, error,
                                      error_size))
             return 0;
-        /* buf[gs] + red[threads] — FWHT / tiled-x workspace */
-        smem = ((size_t)convrot_groupsize + (size_t)threads) * sizeof(float);
-        h3_cuda_epi_fuse_sl_convrot_quant_kernel<<<(unsigned)m_pad, threads,
-                                                   smem, h3_cuda_op_st(cuda)>>>(
-            d_swiglu, cuda->d_hadamard, d_xi8, d_scales, m, k,
-            convrot_groupsize);
+        /* buf[gs] + red[threads] — FWHT / tiled-x workspace.
+         * Default dense tiled (BIT_ID). H3_DIT_EPI_FUSE_SL_FWHT=1 → FWHT WC. */
+        {
+            const char *fwht_env = getenv("H3_DIT_EPI_FUSE_SL_FWHT");
+            int use_fwht =
+                (convrot_groupsize >= 2) &&
+                ((convrot_groupsize & (convrot_groupsize - 1)) == 0) &&
+                fwht_env && fwht_env[0] == '1' && fwht_env[1] == '\0';
+            smem = ((size_t)convrot_groupsize + (size_t)threads) * sizeof(float);
+            h3_cuda_epi_fuse_sl_convrot_quant_kernel<<<(unsigned)m_pad, threads,
+                                                       smem, h3_cuda_op_st(cuda)>>>(
+                d_swiglu, cuda->d_hadamard, d_xi8, d_scales, m, k,
+                convrot_groupsize, use_fwht);
+        }
         status = cudaGetLastError();
         if (status != cudaSuccess) {
             h3_cuda_set_error_cuda(error, error_size, "epi_fuse_sl kernel",
