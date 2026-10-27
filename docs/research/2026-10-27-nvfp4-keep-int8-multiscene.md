@@ -50,3 +50,13 @@ Postfix mlp/qkv (p01 only): mosaic/screen-door **FAIL** despite energy OK — se
 - Refresh OpenRouter key → :free VL per clip (nemotron/dots).
 - Human phone review via `~/grokbot-share/`.
 - Optional: single-GEMM rel_l2 host probe for out/fc* SF (not blocking; routing proven).
+
+
+## Update — OR VL + mosaic honesty (same day, Asia/Shanghai)
+
+See `2026-10-27-nvfp4-keep-int8-or-vl-multiscene.md`.
+
+- INT8: OR :free VL **5/5 PASS**.
+- Hybrid OR incomplete (free daily 429); host frames: **KEEP=attn still mosaics vs INT8** (alive, not product-clean).
+- WC warm: INT8 ~24.0s, KEEP=attn ~24.2–25.4s.
+- No short implementation cut for residual mosaic (weight rel_l2≈0.095 all kinds); recommend product INT8; KEEP=attn experimental-only pending human review / calib.
