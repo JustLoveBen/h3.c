@@ -47,3 +47,14 @@ Config: turbo4 INT8, 864×480, seed `0x48000001`, `--repeat 2`, `H3_DIT_ACT_F16=
 - Wall-clock: **~+46% hot dit** (SL slower; expected naive Hadamard). **Default remains OFF.**
 - P2 `H3_DIT_EPI_FUSE` stays DISARMED. NVFP4 untouched.
 
+## Tiled / FWHT path (in progress, 2026-10-27 Asia/Shanghai)
+
+Naive O(gs²) recompute caused **~+46% hot dit**. Replacement in `h3_cuda_epi_fuse_sl_convrot_quant_kernel`:
+
+1. **Fast path (default when gs power-of-2):** in-smem **normalized FWHT** — ≡ Sylvester `H@x` (`d_hadamard` is always Sylvester via `h3_cuda_ensure_hadamard`). Complexity O(gs log gs) per group per pass.
+2. **Fallback:** smem-resident `x_g` + dense matvec (same sum order as `h3_cuda_convrot_act_kernel`) when gs is not a power of two.
+3. Smem layout: `buf[gs] + red[threads]`. Launch smem bumped accordingly.
+4. Host proof extended: `tests/test_epi_fuse_sl_host.c` — dense SL≡ink (gs=4) **and** `fwht_sl_vs_dense` at gs=256 (`i8_mismatch=0`).
+
+**Still default OFF.** Next: sync+rebuild 238, INT8 turbo4 A/B (ctrl vs SL) for BIT_ID + WC. Do not default-on until WC ≤ ctrl and waffle green.
+

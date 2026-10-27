@@ -5,8 +5,8 @@
 # NVFP4 KEEP_INT8 hybrid (no-retrain)
 
 **Date:** 2026-10-27 (Asia/Shanghai)  
-**Status:** code landed; 238 ladder pending in same commit window  
-**SHA base:** cc427ef + this slice
+**Status:** code landed; 238 ladder running — see `2026-10-27-nvfp4-keep-int8-ladder-results.md`  
+**SHA base:** a7d7375 (KEEP+DISARM on origin/main)
 
 ## Why
 

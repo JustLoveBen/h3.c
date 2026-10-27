@@ -4656,10 +4656,36 @@ __global__ void h3_cuda_f32_to_f16_row_prescale_kernel(const float *x, __half *y
 }
 
 /* EPI_FUSE_SL: single-launch ConvRot(Hadamard)+per-row INT8.
- * Mathematically matches ink (X@H then absmax/127 quant) but does not
- * materialize the f32 rotated row in HBM: Hadamard is recomputed for
- * absmax then again for quant. H layout matches d_hadamard / cublas path
- * (y[i]=sum_j x[j]*H[j*gs+i]). Default OFF via H3_DIT_EPI_FUSE_SL. */
+ * Matches ink algebra Y=quant(X@H) without materializing f32 rot in HBM.
+ * Fast path: in-smem normalized FWHT (≡ Sylvester H@x; d_hadamard is always
+ * Sylvester from h3_cuda_ensure_hadamard). O(gs log gs) vs naive O(gs²).
+ * Fallback: smem-x tiled dense matvec (same sum order as convrot_act_kernel)
+ * when gs is not a power of two or exceeds blockDim.
+ * Default OFF via H3_DIT_EPI_FUSE_SL. */
+__device__ __forceinline__ void h3_cuda_sl_fwht_normalized(float *buf, int gs,
+                                                          int tid,
+                                                          int nthreads) {
+    int h;
+    float scale;
+    for (h = 1; h < gs; h *= 2) {
+        int i;
+        __syncthreads();
+        for (i = tid; i < gs; i += nthreads) {
+            int which = i % (h * 2);
+            if (which < h) {
+                float u = buf[i];
+                float v = buf[i + h];
+                buf[i] = u + v;
+                buf[i + h] = u - v;
+            }
+        }
+    }
+    __syncthreads();
+    scale = rsqrtf((float)gs);
+    for (int i = tid; i < gs; i += nthreads) buf[i] *= scale;
+    __syncthreads();
+}
+
 __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     const float *__restrict__ x, const float *__restrict__ H,
     int8_t *__restrict__ y, float *__restrict__ scales, size_t m, size_t k,
@@ -4667,8 +4693,13 @@ __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     const size_t row = (size_t)blockIdx.x;
     const int tid = (int)threadIdx.x;
     const int nthreads = (int)blockDim.x;
-    extern __shared__ float red[];
+    /* smem: buf[gs] working group + red[nthreads] absmax reduce */
+    extern __shared__ float smem[];
+    float *buf = smem;
+    float *red = smem + gs;
     int8_t *dst = y + row * k;
+    /* Sylvester H is always power-of-2 gs from ensure_hadamard; FWHT ≡ H@x. */
+    const int use_fwht = (gs >= 2) && ((gs & (gs - 1)) == 0);
     if (row >= m) {
         for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads)
             dst[col] = 0;
@@ -4680,15 +4711,27 @@ __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     float local_max = 0.0f;
     size_t g;
     int i, j;
+
     for (g = 0; g < n_groups; g++) {
         const float *xg = src + g * (size_t)gs;
-        for (i = tid; i < gs; i += nthreads) {
-            float acc = 0.0f;
-            for (j = 0; j < gs; j++)
-                acc += xg[j] * H[(size_t)j * (size_t)gs + (size_t)i];
-            float a = fabsf(acc);
-            if (a > local_max) local_max = a;
+        for (i = tid; i < gs; i += nthreads) buf[i] = xg[i];
+        __syncthreads();
+        if (use_fwht) {
+            h3_cuda_sl_fwht_normalized(buf, gs, tid, nthreads);
+            for (i = tid; i < gs; i += nthreads) {
+                float a = fabsf(buf[i]);
+                if (a > local_max) local_max = a;
+            }
+        } else {
+            for (i = tid; i < gs; i += nthreads) {
+                float acc = 0.0f;
+                for (j = 0; j < gs; j++)
+                    acc += buf[j] * H[(size_t)j * (size_t)gs + (size_t)i];
+                float a = fabsf(acc);
+                if (a > local_max) local_max = a;
+            }
         }
+        __syncthreads(); /* protect buf before next group load */
     }
     red[tid] = local_max;
     __syncthreads();
@@ -4705,15 +4748,28 @@ __global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
     for (g = 0; g < n_groups; g++) {
         const float *xg = src + g * (size_t)gs;
         int8_t *yg = dst + g * (size_t)gs;
-        for (i = tid; i < gs; i += nthreads) {
-            float acc = 0.0f;
-            for (j = 0; j < gs; j++)
-                acc += xg[j] * H[(size_t)j * (size_t)gs + (size_t)i];
-            float q = roundf(acc * inv);
-            if (q > 127.0f) q = 127.0f;
-            if (q < -127.0f) q = -127.0f;
-            yg[i] = (int8_t)q;
+        for (i = tid; i < gs; i += nthreads) buf[i] = xg[i];
+        __syncthreads();
+        if (use_fwht) {
+            h3_cuda_sl_fwht_normalized(buf, gs, tid, nthreads);
+            for (i = tid; i < gs; i += nthreads) {
+                float q = roundf(buf[i] * inv);
+                if (q > 127.0f) q = 127.0f;
+                if (q < -127.0f) q = -127.0f;
+                yg[i] = (int8_t)q;
+            }
+        } else {
+            for (i = tid; i < gs; i += nthreads) {
+                float acc = 0.0f;
+                for (j = 0; j < gs; j++)
+                    acc += buf[j] * H[(size_t)j * (size_t)gs + (size_t)i];
+                float q = roundf(acc * inv);
+                if (q > 127.0f) q = 127.0f;
+                if (q < -127.0f) q = -127.0f;
+                yg[i] = (int8_t)q;
+            }
         }
+        __syncthreads(); /* protect buf before next group load */
     }
 }
 
@@ -4764,7 +4820,8 @@ int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
         if (!h3_cuda_ensure_hadamard(cuda, convrot_groupsize, error,
                                      error_size))
             return 0;
-        smem = (size_t)threads * sizeof(float);
+        /* buf[gs] + red[threads] — FWHT / tiled-x workspace */
+        smem = ((size_t)convrot_groupsize + (size_t)threads) * sizeof(float);
         h3_cuda_epi_fuse_sl_convrot_quant_kernel<<<(unsigned)m_pad, threads,
                                                    smem, h3_cuda_op_st(cuda)>>>(
             d_swiglu, cuda->d_hadamard, d_xi8, d_scales, m, k,
