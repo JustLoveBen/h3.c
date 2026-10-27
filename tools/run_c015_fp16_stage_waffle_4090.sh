@@ -82,24 +82,16 @@ run_arm() {
 
 extract_peak() {
   local log=$1
-  # Prefer peak_dit GiB from vram_ledger; fall back to max bucket
-  python3 - "$log" <<'PY'
+  # Ledger format: vram_ledger: point=peak_dit ... used_mib=22878.9
+  python3 - "$log" <<'INNER'
 import re, sys
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-# vram_ledger_delta peak_dit=… or vram_ledger: peak_dit=…
+text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
 vals = []
-for m in re.finditer(r"peak_dit[=:\s]+([0-9.]+)\s*GiB", text):
-    vals.append(float(m.group(1)))
-for m in re.finditer(r"vram_ledger.*peak[^\n]*?([0-9.]+)\s*GiB", text):
-    vals.append(float(m.group(1)))
-# also MiB lines
-for m in re.finditer(r"peak_dit[=:\s]+([0-9.]+)\s*MiB", text):
+for m in re.finditer(r'vram_ledger:\s*point=peak_dit\b[^\n]*?used_mib=([0-9.]+)', text):
     vals.append(float(m.group(1)) / 1024.0)
-if not vals:
-    print("NA")
-else:
-    print(f"{max(vals):.4f}")
-PY
+print('NA' if not vals else f'{max(vals):.4f}')
+INNER
+}
 }
 
 # Arm A: baseline (stage unset)
