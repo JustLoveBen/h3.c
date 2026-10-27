@@ -27,9 +27,9 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 
 ## Priority next (Track-A waffleable, DeepSeek-derived)
 
-1. **C015 construction** (消中转) — only Track-A item with expected **VRAM** metric and Absorb kinship; gate waffle+E2.  
-2. **C011** VAE cast/prescale fuse — **dig+** [`c011-dig`](2026-10-28-c011-vae-cast-prescale-dig.md) (Exp-G2 BLOCK pivot); nsys re-baseline next; WC mid.  
-3. **C016 PDL** — only after a self-written short chain exists; low WC.  
+1. ~~**C015**~~ built OFF + waffle/E2 PASS (−1.412 GiB); default still OFF.  
+2. ~~**C011**~~ VAE cast/prescale — **stale closed NO_WC_WIN** [`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md) (VAE roundtrip ≈29 ms).  
+3. **C016 PDL** — **next dig**; only after a self-written short chain exists; low WC.  
 4. **Do not** reopen C018/C019/C003-SL/FlashMLA.
 
 Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; remaining «DeepSeek path» for near-lossless **is C015**, not MLA kernels.

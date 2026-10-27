@@ -157,7 +157,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C008** | Attn | SLA 式稀疏+线性补偿叠 sol | 训/推混合；保运动 | video-dit-attention-frontier §7 | WC中~高 Q高 R高 | 独立 SKU；非默认金线 | **idea** | — | 仅观察/研究臂；勿与 C001 交叉 |
 | **C009** | Attn | SageAttention3 FP4 opt-in | 注意力段低精度 | frontier §5.1 | WC中 Q高 | sm_120 验证 | **idea** | S4 | 1–2 天探针，独立臂 |
 | **C010** | Attn | sol MMDiT dense 护栏（文本行/前层 dense） | 降稀疏质量风险 | accel 附录 | Q中 | sol 臂 | **idea** | — | A/B 质量 |
-| **C011** | VAE | cast/prescale ~2.29s 中可融余量 | 融合/消除往返 | quality-preserving；sm120；[`c011-dig`](2026-10-28-c011-vae-cast-prescale-dig.md) | WC中 | nsys 授权 | **dig+**（Exp-G2 BLOCK 后 Track-A 枢轴；先 4090 重基线再改） | S5 | nsys 归因 → fuse-only；勿混 C012 TF32 |
+| **C011** | VAE | cast/prescale ~2.29s 中可融余量 | 融合/消除往返 | [`c011-dig`](2026-10-28-c011-vae-cast-prescale-dig.md)；[`nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md) | — | — | **stale closed (NO_WC_WIN)**：VAE weight roundtrip ≈29 ms≪0.3 s；naive 301 ms=DiT SDPA cast | S5 | 勿再开 fuse；C012 sgemm 另册 |
 | **C012** | VAE | VAE 段 SIMT sgemm / TF32 衍生 | 算力路径升级 | sm120「VAE 族未施工」 | WC中 Q中（TF32） | nsys | **idea** | S5 | T1 允许 TF32；T2 慎 |
 | **C013** | VAE | VAE INT8 路径深化 | 与 DiT INT8 同族 | `h3_vae_int8*` | WC低~中 | 质量门 | **partial** | S4 | 不挡 DiT 主线 |
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
@@ -345,7 +345,7 @@ C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
 C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-ink-0pct-sl-bitid-plus46pct,S5,keep-off
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
-C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
+C011,A,VAE,cast/prescale fusion remainder,stale-closed-NO_WC_WIN,S5,P2
 C015,A/C,DiT,act FP16 staging,dig-plus-stub,S2,P2
 C018,A,DiT,QKV merge 3to1,stale-closed-exp-g3,S5,P-closed
 C019,A,DiT,QKNorm+RoPE fuse,stale-closed-exp-g3,S5,P-closed
@@ -417,6 +417,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-28 | **C015 built OFF**: F16 d_qkv (+wide!lora) carve, `y_f16` dequant, F16qkv rope, FC2 cast; default OFF pending waffle+E2. |
 | 2026-10-28 | **C015 480p waffle+E2 PASS** (−1.412 GiB peak_dit; mean|Δb16|=0.015); default still OFF. |
 | 2026-10-28 | **Exp-G2 C035 BLOCK** (no local refiner weights) → pivot **C011 dig+**; C015 default untouched. |
+| 2026-10-28 | **C011 CLOSED NO_WC_WIN** @4090 nsys：VAE F16↔F32 weight roundtrip ≈29 ms；next DeepSeek **C016 PDL dig**. |
 | 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---

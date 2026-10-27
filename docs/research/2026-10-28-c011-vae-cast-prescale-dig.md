@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-28 Asia/Shanghai  
 **Trigger:** Exp-G2 C035 **BLOCK** (no local refiner weights) → pivot Track-A.  
-**Status:** dig+ (no construction this slice; needs nsys attribution before code).  
+**Status:** **CLOSED NO_WC_WIN** — see [`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md). VAE weight roundtrip ≈29 ms ≪ 300 ms gate; naive 301 ms was DiT SDPA cast.  
 **≠** DiT `H3_DIT_ACT_F16` / C015 act FP16 staging.
 
 ## Claim → mechanism → metric
@@ -53,3 +53,11 @@
 ## Out of scope
 
 - C035 download; FaceRefine; C015 default flip; NVFP4 VAE.
+
+
+## Close (2026-10-28)
+
+nsys re-baseline on 4090 @`84e75b4` product stack: **NO_WC_WIN**.  
+Fuseable VAE meat ≈29.3 ms (F16→F32→F16 weight load). No `H3_VAE_CAST_FUSE`. No construction.
+
+**Next DeepSeek item:** C016 PDL dig (not C012 TF32; not FaceRefine/C035 download).

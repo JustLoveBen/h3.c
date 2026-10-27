@@ -33,7 +33,7 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 | 2 | **C062** | `H3_TE_CACHE_AUTO=1` + `--repeat>=2` | bit-id emb | te 3.5s→~0.3s on HIT | **partial+** @ `95ab073` | AUTO MISS→reuse OK; still not gold default |
 | 3 | C070 | `H3_FORBID_HOT_SYNC` | n/a (hygiene) | low | landed(forbid) | KPI runs |
 | 4 | C068/C069 | RoPE host memo + VAE H2D skip | bit-id | rope host −9ms; dit Δ noise | landed / partial+ | Fair hot memo on/off done; default-on |
-| 5 | C011 | VAE cast/prescale fuse | bit-id if fuse-only | mid | idea | Needs nsys; disk 99% |
+| 5 | C011 | VAE cast/prescale fuse | bit-id if fuse-only | — | **stale closed NO_WC_WIN** | nsys@4090 ≈29 ms VAE meat |
 | 6 | C003 redesign | in-kernel ConvRot+requant (`H3_DIT_EPI_FUSE_SL`) | bit-id (238 PASS) | mid (was fake +3–8%) | **landed OFF** | Naive SL hot dit **+46%**; ink ~0%; P2 DISARMED; keep OFF |
 | 7 | C018 QKV merge | maybe non-bit if INT8 order | mid | idea/maybe stale | Diff before build |
 | 8 | Z05 CUDA Graph default | bit-id launch | <0.5s noise | closed default-off | Keep off |

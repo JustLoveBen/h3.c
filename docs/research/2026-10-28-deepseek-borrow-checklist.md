@@ -24,13 +24,13 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | 融合消中转 / epilogue | 小核融；GEMM+epi | **C003** EPI_FUSE / SL / INK | **boundary；keep OFF**（SL +46% dit） | A | 勿 default；tiled/TC 前不谈 WC |
 | E2-P3 跨 phase | 融合延伸 | **C004** | **idea** | A | C003 数值门后 |
 | Hadamard / ConvRot 共设计 | outlier 抑 | **C005** + `H3_DIT_ACT_F16` ConvRot | **partial**（ConvRot F16 **default ON**） | A | 不单独立项；≠ C015 |
-| 激活带宽中转降半 | 显存/带宽思维（DeepInfer T02） | **C015/C042** `H3_DIT_ACT_FP16_STAGE` | **pending(stub)**：getter 拒装；ledger 可印 half-save | A | **Track-A #1 施工**（见下） |
+| 激活带宽中转降半 | 显存/带宽思维（DeepInfer T02） | **C015/C042** `H3_DIT_ACT_FP16_STAGE` | **built OFF + gate PASS** | A | default flip TBD；勿本切片翻转 |
 | 权重窗 / streaming | 显存预算 | **C041** window24；**C043** streaming | C041 **probed**；C043 **idea** | A | C041 默认不变；C043 等 C015 数字 |
 | L2 pin / RoPE memo | cache hint / 不变量 | **C017**；**C068/C069** | C017 opt-in 无 WC；C068 default-on | A | 保持 |
 | PDL 短链 | launch 气泡 | **C016** | **idea** | A | 排融合后 |
 | QKV 3→1 宽 GEMM | Sol Pillar-1 / DeepSeek Absorb 同构 | **C018** `H3_DIT_QKV_MERGE` | **stale closed**（Exp-G3 静态：INT8 已是单次宽 GEMM） | A | 停 merge 叙事；catalog 标 closed |
 | QKNorm+RoPE 融合 | Pillar-1 / Absorb | **C019** `H3_DIT_QKNORM_ROPE_FUSE` | **stale closed**（Exp-G3：`qkv_rope_f16_kernel` 已融） | A | 停；残留 F32 `d_qkv` → **C015** |
-| VAE cast 融合余量 | 中转税 | **C011/C012** | **idea** | A | 需 nsys+盘；勿盲改 |
+| VAE cast 融合余量 | 中转税 | **C011** | **stale closed (NO_WC_WIN)**；C012 sgemm 仍 idea | A | nsys@4090：VAE roundtrip ≈29 ms；见 close doc |
 | 配置即合同 / 测量卫生 | DeepInfer EnvVar / T03/T12 | **C061/C065/C066/C067/C073/C074** | **landed**（C073 waffle Δ=0） | A | 持续强制 |
 | VRAM 账本 | profile 后切预算 T02 | **C040** | **landed** 480p+768p@4090 | A | 指导 C015 余量 |
 | 少做前向 | 投机→合同少步 | **C030/C031** PDMD/DMAD | **landed(visual-OR)** | B | 产品主墙钟轴仍是 NFE |
@@ -47,15 +47,11 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 
 ## Track-A 下一刀（最高 ship ROI · 给执行器）
 
-1. **C015/C042 — 完成 `d_qkv`/`d_wide` FP16 工作区中转（消中转）** — **唯一仍开的 DeepSeek/Absorb 近无损主刀**  
-   - Exp-G3 已关 C018/C019；残留是 F32 物化 `d_qkv`/`d_wide`，不是缺 merge。  
-   - 理论 half-save：480p ≈1.41 GiB · 768p ≈3.50 GiB（上界）；E2 要测 peak ≥−0.5 GiB + waffle。  
-   - stub/`dit_ws_ledger`/`H3_DIT_ACT_FP16_STAGE` **已在脏树**（另切片 dig）——接盘续作 packing，勿平行覆盖。  
-   - 合同：非 BIT_ID；默认 OFF 至 E2；施工可无长 GPU，短探针等 G1 让卡。
+1. ~~**C015/C042**~~ — **built OFF + gate PASS**（勿本切片 default flip）。  
+2. ~~**C011**~~ — **stale closed NO_WC_WIN**（[`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md)；VAE meat ≈29 ms）。  
+3. **C016 PDL（下一刀 dig）** — 仅在自写 GEMM→dequant 短链存在后施工；预期 WC 低；**勿**重开 C018/C019/C003-SL/FlashMLA。  
+   - C012 VAE SIMT sgemm ≈214 ms 仍 idea（TF32 质量风险），非 DeepSeek #3。
 
-2. **C011（次选）— VAE cast/prescale 融合余量**  
-   - DeepInfer S5 中转税；需 nsys 定点再动刀；WC 中等、风险低于乱开 EPI_FUSE。  
-   - **勿**把 C016 PDL / C003-SL / C018–C019 重开当 #2。
 
 **先别排：** DualPipe、FlashMLA、DeepEP、NVFP4 重开、U=2 BF16 当 4090 主刀、EPI_FUSE 默认开、重开 C018/C019、与 G1 抢同一张卡。
 
@@ -65,3 +61,4 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | --- | --- |
 | 2026-10-28 | 初版：DeepSeek+DeepInfer → C0xx 状态表。 |
 | 2026-10-28 | 对齐 Exp-G3：C018/C019 → stale closed；Track-A #1=C015，#2=C011（勿重开 merge）。 |
+| 2026-10-28 | C015 PASS；C011 nsys **NO_WC_WIN closed**；下一刀 **C016 PDL dig**。 |

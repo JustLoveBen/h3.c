@@ -35,7 +35,7 @@
 | **3** | **抬画布质量 SKU**（960×544 / 1152×640 PDMD上限；1344 Euler） | quality@sameNFE | 小脸五官可辨（主杠杆） | L | 跨分辨率非 waffle 金线 | ✅ 已证 | 低（产品档） | **NOW（质量）** — [`ghosting`](2026-10-27-ghosting-and-small-face.md)：远脸=像素预算；**加步不是免费清晰度** |
 | **4** | **C035 detail / taomate-0.7 refiner LoRA** | quality@sameNFE / better-than-DMAD polish | 少步过饱和/糊边恢复；非发明远景像素 | M | 有损臂；独立合同 | ✅ | 中 | **BLOCK 2026-10-28** — 无本地权（[`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md)）；权重到位再扫 |
 | **5** | **人脸/身份 LoRA（训练臂 · 非 FaceRefine）** | training / quality | 近景身份/口型更稳；**不能**单独救 ~34px 远脸 | H | 新合同 | ✅ 推理可挂 | **高（训）** | **有条件 NOW 设计、DEFER 重训** — 见 §2.1；需 face-heavy 数据 + 与 DMAD/Euler 合同正交 |
-| **6** | **C011 VAE cast/prescale 融合余量** | lossless WC | 中（历史 cast~2s 量级中的可融子集） | L–M | BIT_ID 若纯融合 | ✅ | 中 | **NEXT（需 nsys+盘）** — INT8 DiT 近峰后 VAE 是下一秒级靶；勿无 profile 改 |
+| **6** | ~~**C011 VAE cast/prescale**~~ | — | ≈29 ms VAE meat | — | — | — | — | **CLOSED NO_WC_WIN** [`nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md)；next DeepSeek **C016 PDL dig** |
 | **7** | **C018 QKV merge（先 diff 现状）** | lossless WC? | 历史估 −0.6~−1.2s；可能已覆盖 | M | INT8 序可能非 bit | ✅ | 低探+中改 | **NEXT probe** — catalog 标 *maybe stale*；先证明缺口再写核 |
 | **8** | **C064 TE↔DiT↔VAE 安全重叠** | VRAM/WC hygiene | 峰值错峰；冷启动/预热 OOM 少 | M | 应 bit | ✅ | 中 | **AFTER C041/C015** — 白名单已 landed；真重叠仍门控 |
 | **9** | **C043 layerwise weight streaming** | VRAM 能力 | 768p+ / 更大窗「能跑完」 | M | WC 中性~负 | ✅ | 高 | **DEFER** — 余量决策前提是 C041/C015 数字 |
