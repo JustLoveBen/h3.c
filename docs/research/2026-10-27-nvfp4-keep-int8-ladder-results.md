@@ -39,3 +39,7 @@ Cold-clip `waffle_guard INVALID_LOWENERGY` is a **known false positive** on INT8
 Pre-fix mlp/qkv FAIL was an **implementation bug**, not proof that attn-FP4/mlp-INT8 is theoretically impossible.
 See `2026-10-27-nvfp4-keep-int8-gate-bug-rca.md`. Postfix ladder restores energy on mlp/qkv/full; k_qkv≠k_full.
 Fine arms `attn,fc1` / `attn,fc2` also energy-OK. Multi-scene visual + OR :free still required.
+
+## Multi-scene gate (2026-10-27 later)
+
+See `2026-10-27-nvfp4-keep-int8-multiscene.md`. 5 prompts × {int8, attn, attn_fc1, attn_fc2} = 20 clips all energy-OK. Experimental recommend: KEEP=attn.
