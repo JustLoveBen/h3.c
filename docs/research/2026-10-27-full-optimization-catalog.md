@@ -153,7 +153,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C004** | DiT INT8 | E2-P3 跨 phase FC2→QKV | mode 3 requant 接线 | DESIGN.md §5 | WC中 R中高 | C003 数值门 | **idea** | S5 | A1 通过后再开 |
 | **C005** | DiT | Hadamard/ConvRot 与 FP4 共设计 | 激活旋转抑 outlier | transfer 2.2；nvfp4 文 | Q中（绑 C001） | 随 NVFP4 | **partial** | S4 | 不单独开项 |
 | **C006** | Attn | cuDNN SDPA / sol 后端选择与稳态 | registry；graph 政策 | `h3_sdpa*`；`321538a` | WC低~中 Q高 | 对照纪律 | **landed/政策** | S6 | 保持 graph 默认关；临时开写标题 |
-| **C007** | Attn | sol warmup/autotune 是否 per-clip ~1.05s | 持久化 (T,shape,GPU) | sm120 L1；sol-attn R3 | WC中（cold） | 先证实付费频率 | **idea** | S6 | 冷热日志对照；已是 cold-only 则关闭项 |
+| **C007** | Attn | sol warmup/autotune 是否 per-clip ~1.05s | 持久化 (T,shape,GPU) | sm120 L1；sol-attn R3 | WC中（cold） | 先证实付费频率 | **idea / N/A@4090-cudnn**（sol_cute want=0 lib=0） | S6 | 仅 sol_cute 武装后重开 |
 | **C008** | Attn | SLA 式稀疏+线性补偿叠 sol | 训/推混合；保运动 | video-dit-attention-frontier §7 | WC中~高 Q高 R高 | 独立 SKU；非默认金线 | **idea** | — | 仅观察/研究臂；勿与 C001 交叉 |
 | **C009** | Attn | SageAttention3 FP4 opt-in | 注意力段低精度 | frontier §5.1 | WC中 Q高 | sm_120 验证 | **idea** | S4 | 1–2 天探针，独立臂 |
 | **C010** | Attn | sol MMDiT dense 护栏（文本行/前层 dense） | 降稀疏质量风险 | accel 附录 | Q中 | sol 臂 | **idea** | — | A/B 质量 |
@@ -393,6 +393,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 日期 | 说明 |
 |---|---|
 | 2026-10-27 | C003 EPI_FUSE_SL 238 A/B @ `ed1ce72`: BIT_ID+waffle PASS；hot dit **+46%** → keep OFF；**开发收口**。见 [`epi-fuse-sl`](2026-10-27-epi-fuse-sl-single-launch.md) / [`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)。 |
+| 2026-10-28 | DMAD-4 vs Euler-8 480p KPI (t71u primary pair; PDMD skipped): warm dit 1.61× / warm e2e 1.43×; C007 N/A on cudnn. 见 [`dmad4-vs-euler8`](2026-10-28-dmad4-vs-euler8-kpi-480p.md)。 |
 | 2026-10-28 | C073 dump→replay 480p Euler-8 GPU acceptance：async on/off waffle PASS Δ=0 + rgb bit-id；PDMD contrast-only (t71u). 见 [`c073-480p`](2026-10-28-c073-dump-replay-480p.md)。 |
 | 2026-10-28 | C040 ledger buckets+delta + true `peak_dit`；C062 AUTO 480p×5s p10 KPI (Euler-8 WALL 91.4s / PDMD-4 61.0s；clip2 te=0). 见 [`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md)。 |
 | 2026-10-27 | Fair hot KPI：C017 Δ≈0 keep opt-in；C068 memo default-on（rope −9ms）；`H3_ROPE_MEMO=0` KPI；**本轮自动 ROI 收口**。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) §6。 |
