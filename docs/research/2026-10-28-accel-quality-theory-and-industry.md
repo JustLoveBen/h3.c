@@ -328,6 +328,7 @@
 | **Arms** | DMAD-4 裸；+refiner STEPS=1/2 × scale∈{0.5,0.7}；对照抬画布一档（质量锚） |
 | **PASS** | 同画布人眼：过饱和/ smear 明显改善；无 identity/色偏灾难；主观增益 ≥「半档抬画布」的一半 |
 | **FAIL** | 无改善或全局糊 → 维持 C035 idea，不产品化；**绝不**回退 FaceRefine stitch |
+| **结果 2026-10-28** | **BLOCK（无权重）** — 4090/Mac `models/loras` 仅 DMAD/PDMD；无 Kijai rank-19 / TaoMate。接线在，本轮不下载。详见 [`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md)。**枢轴 Track-A C011** dig。 |
 
 #### Exp-G3 · Track A · Sol Pillar-1「免费核」缺口证明（无长跑也可开）
 

@@ -157,7 +157,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C008** | Attn | SLA 式稀疏+线性补偿叠 sol | 训/推混合；保运动 | video-dit-attention-frontier §7 | WC中~高 Q高 R高 | 独立 SKU；非默认金线 | **idea** | — | 仅观察/研究臂；勿与 C001 交叉 |
 | **C009** | Attn | SageAttention3 FP4 opt-in | 注意力段低精度 | frontier §5.1 | WC中 Q高 | sm_120 验证 | **idea** | S4 | 1–2 天探针，独立臂 |
 | **C010** | Attn | sol MMDiT dense 护栏（文本行/前层 dense） | 降稀疏质量风险 | accel 附录 | Q中 | sol 臂 | **idea** | — | A/B 质量 |
-| **C011** | VAE | cast/prescale ~2.29s 中可融余量 | 融合/消除往返 | quality-preserving；sm120 | WC中 | nsys 授权 | **idea** | S5 | 剖析后再改 |
+| **C011** | VAE | cast/prescale ~2.29s 中可融余量 | 融合/消除往返 | quality-preserving；sm120；[`c011-dig`](2026-10-28-c011-vae-cast-prescale-dig.md) | WC中 | nsys 授权 | **dig+**（Exp-G2 BLOCK 后 Track-A 枢轴；先 4090 重基线再改） | S5 | nsys 归因 → fuse-only；勿混 C012 TF32 |
 | **C012** | VAE | VAE 段 SIMT sgemm / TF32 衍生 | 算力路径升级 | sm120「VAE 族未施工」 | WC中 Q中（TF32） | nsys | **idea** | S5 | T1 允许 TF32；T2 慎 |
 | **C013** | VAE | VAE INT8 路径深化 | 与 DiT INT8 同族 | `h3_vae_int8*` | WC低~中 | 质量门 | **partial** | S4 | 不挡 DiT 主线 |
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
@@ -177,7 +177,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C032** | fewstep | 错合同污染加速叙事 | contract FAIL / preset / σ 金表 | fewstep_contract；fixtures | Q高 R低 | — | **landed**（host） | S11 | GPU 跑时强制 `--fewstep-contract` |
 | **C033** | fewstep | PDMD-2 仅作合同回归 | 大 σ 跳固有发糊 | pdmd 文 r2–r4 | — | — | **landed/边界** | — | 不作 T3 通过尺 |
 | **C034** | fewstep | Metal CLI 无 LoRA/sampler | 边界说明 | fewstep-metal-boundary | — | — | **landed（文档）** | — | 验收走 `h3_cuda_generate` |
-| **C035** | 蒸馏质量 | turbo4 过饱和/糊 | taomate 0.7 refiner / 细节 LoRA | accel 附录 | Q中 | 独立臂 | **idea** | S7/族8 | 低成本 A/B；勿进默认 |
+| **C035** | 蒸馏质量 | turbo4 过饱和/糊 | taomate 0.7 refiner / 细节 LoRA | accel 附录；[`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md) | Q中 | 独立臂 | **BLOCK**（4090/Mac `models/` 无 Kijai/TaoMate 权；接线在；禁下载本轮） | S7/族8 | 权重到位后重开 STEPS×SCALE 扫；勿 FaceRefine |
 | **C036** | 求解器 | 高阶求解器少 NFE（非蒸馏） | 族1 solver | accel 机理 | WC中 Q中 | 金线步数政策 | **idea** | — | 观察；与蒸馏正交 |
 | **C037** | 投机扩散 | ASDSV 类 | 少跑完整 forward | transfer 4.4 | WC? R高 | draft 权重无 | **idea/观察** | S7 | **不进主序列** |
 
@@ -416,6 +416,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-28 | **Exp-G3** Pillar-1 gap proof: C018/C019 **stale closed**; C015/C042 **dig+** ledger+stub; DeepSeek Track-A status [`deepseek-derived-track-a-status`](2026-10-28-deepseek-derived-track-a-status.md). |
 | 2026-10-28 | **C015 built OFF**: F16 d_qkv (+wide!lora) carve, `y_f16` dequant, F16qkv rope, FC2 cast; default OFF pending waffle+E2. |
 | 2026-10-28 | **C015 480p waffle+E2 PASS** (−1.412 GiB peak_dit; mean|Δb16|=0.015); default still OFF. |
+| 2026-10-28 | **Exp-G2 C035 BLOCK** (no local refiner weights) → pivot **C011 dig+**; C015 default untouched. |
 | 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---

@@ -28,7 +28,7 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 ## Priority next (Track-A waffleable, DeepSeek-derived)
 
 1. **C015 construction** (消中转) — only Track-A item with expected **VRAM** metric and Absorb kinship; gate waffle+E2.  
-2. **C011** VAE cast/prescale fuse — S5; needs nsys; WC mid.  
+2. **C011** VAE cast/prescale fuse — **dig+** [`c011-dig`](2026-10-28-c011-vae-cast-prescale-dig.md) (Exp-G2 BLOCK pivot); nsys re-baseline next; WC mid.  
 3. **C016 PDL** — only after a self-written short chain exists; low WC.  
 4. **Do not** reopen C018/C019/C003-SL/FlashMLA.
 

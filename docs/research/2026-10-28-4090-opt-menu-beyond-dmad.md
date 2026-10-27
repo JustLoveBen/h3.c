@@ -33,7 +33,7 @@
 | **1** | **C041 窗 30→24** | VRAM | ~GiB 级峰值余量；可能 −WC（H2D 更频） | L | 同配置可过（能力探针） | ✅ | 低 | **NOW（他机在跑）** — C040 768p free≈0.8 GiB，缩窗是最便宜的余量探针；**不解默认** |
 | **2** | **C015/C042 act-FP16 中转** | VRAM / 近无损 WC | 激活带宽↓；768p+ 余量；WC 可能小正/零 | M | **非 BIT_ID**；需同配置 waffle | ✅ | 中 | **NOW（他机在跑）** — 与 C041 互补；成功标准见 §4 |
 | **3** | **抬画布质量 SKU**（960×544 / 1152×640 PDMD上限；1344 Euler） | quality@sameNFE | 小脸五官可辨（主杠杆） | L | 跨分辨率非 waffle 金线 | ✅ 已证 | 低（产品档） | **NOW（质量）** — [`ghosting`](2026-10-27-ghosting-and-small-face.md)：远脸=像素预算；**加步不是免费清晰度** |
-| **4** | **C035 detail / taomate-0.7 refiner LoRA** | quality@sameNFE / better-than-DMAD polish | 少步过饱和/糊边恢复；非发明远景像素 | M | 有损臂；独立合同 | ✅ | 中 | **NOW（小 A/B）** — catalog 长地平线已挂；比 FaceRefine 更贴「权重补丁」叙事 |
+| **4** | **C035 detail / taomate-0.7 refiner LoRA** | quality@sameNFE / better-than-DMAD polish | 少步过饱和/糊边恢复；非发明远景像素 | M | 有损臂；独立合同 | ✅ | 中 | **BLOCK 2026-10-28** — 无本地权（[`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md)）；权重到位再扫 |
 | **5** | **人脸/身份 LoRA（训练臂 · 非 FaceRefine）** | training / quality | 近景身份/口型更稳；**不能**单独救 ~34px 远脸 | H | 新合同 | ✅ 推理可挂 | **高（训）** | **有条件 NOW 设计、DEFER 重训** — 见 §2.1；需 face-heavy 数据 + 与 DMAD/Euler 合同正交 |
 | **6** | **C011 VAE cast/prescale 融合余量** | lossless WC | 中（历史 cast~2s 量级中的可融子集） | L–M | BIT_ID 若纯融合 | ✅ | 中 | **NEXT（需 nsys+盘）** — INT8 DiT 近峰后 VAE 是下一秒级靶；勿无 profile 改 |
 | **7** | **C018 QKV merge（先 diff 现状）** | lossless WC? | 历史估 −0.6~−1.2s；可能已覆盖 | M | INT8 序可能非 bit | ✅ | 低探+中改 | **NEXT probe** — catalog 标 *maybe stale*；先证明缺口再写核 |
