@@ -19,7 +19,7 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 | Config-as-contract / golden TE | env contract, te_cache | C061/C062 | **landed+** | Hygiene |
 | VRAM phase ledger | `H3_VRAM_LEDGER` | C040 | **landed+** | Unblocks C015 |
 | Forbid hot sync | sync audit | C070 | partial | P3 |
-| PDL (DeepGEMM `set_pdl`) | GEMM→dequant bubble | C016 | **idea** | After real fuse; cublasLt no PDL |
+| PDL (DeepGEMM `set_pdl`) | GEMM→dequant bubble | C016 | **stale closed** | HW CC≥9.0；4090=8.9；[`c016-close`](2026-10-28-c016-pdl-dig-close.md) |
 | L2 pin small tables | Hadamard pin | C017 | landed opt-in | No WC win |
 | FlashMLA / MLA / GQA / DSA-as-attn | — | Z40/Z41 | **N-A** | No cross-step KV |
 | DeepEP / MoE | — | Z40 | **N-A** | No MoE |
@@ -29,7 +29,8 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 
 1. ~~**C015**~~ built OFF + waffle/E2 PASS (−1.412 GiB); default still OFF.  
 2. ~~**C011**~~ VAE cast/prescale — **stale closed NO_WC_WIN** [`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md) (VAE roundtrip ≈29 ms).  
-3. **C016 PDL** — **next dig**; only after a self-written short chain exists; low WC.  
+3. ~~**C016 PDL**~~ — **CLOSED** @4090（无 HW + 无 cublasLt 挂点）。  
+4. **C043 streaming** — **next dig** (after C041 probed).  
 4. **Do not** reopen C018/C019/C003-SL/FlashMLA.
 
 Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; remaining «DeepSeek path» for near-lossless **is C015**, not MLA kernels.

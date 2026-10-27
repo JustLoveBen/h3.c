@@ -27,7 +27,7 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | 激活带宽中转降半 | 显存/带宽思维（DeepInfer T02） | **C015/C042** `H3_DIT_ACT_FP16_STAGE` | **built OFF + gate PASS** | A | default flip TBD；勿本切片翻转 |
 | 权重窗 / streaming | 显存预算 | **C041** window24；**C043** streaming | C041 **probed**；C043 **idea** | A | C041 默认不变；C043 等 C015 数字 |
 | L2 pin / RoPE memo | cache hint / 不变量 | **C017**；**C068/C069** | C017 opt-in 无 WC；C068 default-on | A | 保持 |
-| PDL 短链 | launch 气泡 | **C016** | **idea** | A | 排融合后 |
+| PDL 短链 | launch 气泡 | **C016** | **stale closed (NO_WC_WIN / HW_UNAVAILABLE@4090)** | A | CC 8.9 无 PDL；cublasLt 无挂点；见 [`c016-close`](2026-10-28-c016-pdl-dig-close.md) |
 | QKV 3→1 宽 GEMM | Sol Pillar-1 / DeepSeek Absorb 同构 | **C018** `H3_DIT_QKV_MERGE` | **stale closed**（Exp-G3 静态：INT8 已是单次宽 GEMM） | A | 停 merge 叙事；catalog 标 closed |
 | QKNorm+RoPE 融合 | Pillar-1 / Absorb | **C019** `H3_DIT_QKNORM_ROPE_FUSE` | **stale closed**（Exp-G3：`qkv_rope_f16_kernel` 已融） | A | 停；残留 F32 `d_qkv` → **C015** |
 | VAE cast 融合余量 | 中转税 | **C011** | **stale closed (NO_WC_WIN)**；C012 sgemm 仍 idea | A | nsys@4090：VAE roundtrip ≈29 ms；见 close doc |
@@ -49,8 +49,9 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 
 1. ~~**C015/C042**~~ — **built OFF + gate PASS**（勿本切片 default flip）。  
 2. ~~**C011**~~ — **stale closed NO_WC_WIN**（[`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md)；VAE meat ≈29 ms）。  
-3. **C016 PDL（下一刀 dig）** — 仅在自写 GEMM→dequant 短链存在后施工；预期 WC 低；**勿**重开 C018/C019/C003-SL/FlashMLA。  
-   - C012 VAE SIMT sgemm ≈214 ms 仍 idea（TF32 质量风险），非 DeepSeek #3。
+3. ~~**C016 PDL**~~ — **stale closed**（[`c016-close`](2026-10-28-c016-pdl-dig-close.md)：4090 CC 8.9 无 PDL HW；cublasLt 无挂点；L2/P2b 上界 ≪0.3 s）。  
+4. **C043 layerwise weight streaming（下一刀 dig）** — C041 probed 默认不变；768p VRAM 能力轴；**勿**重开 C018/C019/C003-SL/FlashMLA。  
+   - C012 VAE SIMT sgemm ≈214 ms 仍 idea（TF32 质量风险），非 DeepSeek 下一刀。
 
 
 **先别排：** DualPipe、FlashMLA、DeepEP、NVFP4 重开、U=2 BF16 当 4090 主刀、EPI_FUSE 默认开、重开 C018/C019、与 G1 抢同一张卡。
@@ -62,3 +63,4 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | 2026-10-28 | 初版：DeepSeek+DeepInfer → C0xx 状态表。 |
 | 2026-10-28 | 对齐 Exp-G3：C018/C019 → stale closed；Track-A #1=C015，#2=C011（勿重开 merge）。 |
 | 2026-10-28 | C015 PASS；C011 nsys **NO_WC_WIN closed**；下一刀 **C016 PDL dig**。 |
+| 2026-10-28 | **C016 CLOSED** NO_WC_WIN/HW_UNAVAILABLE@4090（CC 8.9）；下一刀 **C043 streaming dig**。 |

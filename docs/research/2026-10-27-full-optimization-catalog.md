@@ -162,7 +162,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C013** | VAE | VAE INT8 路径深化 | 与 DiT INT8 同族 | `h3_vae_int8*` | WC低~中 | 质量门 | **partial** | S4 | 不挡 DiT 主线 |
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
 | **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2；[`c015-dig`](2026-10-28-c015-act-fp16-staging-dig.md)；[`kpi`](2026-10-28-c015-fp16-stage-waffle-e2-kpi.md)；DeepSeek 消中转 | WC低 VRAM高 Q中 | C040 | **built OFF + gate PASS**（waffle meanΔ 0.015；E2 peak_dit −1.412 GiB @480p；default still OFF） | S2 | Product default flip TBD；U>1 A2A half TBD |
-| **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；sm120 L2 | WC低（−0.1~−0.3） | 融合后；自写核 | **idea** | S5/S8 | 排 C003 后 |
+| **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；[`c016-close`](2026-10-28-c016-pdl-dig-close.md) | — | CC≥9.0 | **stale closed (NO_WC_WIN / HW_UNAVAILABLE@4090)** | S5/S8 | 4090 CC 8.9；勿施工 |
 | **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot Hadamard `H3_CUDA_L2_PIN` | sm120 M3；[`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) | WC低 bit同 | — | **landed(opt-in)**（fair hot Δ≈+62ms；BIT_ID PASS；**无墙钟收益**） | S2 | 保持 opt-in；勿 default-on |
 | **C018** | DiT | QKV merge（3→1 宽 GEMM） | 历史 gap list | [`exp-g3`](2026-10-28-exp-g3-pillar1-gap-proof.md) | — | — | **stale closed**（已是单 `LINEAR_QKV` GEMM） | S5 | 停止 −0.6~−1.2s 叙事；余量→C015 |
 | **C019** | DiT | QKNorm+RoPE 融合 | gap list 附属 | [`exp-g3`](2026-10-28-exp-g3-pillar1-gap-proof.md)；`qkv_rope_f16_kernel` | — | — | **stale closed**（热路径已融） | S5 | 勿重开 |
@@ -418,6 +418,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-28 | **C015 480p waffle+E2 PASS** (−1.412 GiB peak_dit; mean|Δb16|=0.015); default still OFF. |
 | 2026-10-28 | **Exp-G2 C035 BLOCK** (no local refiner weights) → pivot **C011 dig+**; C015 default untouched. |
 | 2026-10-28 | **C011 CLOSED NO_WC_WIN** @4090 nsys：VAE F16↔F32 weight roundtrip ≈29 ms；next DeepSeek **C016 PDL dig**. |
+| 2026-10-28 | **C016 CLOSED** NO_WC_WIN/HW_UNAVAILABLE@4090（CC 8.9；无 cublasLt PDL）；next DeepSeek **C043 streaming dig**. |
 | 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---
