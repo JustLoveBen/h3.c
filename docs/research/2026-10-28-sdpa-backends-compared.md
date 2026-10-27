@@ -2,7 +2,7 @@
 
 > **日期：** 2026-10-28。**性质：** 只读汇总（答用户「这几个方案是否对比过」）。  
 > **机器语境：** 产品 4090 = Ada sm_89 · cuDNN SDPA；5090/238 = Blackwell sm_120。  
-> **结论先行：** **对比过（历史矩阵 + 5090 sol 护栏 A/B + 理论审计），但不是当前 4090 产品合同（DMAD-4/Euler-8、libs=0）下的同日头对头复测。** Kitchen **不是** DiT 注意力后端。
+> **结论先行：** **对比过**（历史矩阵 + 5090 护栏 + **2026-10-28 Exp-G1：4090 DMAD-4 同日 cudnn vs sol±护栏**）。Kitchen **不是** DiT 注意力后端。产品默认仍 cudnn；sol LAYERS=2 为 Track-B opt-in（需 window=24）。
 
 ---
 
@@ -95,3 +95,19 @@
 | Kitchen | 只谈 VAE 批/融合；勿并入「四个注意力方案」对比 |
 
 **一句话：** 方案目录与历史 A/B **有**；当前 4090 金线 **只跑 cudnn**；Sage/SOL 有速度数字但质量默认不过门（SOL 全稀疏曾退化，护栏臂在 5090 turbo4 双正）；Kitchen 是 VAE 不是 DiT attn。
+
+---
+
+## 5. Exp-G1 补测（2026-10-28 · Track B · DMAD-4）
+
+同日头对头：**cudnn vs sol_cute ± 护栏** @ 4090 · DMAD-4 · 480p×5s · p10 · INT8 window=**24**（窗41 上 sol pool OOM）。
+
+| 臂 | 暖 dit | waffle_mean | 结论 |
+| --- | ---: | ---: | --- |
+| cudnn | 16.9s | 0.774 | Tier-0 基线 |
+| sol 全稀疏 | 14.2s (−16%) | **4.03** | 质量 FAIL |
+| sol LAYERS=2 | 14.4s (−15%) | 0.757 | **Track-B PASS**；默认仍关 |
+| sol STEPS=1 | 14.9s (−12%) | 0.763 | 次优 |
+
+详情与 clips：[`exp-g1`](2026-10-28-exp-g1-sol-guard-vs-cudnn-dmad4-4090.md)。**产品默认仍 cudnn。**
+

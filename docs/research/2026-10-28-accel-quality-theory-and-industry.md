@@ -317,6 +317,7 @@
 | **PASS** | 臂3 waffle 均值 ≤ 臂1 + 0.10；人眼无运动塌/首尾糊；臂3 暖 dit ≤ 臂1 × 0.92；hits 解释得清（dense_skip 计入） |
 | **FAIL** | 臂2 相对臂1 waffle 超 +0.15（复现 V0）→ 确认少步全稀疏禁默认；臂3 不达 PASS → **关闭 4090 sol 产品叙事**，仅留 5090/长序列 |
 | **前置** | `libh3_sol_cute.so` + cute_sm89；修/绕过 `sdpa_strict` 与 dense_skip 冲突 |
+| **结果 2026-10-28** | **PASS（护栏臂）** — arm3 LAYERS=2：暖 dit **0.848×** cudnn、waffle Δ **−0.017**；arm2 全稀疏 waffle **+3.26 FAIL**。需 `H3_DIT_INT8_WINDOW=24`（窗41 OOM sol）。**默认仍 cudnn**。详见 [`exp-g1`](2026-10-28-exp-g1-sol-guard-vs-cudnn-dmad4-4090.md)。 |
 
 #### Exp-G2 · Track B · TaoMate/细节 refiner @ DMAD-4（C035 落地）
 
@@ -385,3 +386,4 @@
 | 2026-10-28 | 初稿：行业地图（带链接）、本仓 Track A/B 证据表、加速且提质理论、严谨模板、分轨下一刀。分析-only，无长 GPU。 |
 | 2026-10-28 | **§G 增补：** sol-h3 / FastH3 / VDN / TaoMate / DMD 族竞品吸收 → Track A/B 映射 → shippable 栈 S0–S3 → Exp-G1…G6 可证伪门。分析-only。 |
 | 2026-10-28 | **Exp-G3 FAIL**：C018/C019 stale closed；C015 dig+；[`deepseek-derived-track-a-status`](2026-10-28-deepseek-derived-track-a-status.md)。 |
+| 2026-10-28 | **Exp-G1 PASS（护栏）**：4090 DMAD-4 sol LAYERS=2 vs cudnn；全稀疏 FAIL；默认不改。[`exp-g1`](2026-10-28-exp-g1-sol-guard-vs-cudnn-dmad4-4090.md)。 |
