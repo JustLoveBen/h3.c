@@ -33,3 +33,9 @@ Cold-clip `waffle_guard INVALID_LOWENERGY` is a **known false positive** on INT8
 ## Artifacts
 
 `out/keep_int8_ladder_20261027/{k_all,k_attn,k_mlp,k_qkv,k_full}/{generate.log,summary.txt,latent.raw,p01_sprint.mp4}`
+
+## Update: gate bug fix (2026-10-27 later, Asia/Shanghai)
+
+Pre-fix mlp/qkv FAIL was an **implementation bug**, not proof that attn-FP4/mlp-INT8 is theoretically impossible.
+See `2026-10-27-nvfp4-keep-int8-gate-bug-rca.md`. Postfix ladder restores energy on mlp/qkv/full; k_qkv≠k_full.
+Fine arms `attn,fc1` / `attn,fc2` also energy-OK. Multi-scene visual + OR :free still required.

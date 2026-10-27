@@ -3629,6 +3629,13 @@ static int block_phase_out_mlp(
                        (h3_dit_epi_fuse_ink_wanted() || epi_fuse_sl);
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
+    /* Hybrid KEEP bug (2026-10-27 RCA): FP4 out/fc2 already fuse AdaLN gate into
+     * d_b / d_y. When fp4_mask!=0, gemm_epi is off and the old post-out
+     * gate_adaln(d_x,d_a) path re-gated the *pre-qkv* AdaLN act (d_a), wiping
+     * the FP4 out result — so KEEP=qkv ≡ full FP4 checksum, and KEEP=mlp left
+     * INT8 fc2 in d_a while nvfp4_on skipped gate_mlp (d_y never written). */
+    int out_fp4_gated = 0;
+    int fc2_fp4_gated = 0;
     h3_cuda_dit_gemm_epi epi;
     static int fused_logged;
 
@@ -3662,6 +3669,7 @@ static int block_phase_out_mlp(
                                 &fp4_gemm, detail, sizeof(detail))) {
             prep = fp4_prep;
             gemm = fp4_gemm;
+            out_fp4_gated = 1; /* d_b already = gate(residual, out) */
             goto out_done;
         }
         fprintf(stderr, "dit_nvfp4: out b%u FP4 dispatch failed (%s); INT8\n",
@@ -3726,7 +3734,9 @@ out_done:
                  backend);
     }
 
-    if (gemm_epi) {
+    /* FP4 out already wrote gated residual into d_b — do NOT re-run
+     * gate_adaln(d_x, d_a): d_a is still the pre-qkv AdaLN act. */
+    if (gemm_epi || out_fp4_gated) {
         uly_klog("adaln_mlp", "enter");
         if (!h3_cuda_adaln_f32_dev(ctx->cuda, d_b, d_n2, d_mod, d_map, seq,
                                    hidden, slots, 3, 4, eps, d_a, &op, detail,
@@ -3953,6 +3963,7 @@ fc1_done:
             if (nvfp4_gemm_dispatch(ctx, block, 3u, d_act, d_y, seq, d_b,
                                     d_mod, d_map, 5u, ctx->lora ? d_a : NULL,
                                     &prep, &gemm, detail, sizeof(detail))) {
+                fc2_fp4_gated = 1; /* d_y already = gate(residual, fc2) */
                 goto fc2_done;
             }
             fprintf(stderr,
@@ -4048,9 +4059,10 @@ fc2_done:
         }
     }
 
-    /* FP4 fc2 already applied the MLP gate in its BF16 epilogue (it writes
-     * d_y), so skip the standalone gate like the INT8 R31 path does. */
-    if (gemm_epi || ctx->nvfp4_on) {
+    /* FP4 fc2 already applied the MLP gate in its BF16 epilogue (writes d_y).
+     * KEEP hybrid: INT8 fc2 still needs standalone gate_mlp — do NOT skip on
+     * nvfp4_on alone (that left d_y untouched / std explode on KEEP=mlp). */
+    if (gemm_epi || fc2_fp4_gated) {
         if (stats) stats->gate_mlp_ms = 0.0;
         return 1;
     }

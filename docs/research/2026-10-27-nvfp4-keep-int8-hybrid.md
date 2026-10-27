@@ -5,7 +5,7 @@
 # NVFP4 KEEP_INT8 hybrid (no-retrain)
 
 **Date:** 2026-10-27 (Asia/Shanghai)  
-**Status:** code landed; 238 ladder running — see `2026-10-27-nvfp4-keep-int8-ladder-results.md`  
+**Status:** KEEP landed; **out/fc2 gate hybrid bug fixed** (see gate-bug RCA). Postfix energy OK on mlp/qkv/full; multi-scene visual pending.  
 **SHA base:** a7d7375 (KEEP+DISARM on origin/main)
 
 ## Why
