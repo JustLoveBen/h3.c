@@ -13,7 +13,7 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 |---|---|---|---|---|
 | Absorb / merge projections | QKV 3→1 GEMM | C018 | **stale closed** | Exp-G3 proof 2026-10-28 |
 | Fused Q-norm+RoPE+cast | `qkv_rope_f16_kernel` | C019 | **stale closed** | Same proof |
-| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **built OFF** | waffle+E2 before default; U=1 |
+| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **built OFF + gate PASS** | waffle+E2 PASS @480p (−1.412 GiB); default still OFF; U=1 |
 | GEMM+epilogue / ConvRot+requant | EPI_FUSE / INK / SL | C003 | **landed OFF** | SL +46% dit; ink ~0%; keep OFF |
 | DeferredRelease overlap | TE↔DiT prefetch | C064 | **partial+ NO_WC_WIN** | Opt-in only |
 | Config-as-contract / golden TE | env contract, te_cache | C061/C062 | **landed+** | Hygiene |

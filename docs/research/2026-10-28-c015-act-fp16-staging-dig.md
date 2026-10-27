@@ -59,7 +59,7 @@ C015_half_save = (qkv_f32 + wide_f32) / 2
 3. F16-input rope `…_f16qkv` — **done**.  
 4. FC2 cast F16→F32 — **done**.  
 5. Ulysses sizes — pack math ready; runtime arm U=1 only.  
-6. 480p waffle + 768p peak ledger — **this gate**; then default.
+6. 480p waffle + E2 — **PASS** ([kpi](2026-10-28-c015-fp16-stage-waffle-e2-kpi.md): Δb16 mean 0.015, peak_dit −1.412 GiB). Default still OFF.
 
 ## Related closed / non-goals
 
