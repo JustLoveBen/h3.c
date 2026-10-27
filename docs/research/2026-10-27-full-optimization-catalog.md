@@ -185,7 +185,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 | deadend-memory 条目1；A2；`H3_VRAM_LEDGER` | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **partial**（插桩 landed；238 未跑） | S2 | 238：开 ledger 跑 768p 分桶 |
+| **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 + delta | deadend-memory 条目1；A2；`H3_VRAM_LEDGER`；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **partial+**（480p buckets+delta @4090；peak_dit≈22.4GiB；768p probe仍可选） | S2 | 可选：768p ledger probe |
 | **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **idea** | S2 | 一次性实验，不解默认 |
 | **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2 | VRAM高 | C040 | **idea** | S2 | waffle 非 bit-identical |
 | **C043** | DiT | Layerwise weight streaming | 权重按层驻留+prefetch | transfer 4.3；SGLang −30GB 指针 | VRAM高 WC中性~负 | C040；视觉后 | **idea** | S1/S2 | 768p 全序列能力优先 |
@@ -202,7 +202,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 |---|---|---|---|---|---|---|---|---|---|
 | **C060** | 对照 | TE 路径漂移污染 md5/waffle | 强制标明 live vs `H3_TEXT_H_LOAD` | P0 runbook；timing | Q高 | — | **partial** | S9 | 报告硬字段 |
 | **C061** | 对照 | env 合同只在离线工具 | generate 启动内联打印 | `h3_env_contract_*`；print_h3_env_contract；A10 | Q（防测错） | — | **landed**（内联；238 generate 日志有 `# H3_ENV_CONTRACT` + FORBID 行） | S9/S11 | 继续强制过检 |
-| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 + `H3_TE_CACHE_AUTO` | timing；productization；[`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial+** @ `95ab073`（HIT 硬门；AUTO MISS→write + clip2 te=0；默认仍 off） | S1/S9/S12 | 默认保持 off；多 prompt 后再议 |
+| **C062** | TE | TE 7–58s 摆动污染加速比 | te_cache 产品化 + 常驻 + HIT 硬门 + `H3_TE_CACHE_AUTO` | timing；productization；[`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | WC测准 / 次要墙钟 | key 含 layers/dim/ids | **partial+ / KPI-closed@480p**（AUTO clip2 te=0 on p10；默认仍 off） | S1/S9/S12 | 默认保持 off；多 prompt 后再议 |
 | **C063** | TE | `c_te_raw` 偶发不确定 | 根治债 | followup；dev-plan | Q | 不插队 | **idea** | S9 | 单独 ticket |
 | **C064** | 生命周期 | TE↔DiT↔VAE 峰值与释放 | 状态机 + DeferredRelease | te-lifecycle-audit；[whitelist](2026-10-27-lifecycle-deferred-release.md)；`h3_lifecycle_whitelist.h` | VRAM/WC | 真机峰值 | **partial**（白名单+trace landed；真重叠仍门控） | S1 | 安全条件满足再重叠 H2D |
 | **C065** | 测量 | 墙钟卫生 | 关 `H3_GEN_MEM_TRACE`；只追加 timing | generation-timing | Q | — | **landed（纪律）** | S9 | 持续执行 |
@@ -351,11 +351,11 @@ C017,A,DiT,L2 pin hot tables,landed-opt-in-no-wc,S2,closed-opt-in
 C030,B,fewstep,PDMD-4NFE GPU accept,landed-visual-OR,S7,done-dev
 C031,B,fewstep,DMAD lcm_renoise GPU,landed-visual-OR,S7,done-dev
 C032,B,fewstep,contract selfcheck,landed,S11,done-dev
-C040,C,768p,VRAM ledger instrumentation,partial,S2,P2
+C040,C,768p,VRAM ledger instrumentation,partial-plus-480p-kpi,S2,P2
 C041,C,DiT,window 30to24 probe,idea,S2,P3
 C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
-C062,D,TE,te_cache productization,partial-plus-auto,S1/S9,P1
+C062,D,TE,te_cache productization,partial-plus-kpi-480p,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
 C073,D,eval,dump-once score-many conventions,partial,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed-default-on,fam4,closed-kpi
@@ -393,6 +393,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 日期 | 说明 |
 |---|---|
 | 2026-10-27 | C003 EPI_FUSE_SL 238 A/B @ `ed1ce72`: BIT_ID+waffle PASS；hot dit **+46%** → keep OFF；**开发收口**。见 [`epi-fuse-sl`](2026-10-27-epi-fuse-sl-single-launch.md) / [`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)。 |
+| 2026-10-28 | C040 ledger buckets+delta + true `peak_dit`；C062 AUTO 480p×5s p10 KPI (Euler-8 WALL 91.4s / PDMD-4 61.0s；clip2 te=0). 见 [`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md)。 |
 | 2026-10-27 | Fair hot KPI：C017 Δ≈0 keep opt-in；C068 memo default-on（rope −9ms）；`H3_ROPE_MEMO=0` KPI；**本轮自动 ROI 收口**。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) §6。 |
 | 2026-10-27 | C017 238 BIT_ID PASS @ `95ab073`；C062 AUTO MISS→reuse；WC Δ 不宣称。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |
 | 2026-10-27 | Beyond-DMAD + lossless 计划：C017 `H3_CUDA_L2_PIN` opt-in；C062 `H3_TE_CACHE_AUTO`；PDMD-4 优选于 DMAD；C003 维持 DISARMED。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |

@@ -140,3 +140,8 @@ BIT_ID vs ctrl; **~+46%** hot dit → default **OFF**. See [`epi-fuse-sl-single-
 - Catalog: [`2026-10-27-full-optimization-catalog.md`](2026-10-27-full-optimization-catalog.md)
 - Quality-preserving survey: [`2026-10-05-quality-preserving-acceleration.md`](2026-10-05-quality-preserving-acceleration.md)
 - C003 boundary: [`2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md)
+
+## 2026-10-28 follow-up
+
+- C040/C062 480p×5s KPI on 4090: see [`2026-10-28-c040-c062-480p-kpi.md`](2026-10-28-c040-c062-480p-kpi.md).
+- C040: true DiT-resident `peak_dit` + deltas; C062 AUTO clip2 te=0 confirmed.

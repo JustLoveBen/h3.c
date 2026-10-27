@@ -94,14 +94,20 @@ static void h3_fail_tag(const char *tag) {
 }
 
 /* C040: opt-in VRAM ledger (H3_VRAM_LEDGER=1). Host builds without CUDA
- * skip via stub; this TU always has cuda_runtime.h. */
+ * skip via stub; this TU always has cuda_runtime.h.
+ * Points: after_cuda → after_te → before_dit → peak_dit (DiT resident) →
+ *         after_dit_release → before_vae → after_vae (last --repeat clip).
+ * Each line also emits vram_ledger_delta vs the previous armed point (分桶). */
 static int h3_vram_ledger_on(void) {
     const char *e = getenv("H3_VRAM_LEDGER");
     return (e && e[0] == '1') ? 1 : 0;
 }
 
 static void h3_vram_ledger_point(const char *point) {
+    static double prev_used_mib = -1.0;
+    static const char *prev_point = NULL;
     size_t free_b = 0, total_b = 0;
+    double used_mib;
     if (!h3_vram_ledger_on() || !point)
         return;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
@@ -110,10 +116,15 @@ static void h3_vram_ledger_point(const char *point) {
         fflush(stdout);
         return;
     }
+    used_mib = (double)(total_b - free_b) / (1024.0 * 1024.0);
     printf("vram_ledger: point=%s free_mib=%.1f used_mib=%.1f total_mib=%.1f\n",
-           point, (double)free_b / (1024.0 * 1024.0),
-           (double)(total_b - free_b) / (1024.0 * 1024.0),
+           point, (double)free_b / (1024.0 * 1024.0), used_mib,
            (double)total_b / (1024.0 * 1024.0));
+    if (prev_used_mib >= 0.0 && prev_point)
+        printf("vram_ledger_delta: from=%s to=%s d_used_mib=%+.1f\n",
+               prev_point, point, used_mib - prev_used_mib);
+    prev_used_mib = used_mib;
+    prev_point = point;
     fflush(stdout);
 }
 
@@ -2442,6 +2453,7 @@ int main(int argc, char **argv) {
                     "                     S_real (pad rows excluded). Gold default stays 1.\n"
                     "  --te-cache DIR     Opt-in TE prompt embedding disk cache.\n"
                     "                     H3_TE_CACHE_AUTO=1 + --repeat>=2\n"
+                    "  H3_VRAM_LEDGER=1   C040 cudaMemGetInfo buckets (after_cuda..after_vae)\n"
                     "                     → auto dir out/te_cache_auto (C062).\n"
                     "                     H3_CUDA_L2_PIN=1 → pin Hadamard L2 (C017).\n                     H3_ROPE_PROFILE=1 → dit/vae rope ms + memo hits.\n                     H3_ROPE_MEMO=0 → disable RoPE host memo (KPI).\n"
                     "                     Or H3_TE_PROMPT_CACHE. Default off (金线不变).\n"
@@ -3503,6 +3515,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cuda: %s\n", error);
         goto cleanup;
     }
+    h3_vram_ledger_point("after_cuda");
     if (lift_on) {
         int in_ch = 0, hid = 0;
         h3_vae_int8_store vs;
@@ -5652,6 +5665,7 @@ int main(int argc, char **argv) {
                 h3_w4a8_cache_log_window(cw0, "after_te");
         }
         gen_mem_trace(cuda, "after_te");
+        h3_vram_ledger_point("after_te");
     }
 
 clip_denoise:
@@ -7038,6 +7052,8 @@ clip_denoise:
                    (unsigned long long)h3_dit_w4a8_checksum_f32(latent, n_lat));
         }
     }
+    /* C040: true DiT-resident peak (weights + scratch still on device). */
+    h3_vram_ledger_point("peak_dit");
     if (dump_latent_path && dump_latent_path[0]) {
         if (!dump_latent_file(dump_latent_path, latent, n_lat, latent_t,
                               latent_h, latent_w, error, sizeof(error))) {
@@ -7111,7 +7127,7 @@ clip_denoise:
         h3_cuda_release_heavy_workspace(cuda);
         h3_cuda_sage3_drop_pool();
         h3_cuda_sol_cute_drop_pool();
-        h3_vram_ledger_point("peak_dit");
+        h3_vram_ledger_point("after_dit_release");
         printf("released DiT/TE before VAE (kept CUDA ctx; trimmed DiT scratch; "
                "dropped sage3/sol_cute pools)\n");
         h3_vram_ledger_point("before_vae");

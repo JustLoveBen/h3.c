@@ -60,6 +60,7 @@ CONTRACT: List[Entry] = [
     ("H3_ROPE_PROFILE", "1=log dit/vae rope ms + memo hit/miss", "info"),
     ("H3_ROPE_MEMO", "0=disable RoPE host memo (fair KPI); default on", "info"),
     ("H3_TE_CACHE_AUTO", "1=auto te_cache under out/ when --repeat>=2 (C062)", "info"),
+    ("H3_VRAM_LEDGER", "1=C040 cudaMemGetInfo VRAM buckets (after_cuda..after_vae)", "info"),
 ]
 
 
