@@ -21,23 +21,29 @@ Asia/Shanghai. Goal: **true mid-buffer elimination** (not ink's sgemm+quant mult
 
 ## Incomplete / remaining
 
-1. **Wall-clock:** custom `O(gs²)` Hadamard per group is not cublas-strided-batched; expect **Δ≈0 or regression** vs ink/ctrl until tiled/TC Hadamard. Report honest dit ms on 238.
-2. **act_f16:** still f32 algebra (match ink); `H3_DIT_ACT_F16=0` for A/B.
-3. **Device BIT_ID vs ink:** production A/B (SL vs ctrl, and SL vs ink) — see table below / append.
-4. Do **not** default-on until waffle≈PASS and WC ≥ ink (or documented trade for launch-count / graph).
+1. **Wall-clock:** naive `O(gs²)` Hadamard recompute **regresses** vs cublas ConvRot (~+46% hot dit). Keep OFF until tiled/TC Hadamard (or accept launch-count/graph trade with documented WC loss).
+2. **act_f16:** still f32 algebra (match ink); A/B used `H3_DIT_ACT_F16=0`.
+3. Device vs ctrl: **BIT_ID** (same hot latent checksum) + same-config waffle **PASS**.
+4. Do **not** default-on (WC regression).
 
 ## Policy
 
 - Production default: **OFF**.
 - NVFP4 stays terminal visual BLOCK (`ebd77a5` energy RCA) — do not green.
-- EPI_FUSE_INK remains valid partial (BIT_ID PASS, ~0% WC).
+- EPI_FUSE_INK remains valid partial (BIT_ID PASS, ~0% WC) — prefer ink over SL for any opt-in fuse today.
 
-## 238 A/B (fill after rebuild)
+## 238 A/B (2026-10-27 Asia/Shanghai, SHA `ed1ce72`)
 
-Config: turbo4 INT8, 864×480, seed `0x48000001`, `--repeat 2`, `H3_DIT_ACT_F16=0`, chain unset.
+Config: turbo4 INT8, 864×480, seed `0x48000001`, `--repeat 2`, `H3_DIT_ACT_F16=0`, chain unset. Out: `out/c003_epi_fuse_sl_20261027/`. Host: `h3_epi_fuse_sl_host_test` PASS (`i8_mismatch=0`).
 
-| arm | SL | ink | hot dit ms | hot latent | waffle | notes |
+| arm | SL | ink* | hot dit ms | hot latent | waffle | RUN_RC |
 |---|---|---|---|---|---|---|
-| ctrl | 0 | 0 | TBD | TBD | — | |
-| sl | 1 | 0 | TBD | TBD | TBD | |
+| ctrl_r1/r2 | 0 | 0 | 14275.6 / 14366.9 | `0xc36483432681f772` | PASS (ctrl) | 0 |
+| sl_r1/r2 | 1 | 1* | 20898.9 / 20910.4 | `0xc36483432681f772` | PASS (sl) | 0 |
+
+\* SL implies ink algebra / pre_q (`epi_fuse_ink=1` in log when `epi_fuse_sl=1`).
+
+- ctrl vs SL hot latent: **BIT_ID equal**.
+- Wall-clock: **~+46% hot dit** (SL slower; expected naive Hadamard). **Default remains OFF.**
+- P2 `H3_DIT_EPI_FUSE` stays DISARMED. NVFP4 untouched.
 

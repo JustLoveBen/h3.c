@@ -34,11 +34,11 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 | 3 | C070 | `H3_FORBID_HOT_SYNC` | n/a (hygiene) | low | landed(forbid) | KPI runs |
 | 4 | C068/C069 | RoPE host memo + VAE H2D skip | bit-id | rope host −9ms; dit Δ noise | landed / partial+ | Fair hot memo on/off done; default-on |
 | 5 | C011 | VAE cast/prescale fuse | bit-id if fuse-only | mid | idea | Needs nsys; disk 99% |
-| 6 | C003 redesign | in-kernel ConvRot+requant | bit-id if algebra kept | mid (was fake +3–8%) | **DISARMED** | Skip-ConvRot unreachable; no default-on |
+| 6 | C003 redesign | in-kernel ConvRot+requant (`H3_DIT_EPI_FUSE_SL`) | bit-id (238 PASS) | mid (was fake +3–8%) | **landed OFF** | Naive SL hot dit **+46%**; ink ~0%; P2 DISARMED; keep OFF |
 | 7 | C018 QKV merge | maybe non-bit if INT8 order | mid | idea/maybe stale | Diff before build |
 | 8 | Z05 CUDA Graph default | bit-id launch | <0.5s noise | closed default-off | Keep off |
 
-**Deferred / auth-gated:** disk wipe; nsys full; NVFP4 retrain/new weights; NVFP4 chain; VAE cast nsys. SL WC confirm on 238 this knife.
+**Deferred / auth-gated:** disk wipe; nsys full; NVFP4 retrain/new weights; NVFP4 chain; VAE cast nsys; SL tiled/TC Hadamard (naive SL **+46%** dit).
 
 ## 2. Landed code (this batch)
 
@@ -70,7 +70,7 @@ Work tree `h3_c_main_20261027` @ `95ab073`. Script `out/scripts/run_c017_l2_pin.
 
 - Disk ~99% / ~58G — blocks nsys / large multi-arm outs.
 - C001 NVFP4 visual **terminal BLOCK** (energy RCA: single-GEMM OK; W4A4 multilayer attractor) — no chain; see `nvfp4-energy-collapse-block`.
-- C003 true fuse needs new kernel design (not re-enable skip-ConvRot).
+- C003: INK ~0% WC; SL single-launch BIT_ID but **+46%** dit — needs tiled/TC Hadamard (not re-enable skip-ConvRot).
 - C068/C069 fair hot done (Δ≈0 material); memo default-on.
 - Human aesthetic polish on PDMD/DMAD optional; OR already PASS fewstep.
 
@@ -111,18 +111,29 @@ Protocol: dmad4 INT8, TE HIT, `H3_FORBID_HOT_SYNC=1`, `--repeat`≥3, **discard 
 | C017 L2 pin | landed opt-in; fair hot Δ≈0 |
 | C062 TE_CACHE_AUTO | partial+; default off |
 | C068/C069 fair hot | memo default-on; WC material no |
-| C003 EPI_FUSE / INK / SL | P2 **DISARMED**; INK partial green; **SL landed default OFF** |
+| C003 EPI_FUSE / INK / SL | P2 **DISARMED**; INK green ~0%; SL @ `ed1ce72` BIT_ID+waffle PASS, hot dit **+46%** → **keep OFF** |
 | C070 forbid | landed |
-| C001 NVFP4 | visual **terminal BLOCK** (energy RCA) — no chain |
+| C001 NVFP4 | visual **terminal BLOCK** (`ebd77a5` energy RCA) — no chain |
 
-**剩余需授权 / 非自动 ROI：**
+**剩余需授权 / 非自动 ROI（无更高自动 ROI → 开发收口）：**
 
-1. **清盘**（~99% / 58G）— 阻塞 nsys / 大矩阵 outs  
+1. **清盘**（~99%）— 阻塞 nsys / 大矩阵 outs  
 2. **nsys** VAE cast/prescale（C011）— 需盘+授权  
-3. **NVFP4 mosaic 根因** — 非本轮 chain WIP  
-4. **EPI_FUSE_SL** single-launch landed (default OFF) — 238 WC/waffle 表见 `epi-fuse-sl-single-launch`; 勿 default-on  
-5. 可选人眼抛光 PDMD/DMAD；扩 L2 pin 到 RoPE device buf（无证据不优先）
+3. **NVFP4** 重训/新权重 / 混精视觉门 — 非本轮；chain 仍 gated  
+4. **EPI_FUSE_SL** tiled/TC Hadamard — 当前 naive 回归；勿 default-on  
+5. 可选人眼抛光 PDMD/DMAD；扩 L2 pin（无证据不优先）
 
+
+## 7. EPI_FUSE_SL 238 A/B (Asia/Shanghai 2026-10-27)
+
+SHA `ed1ce72` (feat SL + cmake fix). Out: `out/c003_epi_fuse_sl_20261027/`. Host `i8_mismatch=0`.
+
+| arm | SL | hot dit ms | hot latent | waffle |
+| --- | --- | ---: | --- | --- |
+| ctrl_r1/r2 | 0 | 14275.6 / 14366.9 | `0xc36483432681f772` | PASS |
+| sl_r1/r2 | 1 | 20898.9 / 20910.4 | `0xc36483432681f772` | PASS |
+
+BIT_ID vs ctrl; **~+46%** hot dit → default **OFF**. See [`epi-fuse-sl-single-launch`](2026-10-27-epi-fuse-sl-single-launch.md).
 
 ## 5. Related
 
