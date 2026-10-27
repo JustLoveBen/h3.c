@@ -4544,8 +4544,15 @@ __global__ void h3_cuda_quantize_act_nvfp4_kernel(const float *__restrict__ x,
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
             scale_f = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
             sf_b = h3_f32_to_ue4m3(scale_f);
+            /* Match tools/quant_dit_nvfp4.py weight path: clamp UE4M3
+             * underflow to min nonzero (byte 1 = 2^-9). Else sf=0 →
+             * inv=Inf or MMA contrib 0 for tiny micro-blocks. Does not
+             * fix C001 blank (single-layer energy already ~1.0 vs INT8);
+             * closes act/weight SF contract gap. */
+            if (sf_b == 0)
+                sf_b = 1;
             scale_f = h3_ue4m3_to_f32(sf_b);   /* use exact representable */
-            inv = 1.0f / scale_f;
+            inv = (scale_f > 0.0f) ? (1.0f / scale_f) : 0.0f;
             nib = h3_e2m1_nibble(v * inv);
             /* lane0 writes SF in the measured sm_120 layout. */
             if (lane_in_mb == 0) {

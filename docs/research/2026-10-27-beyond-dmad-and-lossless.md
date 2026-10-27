@@ -69,7 +69,7 @@ Work tree `h3_c_main_20261027` @ `95ab073`. Script `out/scripts/run_c017_l2_pin.
 ## 4. Next blockers
 
 - Disk ~99% / ~58G — blocks nsys / large multi-arm outs.
-- C001 NVFP4 visual BLOCK — no chain.
+- C001 NVFP4 visual **terminal BLOCK** (energy RCA: single-GEMM OK; W4A4 multilayer attractor) — no chain; see `nvfp4-energy-collapse-block`.
 - C003 true fuse needs new kernel design (not re-enable skip-ConvRot).
 - C068/C069 fair hot done (Δ≈0 material); memo default-on.
 - Human aesthetic polish on PDMD/DMAD optional; OR already PASS fewstep.
@@ -113,7 +113,7 @@ Protocol: dmad4 INT8, TE HIT, `H3_FORBID_HOT_SYNC=1`, `--repeat`≥3, **discard 
 | C068/C069 fair hot | memo default-on; WC material no |
 | C003 EPI_FUSE | **DISARMED** (algebra) |
 | C070 forbid | landed |
-| C001 NVFP4 | visual BLOCK — no chain |
+| C001 NVFP4 | visual **terminal BLOCK** (energy RCA) — no chain |
 
 **剩余需授权 / 非自动 ROI：**
 

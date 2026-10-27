@@ -37,3 +37,13 @@ Harness: `bench/nvfp4_phase0/test_fp4_e2e.cu` (M/N/K argv) linked against conda 
 | 32x4+stride_ncb_rd | 256 | 256 | 5376 | ≈0.34 | **FAIL** |
 
 **Conclusion:** SF row-stride=`ncb` is correct at DiT K; C001 blank video is **not** a single-GEMM SF-layout bug. Sidecar `weight_scale2` all 1.0 (folded into SF by `quant_linear`). Residual hypotheses: multi-layer act ConvRot↔FP4 vs INT8 f16-prescale path, or low-energy accumulation across blocks (latent std 0.31 vs INT8 1.03). Still **BLOCK** for visual / chain. Do not fake PASS.
+
+## Addendum — energy RCA → terminal BLOCK (same day)
+
+Host single-linear INT8 vs NVFP4 A/B (`probe_nvfp4_gemm_ab.py` on 238):
+`fp4/i8_norm≈0.999` for normal act regimes; weight `||W_fp4||/||W_i8||≈1.0`.
+Blank is **not** scale2/dequant/SF-layout. Classified as W4A4 offline requant
+~13% rel_l2 accumulating through DiT+diffusion → low-energy attractor.
+
+See [`2026-10-27-nvfp4-energy-collapse-block.md`](2026-10-27-nvfp4-energy-collapse-block.md)
+for the terminal BLOCK boundary, act-SF min-clamp harden, and “not product default” policy.
