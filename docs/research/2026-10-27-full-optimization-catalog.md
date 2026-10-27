@@ -213,7 +213,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C070** | sync | 热路径隐蔽 sync | 白名单 / `H3_FORBID_HOT_SYNC` | [`cuda-sync-audit`](2026-10-27-cuda-sync-audit.md)；`h3_cuda_hot_sync.h`；gpu-unified C070 smoke | WC低 | 默认 off | **landed(forbid)**（opt-in；238 smoke `FORBID=1` RUN_RC=0 @ `e40d649`） | S8 | KPI 跑可开 |
 | **C071** | cold | cold-clip 间歇高噪 | 方向 B 根治 | roadmap T3-c；A11 | Q | 高不确定 | **idea** | S9 | 不插队 |
 | **C072** | 配置 | 散落 getenv | 集中 `h3_env` 注册表 | S11；A15 | Q | 大重构 | **idea** | S11 | 远期观察 |
-| **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log；[conventions](2026-10-27-dump-once-score-many.md) | Q | — | **partial**（约定+日志标记+checker landed） | S12 | GPU 上跑 dump→replay 验收 |
+| **C073** | 生成/评分 | 边改配置边改金线 | dump-once / score-many | S12；META+log；[conventions](2026-10-27-dump-once-score-many.md)；[`c073-480p`](2026-10-28-c073-dump-replay-480p.md) | Q | — | **landed**（4090 Euler-8 dump→replay async on/off waffle PASS Δ=0；rgb bit-id） | S12 | 默认仍 off；评分臂复用 runner |
 | **C074** | 失败分类 | OOM/合同/数值/环境混报 | 退出码/日志 `tag=FAIL_*` | DeepInfer environ 族；与 C061 同批 | Q | — | **partial**（generate 站点 tagged；VAE 专用 tag 无独立站点） | S11 | GPU 日志抽检 |
 | **C075** | host | Qwen prefetch 深度 | `H3_QWEN_PREFETCH*` | text_encoder | WC低 | — | **partial** | S1 | 调参级 |
 | **C076** | DiT | 大量 `H3_DISABLE_FUSED_*` 回退开关 | 回归与 A/B | h3_dit.c env 列表 | D | — | **landed** | S6 | 保持；勿默认关融合 |
@@ -357,7 +357,7 @@ C043,C,DiT,layerwise streaming,idea,S1/S2,P3
 C061,D,tooling,inline env contract at generate,partial,S9/S11,P0-dev
 C062,D,TE,te_cache productization,partial-plus-kpi-480p,S1/S9,P1
 C064,D,lifecycle,TE-DiT-VAE overlap safe impl,partial,S1,P2
-C073,D,eval,dump-once score-many conventions,partial,S12,P2
+C073,D,eval,dump-once score-many conventions,landed-480p-euler8,S12,P2
 C068,D,DiT,INT8 RoPE table memo,landed-default-on,fam4,closed-kpi
 C069,D,VAE,VAE RoPE memo+H2D skip,partial-plus,fam4,closed-kpi
 C080,E,SKU,VDN/SelfLift/TAE tiering,idea,S7,observe
@@ -393,6 +393,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 日期 | 说明 |
 |---|---|
 | 2026-10-27 | C003 EPI_FUSE_SL 238 A/B @ `ed1ce72`: BIT_ID+waffle PASS；hot dit **+46%** → keep OFF；**开发收口**。见 [`epi-fuse-sl`](2026-10-27-epi-fuse-sl-single-launch.md) / [`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)。 |
+| 2026-10-28 | C073 dump→replay 480p Euler-8 GPU acceptance：async on/off waffle PASS Δ=0 + rgb bit-id；PDMD contrast-only (t71u). 见 [`c073-480p`](2026-10-28-c073-dump-replay-480p.md)。 |
 | 2026-10-28 | C040 ledger buckets+delta + true `peak_dit`；C062 AUTO 480p×5s p10 KPI (Euler-8 WALL 91.4s / PDMD-4 61.0s；clip2 te=0). 见 [`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md)。 |
 | 2026-10-27 | Fair hot KPI：C017 Δ≈0 keep opt-in；C068 memo default-on（rope −9ms）；`H3_ROPE_MEMO=0` KPI；**本轮自动 ROI 收口**。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) §6。 |
 | 2026-10-27 | C017 238 BIT_ID PASS @ `95ab073`；C062 AUTO MISS→reuse；WC Δ 不宣称。见 [`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md)。 |

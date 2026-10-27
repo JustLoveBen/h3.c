@@ -73,3 +73,7 @@ dump_once_score_many: mode=replay path=PATH do_not_retune_gold=1
 - P0 runbook: [`2026-10-26-p0-visual-gate-runbook.md`](2026-10-26-p0-visual-gate-runbook.md)
 - Waffle same-config: [`2026-10-26-waffle-same-config-gate.md`](2026-10-26-waffle-same-config-gate.md)
 - Catalog **C073**
+
+## GPU acceptance (2026-10-28)
+
+4090 480p×5s Euler-8 INT8 dump→replay async on/off: [`2026-10-28-c073-dump-replay-480p.md`](2026-10-28-c073-dump-replay-480p.md) (waffle PASS Δ=0; rgb checksum match). Scheme policy t71u: Euler/DMAD primary; PDMD contrast-only.
