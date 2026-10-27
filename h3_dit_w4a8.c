@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
@@ -38,6 +39,84 @@ static int env_flag_is_one(const char *name) {
  * ConvRot-baked (tools/quant_dit_nvfp4.py). */
 static int nvfp4_skip_act_convrot(void) {
     return env_flag_is_one("H3_DIT_NVFP4_SKIP_ACT_CONVROT");
+}
+
+/* H3_DIT_NVFP4_KEEP_INT8=<csv>: no-retrain hybrid — listed linears stay on
+ * INT8 ConvRot GEMM; others use the NVFP4 sidecar GEMM.
+ * Tokens: qkv,out,fc1,fc2 + aliases attn(=qkv,out), mlp(=fc1,fc2), all.
+ * Unset/empty = full FP4. Product default remains INT8 (H3_DIT_NVFP4 unset). */
+static unsigned nvfp4_parse_keep_int8(void) {
+    const char *e = getenv("H3_DIT_NVFP4_KEEP_INT8");
+    unsigned mask = 0;
+    char buf[128];
+    char *tok, *save = NULL;
+    size_t n;
+    if (!e || !e[0])
+        return 0;
+    n = strlen(e);
+    if (n >= sizeof(buf))
+        n = sizeof(buf) - 1;
+    memcpy(buf, e, n);
+    buf[n] = '\0';
+    for (tok = strtok_r(buf, ",;+|/ ", &save); tok;
+         tok = strtok_r(NULL, ",;+|/ ", &save)) {
+        while (*tok == ' ' || *tok == '\t')
+            tok++;
+        if (!tok[0])
+            continue;
+        if (!strcasecmp(tok, "qkv") || !strcasecmp(tok, "attn.qkv_proj"))
+            mask |= 1u << 0;
+        else if (!strcasecmp(tok, "out") || !strcasecmp(tok, "attn.out_proj") ||
+                 !strcasecmp(tok, "out_proj"))
+            mask |= 1u << 1;
+        else if (!strcasecmp(tok, "fc1") || !strcasecmp(tok, "mlp.fc1"))
+            mask |= 1u << 2;
+        else if (!strcasecmp(tok, "fc2") || !strcasecmp(tok, "mlp.fc2"))
+            mask |= 1u << 3;
+        else if (!strcasecmp(tok, "attn"))
+            mask |= (1u << 0) | (1u << 1);
+        else if (!strcasecmp(tok, "mlp") || !strcasecmp(tok, "ffn"))
+            mask |= (1u << 2) | (1u << 3);
+        else if (!strcasecmp(tok, "all") || !strcasecmp(tok, "1") ||
+                 !strcasecmp(tok, "*"))
+            mask |= 0xFu;
+        else
+            fprintf(stderr,
+                    "dit_nvfp4: KEEP_INT8 unknown token '%s' "
+                    "(want qkv,out,fc1,fc2,attn,mlp,all)\n",
+                    tok);
+    }
+    return mask & 0xFu;
+}
+
+static void nvfp4_log_keep_int8(unsigned keep) {
+    static int logged;
+    char names[64];
+    size_t o = 0;
+    unsigned k;
+    static const char *nm[4] = {"qkv", "out", "fc1", "fc2"};
+    if (logged)
+        return;
+    logged = 1;
+    names[0] = '\0';
+    for (k = 0; k < 4; k++) {
+        if (!(keep & (1u << k)))
+            continue;
+        if (o && o + 1 < sizeof(names))
+            names[o++] = ',';
+        if (o + strlen(nm[k]) < sizeof(names)) {
+            memcpy(names + o, nm[k], strlen(nm[k]));
+            o += strlen(nm[k]);
+            names[o] = '\0';
+        }
+    }
+    if (!keep)
+        fprintf(stderr, "dit_nvfp4: KEEP_INT8=<unset> — full FP4 GEMM\n");
+    else
+        fprintf(stderr,
+                "dit_nvfp4: KEEP_INT8=%s (fp4_mask=0x%x) — hybrid no-retrain\n",
+                names, (~keep) & 0xFu);
+    fflush(stderr);
 }
 
 /* P4.2 Phase-1: FC1→FC2 chained direct-output. Requires H3_DIT_NVFP4=1 AND
@@ -318,6 +397,8 @@ struct h3_dit_w4a8 {
      * .weight_sf / .weight_scale2, swizzled-SF layout identical to the
      * runtime act quantizer). INT8 track stays the fallback per-block. */
     int nvfp4_on;
+    unsigned nvfp4_keep_int8; /* bit0=qkv bit1=out bit2=fc1 bit3=fc2 */
+    unsigned nvfp4_fp4_mask;  /* (~keep)&0xF when nvfp4_on else 0 */
     int nvfp4_chain_on;
     int nvfp4_ready;
     h3_st_header nvfp4_hdr;
@@ -338,6 +419,12 @@ struct h3_dit_w4a8 {
     size_t nvfp4_rot_cap_seq;
     int nvfp4_act_convrot_logged;
 };
+
+static int nvfp4_kind_use_fp4(const h3_dit_w4a8 *ctx, unsigned kind) {
+    if (!ctx || !ctx->nvfp4_on || kind > 3u)
+        return 0;
+    return (ctx->nvfp4_fp4_mask & (1u << kind)) != 0;
+}
 
 static uint32_t dit_text_row_mod(const h3_dit_w4a8 *ctx, size_t i,
                                  size_t text_seq) {
@@ -483,7 +570,11 @@ h3_dit_w4a8 *h3_dit_w4a8_open_int8(h3_cuda *cuda, h3_dit_int8_store *store,
     ctx->tr_early_end = 40;
     ctx->tr_scale = 1.0f;
     ctx->nvfp4_on = env_flag_is_one("H3_DIT_NVFP4");
+    ctx->nvfp4_keep_int8 = ctx->nvfp4_on ? nvfp4_parse_keep_int8() : 0u;
+    ctx->nvfp4_fp4_mask =
+        ctx->nvfp4_on ? ((~ctx->nvfp4_keep_int8) & 0xFu) : 0u;
     if (ctx->nvfp4_on) {
+        nvfp4_log_keep_int8(ctx->nvfp4_keep_int8);
         h3_w4a8_cache_set_nvfp4_int8_skip(ctx->cache, 1);
         fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
                         "(INT8 weights load lazily only on FP4 dispatch "
@@ -554,7 +645,11 @@ h3_dit_w4a8 *h3_dit_w4a8_open_nvfp4(h3_cuda *cuda, h3_nvfp4_store *store,
     ctx->tr_early_end = 40;
     ctx->tr_scale = 1.0f;
     ctx->nvfp4_on = env_flag_is_one("H3_DIT_NVFP4");
+    ctx->nvfp4_keep_int8 = ctx->nvfp4_on ? nvfp4_parse_keep_int8() : 0u;
+    ctx->nvfp4_fp4_mask =
+        ctx->nvfp4_on ? ((~ctx->nvfp4_keep_int8) & 0xFu) : 0u;
     if (ctx->nvfp4_on) {
+        nvfp4_log_keep_int8(ctx->nvfp4_keep_int8);
         h3_w4a8_cache_set_nvfp4_int8_skip(ctx->cache, 1);
         fprintf(stderr, "dit_nvfp4: H3_DIT_NVFP4=1 — FP4 cuBLASLt GEMM track "
                         "(INT8 weights load lazily only on FP4 dispatch "
@@ -2994,6 +3089,8 @@ static int nvfp4_load_block_weights(h3_dit_w4a8 *ctx, unsigned block,
         size_t sf_bytes = h3_cuda_nvfp4_sf_bytes(n, k);
         const h3_st_tensor *s2t;
         if (ctx->nvfp4_w[block][p]) continue;
+        if (!nvfp4_kind_use_fp4(ctx, p))
+            continue; /* KEEP_INT8: leave NULL; INT8 path loads lazily */
         snprintf(wname, sizeof(wname), "blocks.%u.%s.weight_fp4", block,
                  nvfp4_linear_suffix(p));
         snprintf(sname, sizeof(sname), "blocks.%u.%s.weight_sf", block,
@@ -3385,7 +3482,7 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
 
     prep = gemm = 0.0;
     uly_klog("qkv_gemm", "enter");
-    if (ctx->nvfp4_on) {
+    if (nvfp4_kind_use_fp4(ctx, 0u)) {
         /* FP4 track: act quant + FP4 cuBLASLt GEMM + BF16→F32 dequant. */
         snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
         if (nvfp4_gemm_dispatch(ctx, block, 0u, d_a, d_qkv, seq, NULL, NULL,
@@ -3396,11 +3493,13 @@ static int block_phase_qkv(h3_dit_w4a8 *ctx, unsigned block,
         fprintf(stderr, "dit_nvfp4: qkv b%u FP4 dispatch failed (%s); INT8\n",
                 block, detail);
         fflush(stderr);
+        backend[0] = '\0';
+        prep = gemm = 0.0;
+    }
+    if (ctx->nvfp4_on && !w_qkv) {
         w_qkv = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_QKV, error,
                               error_size);
         if (!w_qkv) return 0;
-        backend[0] = '\0';
-        prep = gemm = 0.0;
     }
     if (!h3_cuda_gemm_i8_dequant_f32_w_act_dev(
             ctx->cuda, w_qkv, d_a, ctx->convrot_gs, seq, d_qkv, &prep, &gemm,
@@ -3503,7 +3602,8 @@ static int block_phase_out_mlp(
     /* FP4 track fuses out-gate / swiglu / fc2-gate in its own BF16
      * epilogues, which take over the INT8 R31 epilogue's role; keep the
      * INT8 GEMM epilogue off so the non-FP4 fallback paths stay separate. */
-    int gemm_epi = fused && !ctx->nvfp4_on;
+    /* KEEP_INT8=all → fp4_mask=0 → INT8 fused epi allowed (BIT_ID path). */
+    int gemm_epi = fused && !ctx->nvfp4_fp4_mask;
     /* E2 opt-in (H3_DIT_EPI_FUSE=1): intended to collapse dequant→requant pairs.
      * Requires R31 gemm_epi + act_f16 + convrot.
      *
@@ -3523,9 +3623,9 @@ static int block_phase_out_mlp(
      * Requires gemm_epi + convrot; independent of H3_DIT_EPI_FUSE.
      * Default OFF. Prefer H3_DIT_ACT_F16=0 for A/B (ink uses f32 algebra). */
     int epi_fuse_sl = gemm_epi && h3_dit_epi_fuse_sl_wanted() &&
-                      ctx->convrot_gs > 0 && !ctx->nvfp4_on;
+                      ctx->convrot_gs > 0 && !ctx->nvfp4_fp4_mask;
     /* SL implies ink algebra (pre_q after fused ConvRot+requant). */
-    int epi_fuse_ink = gemm_epi && ctx->convrot_gs > 0 && !ctx->nvfp4_on &&
+    int epi_fuse_ink = gemm_epi && ctx->convrot_gs > 0 && !ctx->nvfp4_fp4_mask &&
                        (h3_dit_epi_fuse_ink_wanted() || epi_fuse_sl);
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
@@ -3552,7 +3652,7 @@ static int block_phase_out_mlp(
 
     prep = gemm = 0.0;
     uly_klog("out_gemm", "enter");
-    if (ctx->nvfp4_on) {
+    if (nvfp4_kind_use_fp4(ctx, 1u)) {
         /* FP4 track: GEMM + AdaLN gate (slot 2) fused on the BF16 acc;
          * LoRA delta is added inside the BF16 gate epilogue (no pre-kick). */
         double fp4_prep = 0.0, fp4_gemm = 0.0;
@@ -3567,11 +3667,13 @@ static int block_phase_out_mlp(
         fprintf(stderr, "dit_nvfp4: out b%u FP4 dispatch failed (%s); INT8\n",
                 block, detail);
         fflush(stderr);
+        backend[0] = '\0';
+        prep = gemm = 0.0;
+    }
+    if (ctx->nvfp4_on && !w_out) {
         w_out = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_OUT, error,
                               error_size);
         if (!w_out) return 0;
-        backend[0] = '\0';
-        prep = gemm = 0.0;
     }
     if (gemm_epi && ctx->lora) {
         void *ready = NULL;
@@ -3720,7 +3822,7 @@ out_done:
             backend[0] = '\0';
             prep = gemm = 0.0;
         }
-        if (ctx->nvfp4_on) {
+        if (nvfp4_kind_use_fp4(ctx, 2u)) {
             /* FP4 FC1: GEMM [seq,2*ffn] + fused SwiGLU (+lora) on BF16 acc;
              * d_act holds the gated half [seq,ffn]. */
             snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
@@ -3735,11 +3837,13 @@ out_done:
                     "dit_nvfp4: fc1 b%u FP4 dispatch failed (%s); INT8\n",
                     block, detail);
             fflush(stderr);
+            backend[0] = '\0';
+            prep = gemm = 0.0;
+        }
+        if (ctx->nvfp4_on && !w_fc1) {
             w_fc1 = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_FC1, error,
                                   error_size);
             if (!w_fc1) return 0;
-            backend[0] = '\0';
-            prep = gemm = 0.0;
         }
         if (gemm_epi && ctx->lora) {
             void *ready = NULL;
@@ -3842,7 +3946,7 @@ fc1_done:
 
         prep = gemm = 0.0;
         uly_klog("fc2_gemm", "enter");
-        if (ctx->nvfp4_on) {
+        if (nvfp4_kind_use_fp4(ctx, 3u)) {
             /* FP4 FC2: GEMM + AdaLN gate (slot 5, residual d_b) fused on
              * the BF16 acc; writes d_y directly. */
             snprintf(backend, sizeof(backend), "%s", "cublasLt_fp4");
@@ -3855,11 +3959,13 @@ fc1_done:
                     "dit_nvfp4: fc2 b%u FP4 dispatch failed (%s); INT8\n",
                     block, detail);
             fflush(stderr);
+            backend[0] = '\0';
+            prep = gemm = 0.0;
+        }
+        if (ctx->nvfp4_on && !w_fc2) {
             w_fc2 = dit_lazy_int8(ctx, block, H3_W4A8_LINEAR_FC2, error,
                                   error_size);
             if (!w_fc2) return 0;
-            backend[0] = '\0';
-            prep = gemm = 0.0;
         }
         if (gemm_epi && ctx->lora) {
             void *ready = NULL;

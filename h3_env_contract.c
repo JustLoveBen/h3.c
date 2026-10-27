@@ -16,6 +16,9 @@ typedef struct {
 static const h3_env_entry k_contract[] = {
     {"H3_DIT_NVFP4", "DiT NVFP4 experimental arm (1=on)", "arm"},
     {"H3_DIT_NVFP4_FILE", "NVFP4 sidecar safetensors path", "arm_file"},
+    {"H3_DIT_NVFP4_KEEP_INT8",
+     "Hybrid no-retrain: CSV of linears kept INT8 (qkv,out,fc1,fc2,attn,mlp,all)",
+     "optional"},
     {"H3_DIT_NVFP4_CHAIN", "NVFP4 FC1→FC2 chain WIP (P3)", "unset"},
     {"H3_DIT_NVFP4_CHAIN_FC1_F32", "chain FC1 f32 diag", "unset"},
     {"H3_DIT_NVFP4_CHAIN_DIAG", "chain diagnostics", "unset"},
