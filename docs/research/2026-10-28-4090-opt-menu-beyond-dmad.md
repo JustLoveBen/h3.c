@@ -39,7 +39,7 @@
 | **6b** | ~~**C016 PDL**~~ | — | HW N/A @sm89 | — | — | **No** | — | **CLOSED** [`c016-close`](2026-10-28-c016-pdl-dig-close.md)；next DeepSeek **C043 streaming dig** |
 | **7** | **C018 QKV merge（先 diff 现状）** | lossless WC? | 历史估 −0.6~−1.2s；可能已覆盖 | M | INT8 序可能非 bit | ✅ | 低探+中改 | **NEXT probe** — catalog 标 *maybe stale*；先证明缺口再写核 |
 | **8** | **C064 TE↔DiT↔VAE 安全重叠** | VRAM/WC hygiene | 峰值错峰；冷启动/预热 OOM 少 | M | 应 bit | ✅ | 中 | **AFTER C041/C015** — 白名单已 landed；真重叠仍门控 |
-| **9** | **C043 layerwise weight streaming** | VRAM 能力 | 768p+ / 更大窗「能跑完」 | M | WC 中性~负 | ✅ | 高 | **DEFER** — 余量决策前提是 C041/C015 数字 |
+| **9** | ~~**C043 layerwise streaming**~~ | — | covered | — | — | — | — | **CLOSED** [`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md)；next **C015 default-on decision dig** |
 | **10** | **正式二采 / latent upscaler SKU（C097）** | architecture/product | 480 草稿→高分比直出便宜 | M | 有损 | ✅ 部分代码 | 高 | **DEFER 产品档** — 非 DiT 主墙；二采少步仍伤小脸（需 face-aware 二采合同） |
 | **11** | **SGMD / 下一代 fewstep 蒸馏（外研）** | better-than-DMAD | 运动/动态优于 DMD2 类（论文人评）；需训 | H | 新学生合同 | 推理后可 | **很高** | **OBSERVE** — PDMD 已优于同 NFE DMAD（论文 Table2）；SGMD 是「再训一条学生」不是推理开关 |
 | **12** | **C036 UniPC/DPM++（无训）** | sampler | ≤8 NFE 训练-free；难打蒸馏 4NFE | M | 轨迹变 | ✅ | 低 | **LOW** — 与 LoRA 正交；不作击败 DMAD 主叙事 |
@@ -127,3 +127,4 @@
 |---|---|
 | 2026-10-28 | 初稿：4090 INT8 约束下重排 Top12；关闭项对齐 catalog；LoRA vs FaceRefine；E1–E3 成功标准。分析-only，无 GPU。 |
 | 2026-10-28 | **C016 CLOSED** HW_UNAVAILABLE@4090；next **C043 streaming dig**. |
+| 2026-10-28 | **C043 CLOSED** covered-by-window+C041；next **C015 default-on decision dig**. |

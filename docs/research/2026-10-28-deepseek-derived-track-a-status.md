@@ -30,7 +30,8 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 1. ~~**C015**~~ built OFF + waffle/E2 PASS (−1.412 GiB); default still OFF.  
 2. ~~**C011**~~ VAE cast/prescale — **stale closed NO_WC_WIN** [`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md) (VAE roundtrip ≈29 ms).  
 3. ~~**C016 PDL**~~ — **CLOSED** @4090（无 HW + 无 cublasLt 挂点）。  
-4. **C043 streaming** — **next dig** (after C041 probed).  
+4. ~~**C043 streaming**~~ — **CLOSED** covered by INT8 window+prefetch+C041.  
+5. **C015 default-on decision** — **next dig** (no silent flip).  
 4. **Do not** reopen C018/C019/C003-SL/FlashMLA.
 
 Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; remaining «DeepSeek path» for near-lossless **is C015**, not MLA kernels.
