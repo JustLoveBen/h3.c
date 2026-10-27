@@ -92,7 +92,6 @@ for m in re.finditer(r'vram_ledger:\s*point=peak_dit\b[^\n]*?used_mib=([0-9.]+)'
 print('NA' if not vals else f'{max(vals):.4f}')
 INNER
 }
-}
 
 # Arm A: baseline (stage unset)
 unset H3_DIT_ACT_FP16_STAGE
