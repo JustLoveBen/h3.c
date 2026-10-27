@@ -70,3 +70,38 @@ Hard gates:
 **Bonus:** full FP4 energy restored — C001 blank/collapse was the same out-gate wipe, not (only) naive w4a4 math. Visual/OR still required before any product default-on.
 
 Artifacts: `out/keep_int8_ladder_postfix_20261027/{k_*}/`.
+
+## Visual probe (postfix p01_sprint t≈2s, Asia/Shanghai 13:14)
+
+Frame pull: `out/keep_int8_ladder_postfix_20261027_from238/frames/` + `~/grokbot-share/postfix_frames/`.
+PSNR vs INT8 gold (ffmpeg, avg): attn 17.16 / mlp 17.12 / qkv 17.38 / full 18.33 / attn_fc1 18.36 / attn_fc2 18.55 — all diverge (expected); PSNR alone does not rank usability.
+
+| arm | latent energy | human/agent frame read | verdict |
+|---|---|---|---|
+| k_all | BIT_ID gold | recognizable sprinter, stadium, mild gen fuzz | gold |
+| k_attn | OK | recognizable; more blocky/painterly than gold | alive (experimental) |
+| k_attn_fc1 | OK | clear wet-track sprint, structure intact | alive candidate |
+| k_attn_fc2 | OK | vertical smear / pixelation around runner | weak |
+| k_mlp | OK (fixed) | **systematic mosaic/grid overlay** | FAIL visual |
+| k_qkv | OK (≠full) | **screen-door grid + chroma fringe** | FAIL visual |
+| k_full | OK (fixed) | content present but heavy noise/distortion | FAIL visual (not blank) |
+
+**Mechanism after gate fix:** mlp/qkv no longer explode/collapse via AdaLN wipe — residual FAIL is **FP4 GEMM quality on those kinds** (naive w4a4 / SF path), not another KEEP control-flow bug. Mask/kind/weight-skip were already correct pre-fix; the only hard implementation bug was the dual gate hybrid. Product still stays INT8 default; recommend experimental arm = `KEEP=attn` or `attn,fc1` pending multi-scene.
+
+OpenRouter :free VL blocked this turn (`401 User not found` on env key) — local frame read used instead; re-run OR when key refreshed.
+
+## Mask / path hard evidence (postfix logs)
+
+| arm | KEEP_INT8 log | fp4_mask | gemm_epi | act_convrot | dit_ms (8step) |
+|---|---|---|---|---|---|
+| k_all | qkv,out,fc1,fc2 | 0x0 | 1 | ON | 38345 |
+| k_attn | qkv,out | 0xc | 0 | ON | 37233 |
+| k_mlp | fc1,fc2 | 0x3 | 0 | ON | 39295 |
+| k_qkv | qkv | 0xe | 0 | ON | 30511 |
+| k_full | unset | 0xf | 0 | ON | **23545** |
+| k_attn_fc1 | qkv,out,fc1 | 0x8 | 0 | ON | 40137 |
+| k_attn_fc2 | qkv,out,fc2 | 0x4 | 0 | ON | 29876 |
+
+Bits: QKV=0 OUT=1 FC1=2 FC2=3; `fp4_mask=(~keep)&0xF`. Logs match intended GEMM split. `gemm_epi=0` whenever any FP4 linear (hybrid) — consistent with `fused && !fp4_mask`. No evidence of wrong-kind miss or act ConvRot asymmetry across arms. Weight path: INT8 ConvRot store + FP4 sidecar (1332 tensors) for FP4 kinds.
+
+Host/device A/B at clip level = this postfix ladder (same seed/ids/protocol). Single-GEMM rel_l2 probe not required to close the gate-wipe bug; residual mlp/qkv mosaic remains a **quality** (naive w4a4) issue under correct routing.
