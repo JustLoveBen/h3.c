@@ -76,6 +76,9 @@ const char *h3_ffmpeg_venc(void);
 /* libx264 -preset: H3_X264_PRESET 显式优先；否则按 H3_X264_PRESET_TIER
  * quality(默认)=veryfast / preview=ultrafast。封装层改动,latent 不变。 */
 const char *h3_ffmpeg_x264_preset(void);
+/* libx264 -crf: H3_X264_CRF 显式优先；否则 preview→23，hires
+ * (W×H≥1152×640)→14，其余→18。封装层；不改 latent。 */
+const char *h3_ffmpeg_x264_crf(int width, int height);
 
 /* Fill argv with NULL-terminated ffmpeg encode command. scratch holds
  * size/rate/threads strings. Returns argc or -1. */

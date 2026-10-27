@@ -191,6 +191,18 @@ const char *h3_ffmpeg_x264_preset(void) {
     return x264_tier_preview() ? "ultrafast" : "veryfast";
 }
 
+const char *h3_ffmpeg_x264_crf(int width, int height) {
+    const char *e = getenv("H3_X264_CRF");
+    if (e && e[0]) return e;
+    if (x264_tier_preview()) return "23";
+    /* 1344×768 CRF18+veryfast → ~1.3Mbps talking-head macroblocks.
+     * Raise quality floor for ≥1152×640 eval/product mux. */
+    if (width > 0 && height > 0 &&
+        (long)width * (long)height >= 1152L * 640L)
+        return "14";
+    return "18";
+}
+
 static double ffmpeg_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -405,7 +417,7 @@ int h3_ffmpeg_build_encode_argv(const h3_ffmpeg_enc_opts *opts, char **argv,
         ARG("-preset");
         ARG(h3_ffmpeg_x264_preset());
         ARG("-crf");
-        ARG("18");
+        ARG(h3_ffmpeg_x264_crf(opts->width, opts->height));
     }
     ARG("-pix_fmt");
     ARG("yuv420p");
@@ -811,7 +823,8 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
         "-i", "pipe:0", "-an", "-c:v", "libx264",
-        "-preset", (char *)h3_ffmpeg_x264_preset(), "-crf", "18",
+        "-preset", (char *)h3_ffmpeg_x264_preset(),
+        "-crf", (char *)h3_ffmpeg_x264_crf(width, height),
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", (char *)path, NULL
     };
