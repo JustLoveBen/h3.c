@@ -31,7 +31,7 @@
 | # | ID / 主题 | 类别 | 期望收益 | 风险 | waffle | 4090 | 工作量 | Why now / defer |
 |---:|---|---|---|---|---|---|---|---|
 | **1** | **C041 窗 30→24** | VRAM | ~GiB 级峰值余量；可能 −WC（H2D 更频） | L | 同配置可过（能力探针） | ✅ | 低 | **NOW（他机在跑）** — C040 768p free≈0.8 GiB，缩窗是最便宜的余量探针；**不解默认** |
-| **2** | **C015/C042 act-FP16 中转** | VRAM / 近无损 WC | 激活带宽↓；768p+ 余量；WC 可能小正/零 | M | **非 BIT_ID**；需同配置 waffle | ✅ | 中 | **NOW（他机在跑）** — 与 C041 互补；成功标准见 §4 |
+| **2** | **C015/C042 act-FP16 中转** | VRAM / 近无损 WC | 激活带宽↓；768p+ 余量；WC 可能小正/零 | M | **非 BIT_ID**；需同配置 waffle | ✅ | 中 | **DONE default ON** [`c015-default-on`](2026-10-28-c015-default-on-decision.md) |
 | **3** | **抬画布质量 SKU**（960×544 / 1152×640 PDMD上限；1344 Euler） | quality@sameNFE | 小脸五官可辨（主杠杆） | L | 跨分辨率非 waffle 金线 | ✅ 已证 | 低（产品档） | **NOW（质量）** — [`ghosting`](2026-10-27-ghosting-and-small-face.md)：远脸=像素预算；**加步不是免费清晰度** |
 | **4** | **C035 detail / taomate-0.7 refiner LoRA** | quality@sameNFE / better-than-DMAD polish | 少步过饱和/糊边恢复；非发明远景像素 | M | 有损臂；独立合同 | ✅ | 中 | **BLOCK 2026-10-28** — 无本地权（[`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md)）；权重到位再扫 |
 | **5** | **人脸/身份 LoRA（训练臂 · 非 FaceRefine）** | training / quality | 近景身份/口型更稳；**不能**单独救 ~34px 远脸 | H | 新合同 | ✅ 推理可挂 | **高（训）** | **有条件 NOW 设计、DEFER 重训** — 见 §2.1；需 face-heavy 数据 + 与 DMAD/Euler 合同正交 |
@@ -39,7 +39,7 @@
 | **6b** | ~~**C016 PDL**~~ | — | HW N/A @sm89 | — | — | **No** | — | **CLOSED** [`c016-close`](2026-10-28-c016-pdl-dig-close.md)；next DeepSeek **C043 streaming dig** |
 | **7** | **C018 QKV merge（先 diff 现状）** | lossless WC? | 历史估 −0.6~−1.2s；可能已覆盖 | M | INT8 序可能非 bit | ✅ | 低探+中改 | **NEXT probe** — catalog 标 *maybe stale*；先证明缺口再写核 |
 | **8** | **C064 TE↔DiT↔VAE 安全重叠** | VRAM/WC hygiene | 峰值错峰；冷启动/预热 OOM 少 | M | 应 bit | ✅ | 中 | **AFTER C041/C015** — 白名单已 landed；真重叠仍门控 |
-| **9** | ~~**C043 layerwise streaming**~~ | — | covered | — | — | — | — | **CLOSED** [`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md)；next **C015 default-on decision dig** |
+| **9** | ~~**C043 layerwise streaming**~~ | — | covered | — | — | — | — | **CLOSED** [`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md) |
 | **10** | **正式二采 / latent upscaler SKU（C097）** | architecture/product | 480 草稿→高分比直出便宜 | M | 有损 | ✅ 部分代码 | 高 | **DEFER 产品档** — 非 DiT 主墙；二采少步仍伤小脸（需 face-aware 二采合同） |
 | **11** | **SGMD / 下一代 fewstep 蒸馏（外研）** | better-than-DMAD | 运动/动态优于 DMD2 类（论文人评）；需训 | H | 新学生合同 | 推理后可 | **很高** | **OBSERVE** — PDMD 已优于同 NFE DMAD（论文 Table2）；SGMD 是「再训一条学生」不是推理开关 |
 | **12** | **C036 UniPC/DPM++（无训）** | sampler | ≤8 NFE 训练-free；难打蒸馏 4NFE | M | 轨迹变 | ✅ | 低 | **LOW** — 与 LoRA 正交；不作击败 DMAD 主叙事 |
@@ -128,3 +128,4 @@
 | 2026-10-28 | 初稿：4090 INT8 约束下重排 Top12；关闭项对齐 catalog；LoRA vs FaceRefine；E1–E3 成功标准。分析-only，无 GPU。 |
 | 2026-10-28 | **C016 CLOSED** HW_UNAVAILABLE@4090；next **C043 streaming dig**. |
 | 2026-10-28 | **C043 CLOSED** covered-by-window+C041；next **C015 default-on decision dig**. |
+| 2026-10-28 | **C015 default ON** (decision dig YES). |

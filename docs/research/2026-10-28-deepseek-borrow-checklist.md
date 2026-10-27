@@ -7,7 +7,7 @@
 
 ## 一句话
 
-DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶段、配置即合同、融合消中转、精度×核共设计」**；不能搬的是 MoE/MLA/DualPipe/FlashMLA/DeepEP 二进制。对 4090 单卡产品，**下一刀最高 ship ROI 是 C015 工作区 FP16 中转（stub 已在，构造未武装）**；C018/C019 已被 Exp-G3 **stale closed**。不是再开 Ulysses/BF16 A2A / FlashMLA。
+DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶段、配置即合同、融合消中转、精度×核共设计」**；不能搬的是 MoE/MLA/DualPipe/FlashMLA/DeepEP 二进制。对 4090 单卡产品，**C015 工作区 FP16 中转已 default ON**（2026-10-28 decision dig）；C018/C019 已被 Exp-G3 **stale closed**。不是再开 Ulysses/BF16 A2A / FlashMLA。
 
 ## 对照表（可执行）
 
@@ -24,7 +24,7 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | 融合消中转 / epilogue | 小核融；GEMM+epi | **C003** EPI_FUSE / SL / INK | **boundary；keep OFF**（SL +46% dit） | A | 勿 default；tiled/TC 前不谈 WC |
 | E2-P3 跨 phase | 融合延伸 | **C004** | **idea** | A | C003 数值门后 |
 | Hadamard / ConvRot 共设计 | outlier 抑 | **C005** + `H3_DIT_ACT_F16` ConvRot | **partial**（ConvRot F16 **default ON**） | A | 不单独立项；≠ C015 |
-| 激活带宽中转降半 | 显存/带宽思维（DeepInfer T02） | **C015/C042** `H3_DIT_ACT_FP16_STAGE` | **built OFF + gate PASS** | A | default flip TBD；勿本切片翻转 |
+| 激活带宽中转降半 | 显存/带宽思维（DeepInfer T02） | **C015/C042** `H3_DIT_ACT_FP16_STAGE` | **default ON**（decision dig PASS） | A | opt-out `=0`；见 [`c015-default-on`](2026-10-28-c015-default-on-decision.md) |
 | 权重窗 / streaming | 显存预算 | **C041** window24；**C043** streaming | C041 **probed**；C043 **stale closed (covered by window+prefetch)** | A | 见 [`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md)；勿新建 stream 运行时 |
 | L2 pin / RoPE memo | cache hint / 不变量 | **C017**；**C068/C069** | C017 opt-in 无 WC；C068 default-on | A | 保持 |
 | PDL 短链 | launch 气泡 | **C016** | **stale closed (NO_WC_WIN / HW_UNAVAILABLE@4090)** | A | CC 8.9 无 PDL；cublasLt 无挂点；见 [`c016-close`](2026-10-28-c016-pdl-dig-close.md) |
@@ -43,16 +43,17 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 
 ## WIP 注意（勿踩）
 
-工作树已有 **未提交** C015 dig：`h3_dit_w4a8.c/.h`（`act_fp16_stage` stub + `ws_component_ledger`）、`h3_env_contract.c`、`print_h3_env_contract.py`。Track-A 接盘应 **续作该 stub→真正 packing**，不要另开平行分支覆盖。
+C015 packing **已落地且 default ON**（decision dig 2026-10-28）。勿重开 stub 叙事；opt-out `H3_DIT_ACT_FP16_STAGE=0`。
 
 ## Track-A 下一刀（最高 ship ROI · 给执行器）
 
-1. ~~**C015/C042**~~ — **built OFF + gate PASS**（勿本切片 default flip）。  
+1. ~~**C015/C042**~~ — **default ON**（[`c015-default-on`](2026-10-28-c015-default-on-decision.md)；multi-prompt waffle PASS；Euler −1.41 GiB；warm WC OK）。  
 2. ~~**C011**~~ — **stale closed NO_WC_WIN**（[`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md)；VAE meat ≈29 ms）。  
 3. ~~**C016 PDL**~~ — **stale closed**（[`c016-close`](2026-10-28-c016-pdl-dig-close.md)：4090 CC 8.9 无 PDL HW；cublasLt 无挂点；L2/P2b 上界 ≪0.3 s）。  
 4. ~~**C043 streaming**~~ — **stale closed**（[`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md)：INT8 窗+prefetch 已覆盖；无超出 C041 的清晰 VRAM/WC）。  
-5. **C015 default-on decision dig（下一刀）** — 多 prompt waffle + warm WC + 与 C041 叠显存；**仍禁止静默 default flip**。  
-   - C012 VAE SIMT sgemm ≈214 ms 仍 idea（TF32 质量风险），非 DeepSeek 下一刀。
+5. ~~**C015 default-on decision**~~ — **CLOSED YES → flipped ON**（本轮）。  
+   - C012 VAE SIMT sgemm ≈214 ms 仍 idea（TF32 质量风险），非 DeepSeek 下一刀。  
+   - Track-A DeepSeek 近无损主刀已收；下一刀回 catalog / 产品墙钟（NFE）或 hygiene，勿重开 C018/C019/C003-SL。
 
 
 **先别排：** DualPipe、FlashMLA、DeepEP、NVFP4 重开、U=2 BF16 当 4090 主刀、EPI_FUSE 默认开、重开 C018/C019、与 G1 抢同一张卡。
@@ -66,3 +67,4 @@ DeepSeek / DeepInfer 能搬的是 **「少字节、少同步、重叠独立阶�
 | 2026-10-28 | C015 PASS；C011 nsys **NO_WC_WIN closed**；下一刀 **C016 PDL dig**。 |
 | 2026-10-28 | **C016 CLOSED** NO_WC_WIN/HW_UNAVAILABLE@4090（CC 8.9）；下一刀 **C043 streaming dig**。 |
 | 2026-10-28 | **C043 CLOSED** covered-by-window+C041；下一刀 **C015 default-on decision dig**（不静默翻转）。 |
+| 2026-10-28 | **C015 default ON**（decision dig YES；multi-prompt waffle+warm WC+Euler −1.41 GiB；DMAD LoRA soft-note）；Track-A DeepSeek 主刀收。 |

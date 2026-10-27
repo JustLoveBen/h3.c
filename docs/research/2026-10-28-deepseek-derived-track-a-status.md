@@ -13,7 +13,7 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 |---|---|---|---|---|
 | Absorb / merge projections | QKV 3→1 GEMM | C018 | **stale closed** | Exp-G3 proof 2026-10-28 |
 | Fused Q-norm+RoPE+cast | `qkv_rope_f16_kernel` | C019 | **stale closed** | Same proof |
-| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **built OFF + gate PASS** | waffle+E2 PASS @480p (−1.412 GiB); default still OFF; U=1 |
+| 消中转 / act dtype staging | `d_qkv`/`d_wide` FP16 WS | **C015/C042** | **default ON** | decision dig 2026-10-28 YES; Euler −1.41 GiB; multi-prompt waffle PASS; opt-out `=0` |
 | GEMM+epilogue / ConvRot+requant | EPI_FUSE / INK / SL | C003 | **landed OFF** | SL +46% dit; ink ~0%; keep OFF |
 | DeferredRelease overlap | TE↔DiT prefetch | C064 | **partial+ NO_WC_WIN** | Opt-in only |
 | Config-as-contract / golden TE | env contract, te_cache | C061/C062 | **landed+** | Hygiene |
@@ -27,18 +27,17 @@ DeepSeek/DeepInfer value here is **strategy** (消中转、融合、DeferredRele
 
 ## Priority next (Track-A waffleable, DeepSeek-derived)
 
-1. ~~**C015**~~ built OFF + waffle/E2 PASS (−1.412 GiB); default still OFF.  
+1. ~~**C015**~~ **default ON** ([`c015-default-on`](2026-10-28-c015-default-on-decision.md)).  
 2. ~~**C011**~~ VAE cast/prescale — **stale closed NO_WC_WIN** [`c011-nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md) (VAE roundtrip ≈29 ms).  
 3. ~~**C016 PDL**~~ — **CLOSED** @4090（无 HW + 无 cublasLt 挂点）。  
 4. ~~**C043 streaming**~~ — **CLOSED** covered by INT8 window+prefetch+C041.  
-5. **C015 default-on decision** — **next dig** (no silent flip).  
-4. **Do not** reopen C018/C019/C003-SL/FlashMLA.
+5. ~~**C015 default-on decision**~~ — **CLOSED YES → flipped**.  
+6. **Do not** reopen C018/C019/C003-SL/FlashMLA. Next Track-A pick from catalog / product WC (not another C015 dig).
 
-Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; remaining «DeepSeek path» for near-lossless **is C015**, not MLA kernels.
+Pillar-1 (Sol) ∩ DeepSeek Absorb → **closed** by Exp-G3; C015 near-lossless path **shipped default ON**.
 
 ## This commit deliverables
 
-- Exp-G3 evidence doc; catalog C018/C019 → stale closed.  
-- C015 dig + ledger + stub (prior).  
-- **C015 construction:** F16 qkv(+wide!lora) pack, `epi.y_f16`, F16qkv rope, FC2 cast; env default OFF.  
-- This status table.
+- C015 default-on decision dig + PASS table + **default ON flip**.  
+- Checklist / track-a-status / env contract updated.  
+- Tools: `run_c015_default_decision_dig_4090.sh`, `c015_default_decision_aggregate.py`.

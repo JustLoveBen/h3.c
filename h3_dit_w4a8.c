@@ -1555,8 +1555,13 @@ void h3_dit_w4a8_release_block_workspace(h3_dit_w4a8 *ctx) {
 /* Keep in sync with h3_dit_w4a8_layers_forward_f32 all-aux `need`. */
 /* C015: env request (may still refuse at pack if U>1 / nvfp4 / !fused_epi). */
 static int dit_fp16_stage_env(void) {
+    /* C015 default ON after 2026-10-28 decision dig (multi-prompt waffle PASS,
+     * warm WC no regression, Euler peak_dit drop ≈1.41 GiB). Opt out with =0.
+     * Pack still refuses nvfp4 / U>1 / !fused_epi. Parent/user policy note in
+     * commit: product default ON; set H3_DIT_ACT_FP16_STAGE=0 to revert. */
     const char *e = getenv("H3_DIT_ACT_FP16_STAGE");
-    return e && e[0] == '1' && e[1] == '\0';
+    if (e && e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
 }
 
 /* C015 arm: pack/phase use F16 d_qkv (+ F16 d_wide when !lora). */
@@ -1731,8 +1736,8 @@ int h3_dit_w4a8_act_f16(void) {
 }
 
 /* C015/C042 workspace FP16 staging — NOT the same as H3_DIT_ACT_F16.
- * Default OFF. Env=1 requests arm; pack/phase also require fused_epi, U=1,
- * !nvfp4. Keep OFF until waffle PASS + E2 peak_dit ≤ −0.5 GiB. */
+ * Default ON (2026-10-28 decision dig). Opt out H3_DIT_ACT_FP16_STAGE=0.
+ * Pack/phase still require fused_epi, U=1, !nvfp4. */
 int h3_dit_w4a8_act_fp16_stage(void) {
     static int logged;
     if (!dit_fp16_stage_env()) return 0;
@@ -1747,10 +1752,10 @@ int h3_dit_w4a8_act_fp16_stage(void) {
             (double)(s768 * (inner * 3u + wide) * sizeof(float) / 2u) / GiB;
         logged = 1;
         fprintf(stderr,
-                "dit_act_fp16_stage: H3_DIT_ACT_FP16_STAGE=1 — C015 F16 "
-                "d_qkv (+ d_wide if !lora) carve armed when fused_epi+U=1+"
-                "!nvfp4; theoretical half-save ≈%.2f GiB @seq=%zu / ≈%.2f "
-                "GiB @seq=%zu; default product OFF until waffle+E2; "
+                "dit_act_fp16_stage: C015 F16 d_qkv (+ d_wide if !lora) "
+                "carve armed when fused_epi+U=1+!nvfp4; theoretical "
+                "half-save ≈%.2f GiB @seq=%zu / ≈%.2f GiB @seq=%zu; "
+                "default ON (opt-out H3_DIT_ACT_FP16_STAGE=0); "
                 "≠ H3_DIT_ACT_F16 ConvRot\n",
                 save480, s480, save768, s768);
         fflush(stderr);

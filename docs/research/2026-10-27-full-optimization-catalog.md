@@ -161,7 +161,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 | **C012** | VAE | VAE 段 SIMT sgemm / TF32 衍生 | 算力路径升级 | sm120「VAE 族未施工」 | WC中 Q中（TF32） | nsys | **idea** | S5 | T1 允许 TF32；T2 慎 |
 | **C013** | VAE | VAE INT8 路径深化 | 与 DiT INT8 同族 | `h3_vae_int8*` | WC低~中 | 质量门 | **partial** | S4 | 不挡 DiT 主线 |
 | **C014** | DiT Metal | Mac Metal 核/融合余量 | shaders / 调度 | `h3_shaders.metal`、`h3_gpu.m` | WC（Mac） | 与 CUDA 臂隔离 | **idea** | — | 单独 Mac 账本；本文默认 CUDA 5090 |
-| **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2；[`c015-dig`](2026-10-28-c015-act-fp16-staging-dig.md)；[`kpi`](2026-10-28-c015-fp16-stage-waffle-e2-kpi.md)；DeepSeek 消中转 | WC低 VRAM高 Q中 | C040 | **built OFF + gate PASS**（waffle meanΔ 0.015；E2 peak_dit −1.412 GiB @480p；default still OFF） | S2 | Product default flip TBD；U>1 A2A half TBD |
+| **C015** | DiT | 激活 FP16 中转降带宽 | d_wide/d_qkv 存 FP16 | sm120 M2；[`c015-dig`](2026-10-28-c015-act-fp16-staging-dig.md)；[`kpi`](2026-10-28-c015-fp16-stage-waffle-e2-kpi.md)；[`default-on`](2026-10-28-c015-default-on-decision.md)；DeepSeek 消中转 | WC低 VRAM高 Q中 | C040 | **default ON**（decision dig YES；Euler −1.41 GiB；multi-prompt waffle PASS；opt-out `=0`） | S2 | shipped；U>1 A2A half TBD |
 | **C016** | DiT | PDL 挂 GEMM→dequant 短链 | 消 launch 气泡 | transfer 3.2；[`c016-close`](2026-10-28-c016-pdl-dig-close.md) | — | CC≥9.0 | **stale closed (NO_WC_WIN / HW_UNAVAILABLE@4090)** | S5/S8 | 4090 CC 8.9；勿施工 |
 | **C017** | DiT | L2 accessPolicyWindow pin 小热表 | ConvRot Hadamard `H3_CUDA_L2_PIN` | sm120 M3；[`beyond-dmad-and-lossless`](2026-10-27-beyond-dmad-and-lossless.md) | WC低 bit同 | — | **landed(opt-in)**（fair hot Δ≈+62ms；BIT_ID PASS；**无墙钟收益**） | S2 | 保持 opt-in；勿 default-on |
 | **C018** | DiT | QKV merge（3→1 宽 GEMM） | 历史 gap list | [`exp-g3`](2026-10-28-exp-g3-pillar1-gap-proof.md) | — | — | **stale closed**（已是单 `LINEAR_QKV` GEMM） | S5 | 停止 −0.6~−1.2s 叙事；余量→C015 |
@@ -187,7 +187,7 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 |---|---|---|---|---|---|---|---|---|---|
 | **C040** | DiT@768p | 无逐项显存账本 | 关键节点 `cudaMemGetInfo` 分桶 + delta | deadend-memory 条目1；A2；`H3_VRAM_LEDGER`；[`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md) | VRAM决策前提 | 授权一跑；勿 nsys 若盘满 | **landed+**（480p+768p@4090；768 peak_dit≈22.7GiB no OOM；见 [`c040-768p`](2026-10-28-c040-768p-ledger.md)）（480p buckets+delta @4090；peak_dit≈22.4GiB；768p probe仍可选） | S2 | C015/C041/C043 按 ~0.8GiB headroom 决策 |
 | **C041** | DiT | 窗 30→24 探针 | 换 ~GiB 看全 sol | memory 审计 ② | VRAM中 WC可能负 | C040 | **probed**（480p@4090；Euler peak −3.1GiB；默认不变；[`c041`](2026-10-28-c041-window24-probe.md)） | S2 | 默认不变；opt-in sol headroom |
-| **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2；[`c015-dig`](2026-10-28-c015-act-fp16-staging-dig.md)；[`kpi`](2026-10-28-c015-fp16-stage-waffle-e2-kpi.md) | VRAM高 | C040 | **built OFF + gate PASS**（同 C015） | S2 | near-lossless waffle PASS |
+| **C042** | DiT | 激活 FP16 中转 | 同 C015 | M2；[`default-on`](2026-10-28-c015-default-on-decision.md) | VRAM高 | C040 | **default ON**（同 C015） | S2 | shipped |
 | **C043** | DiT | Layerwise weight streaming | 权重按层驻留+prefetch | transfer 4.3；[`c043-close`](2026-10-28-c043-layerwise-streaming-dig-close.md) | — | — | **stale closed (covered by window+C041)** | S1/S2 | 勿新建；用 C041/C015 杠杆 |
 | **C044** | DiT | NVFP4 权重体积治本 | 与 C001 同刀显存维 | sm120 M1 | VRAM高 | C001 | **blocked** | S4 | 视觉门绑定 |
 | **C045** | DiT | SSD BF16 streaming（已有开关） | 两 slot overlap 读盘 | `ssd_streaming`；`h3_dit.c` | VRAM（Mac/BF16） | 与 INT8 互斥 | **landed** | S2 | CUDA INT8 窗是另一故事 |
@@ -346,7 +346,7 @@ C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-ink-0pct-sl-bitid-plus46pct,S5,keep-off
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,stale-closed-NO_WC_WIN,S5,P2
-C015,A/C,DiT,act FP16 staging,dig-plus-stub,S2,P2
+C015,A/C,DiT,act FP16 staging,default-ON,S2,P2
 C018,A,DiT,QKV merge 3to1,stale-closed-exp-g3,S5,P-closed
 C019,A,DiT,QKNorm+RoPE fuse,stale-closed-exp-g3,S5,P-closed
 C017,A,DiT,L2 pin hot tables,landed-opt-in-no-wc,S2,closed-opt-in
@@ -420,6 +420,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-28 | **C011 CLOSED NO_WC_WIN** @4090 nsys：VAE F16↔F32 weight roundtrip ≈29 ms；next DeepSeek **C016 PDL dig**. |
 | 2026-10-28 | **C016 CLOSED** NO_WC_WIN/HW_UNAVAILABLE@4090（CC 8.9；无 cublasLt PDL）；next DeepSeek **C043 streaming dig**. |
 | 2026-10-28 | **C043 CLOSED** covered-by-window+C041；next DeepSeek **C015 default-on decision dig**. |
+| 2026-10-28 | **C015/C042 default ON** after decision dig (multi-prompt waffle+warm WC+Euler −1.41 GiB). |
 | 2026-10-28 | C064 Track-A TE_OVERLAP opt-in @4090: ov8 vs HOST_STAGE **NO_WC_WIN** (dit +8.9%/+7.4%); keep opt-in. See [`c064-te-overlap`](2026-10-28-c064-te-overlap-probe.md). |
 
 ---
