@@ -1,3 +1,7 @@
+# KEEP_INT8 hybrid（正路径）
+
+**正路径优先级（2026-10-27）：** 现成 w4a4 原生 FP4 + KEEP_INT8 找最大可过覆盖；convert DISARMED。
+
 # NVFP4 KEEP_INT8 hybrid (no-retrain)
 
 **Date:** 2026-10-27 (Asia/Shanghai)  

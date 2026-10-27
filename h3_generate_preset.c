@@ -117,24 +117,13 @@ int h3_generate_preset_apply(const h3_generate_preset_in *in,
         return 1;
     }
     if (!strcmp(name, "nvfp4")) {
-        if (in->magcache_thresh > 0.0f)
-            return preset_fail(err, err_size,
-                               "preset=nvfp4 非金线：拒绝 magcache");
-        if (in->step_cache_kind != 0)
-            return preset_fail(err, err_size,
-                               "preset=nvfp4 非金线：拒绝 tea/fb/easy");
-        if (in->reuse_interval > 1)
-            return preset_fail(err, err_size,
-                               "preset=nvfp4 非金线：拒绝 reuse>1");
-        out->id = H3_PRESET_NVFP4;
-        out->non_gold = 1;
-        if (!in->steps_explicit)
-            out->steps = 8;
-        if (!in->sdpa_explicit)
-            out->sdpa = "cudnn";
-        if (!in->cfg_explicit)
-            out->cfg_scale = 1.0f;
-        return 1;
+        /* DISARM (2026-10-27): --preset nvfp4 was the Sep-13 host
+         * dequant NVFP4→INT8 bypass (zero FP4 speedup). Do not re-enable.
+         * Target path: INT8 ConvRot --dit + H3_DIT_NVFP4=1 +
+         * H3_DIT_NVFP4_FILE=<nvfp4_w4a4.safetensors> (+ optional KEEP_INT8). */
+        return preset_fail(err, err_size,
+                           "preset=nvfp4 DISARMED (host dequant→INT8 bypass; "
+                           "use H3_DIT_NVFP4=1 + NVFP4_FILE w4a4 native FP4)");
     }
     if (strcmp(name, "turbo4") != 0) {
         char buf[256];

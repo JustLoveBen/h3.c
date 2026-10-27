@@ -2890,8 +2890,8 @@ int main(int argc, char **argv) {
     if (!probe_vae_load && !dit_path) {
         if (preset_out.id == H3_PRESET_NVFP4)
             fprintf(stderr,
-                    "need --dit <pruned_nvfp4.safetensors>（preset=nvfp4 非金线；"
-                    "不回退 INT8）\n");
+                    "preset=nvfp4 DISARMED — need INT8 --dit + H3_DIT_NVFP4=1 "
+                    "+ H3_DIT_NVFP4_FILE=w4a4\n");
         else
             fprintf(stderr, "need --dit\n");
         return 2;
@@ -3396,8 +3396,15 @@ int main(int argc, char **argv) {
     t_all0 = now_ms();
     /* NVFP4 accel SKU: probe first, hard-fail, never silent INT8. */
     {
-        int want_nvfp4 = (preset_out.id == H3_PRESET_NVFP4) ||
-                         h3_dit_nvfp4_path_hints(dit_path);
+        /* DISARM default: path "*nvfp4*" or preset nvfp4 must NOT open the
+         * host dequant→INT8 track. Opt-in only via H3_DIT_NVFP4_HOST_DEQUANT=1
+         * (legacy Sep-13 bypass; not a product goal). Native FP4 = H3_DIT_NVFP4. */
+        int want_nvfp4_host_dequant =
+            (getenv("H3_DIT_NVFP4_HOST_DEQUANT") &&
+             getenv("H3_DIT_NVFP4_HOST_DEQUANT")[0] == '1');
+        int want_nvfp4 = want_nvfp4_host_dequant &&
+                         ((preset_out.id == H3_PRESET_NVFP4) ||
+                          h3_dit_nvfp4_path_hints(dit_path));
         if (want_nvfp4) {
             if (!h3_nvfp4_store_open(dit_path, &dit_nvfp4, error,
                                      sizeof(error))) {
@@ -3414,7 +3421,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             dit_is_nvfp4 = 1;
-            printf("dit_format: NVFP4 (非金线；dequant→INT8 GEMM)\n");
+            printf("dit_format: NVFP4 (DISARM host-dequant track; H3_DIT_NVFP4_HOST_DEQUANT=1)\n");
             if (n_ref_images || ref_video_path)
                 printf("dit_tree: Ref2VA %s (not FL2VA)\n", dit_path);
             if (!h3_dit_w4a8_load_core_nvfp4(&dit_nvfp4, &core, error,

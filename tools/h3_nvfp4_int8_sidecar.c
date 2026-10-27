@@ -16,6 +16,19 @@ static const char *k_suffix[4] = {
 static const char *k_name[4] = {"qkv", "out", "fc1", "fc2"};
 
 int main(int argc, char **argv) {
+    /* DISARM (2026-10-27): host dequant→INT8 sidecar is Sep-13 transitional
+     * bypass (no native FP4 speedup). Refuse unless H3_FORCE_NVFP4_INT8_SIDECAR=1. */
+    {
+        const char *force = getenv("H3_FORCE_NVFP4_INT8_SIDECAR");
+        if (!force || force[0] != '1') {
+            fprintf(stderr,
+                    "h3_nvfp4_int8_sidecar DISARMED — host dequant→INT8 is not "
+                    "a product path. Set H3_FORCE_NVFP4_INT8_SIDECAR=1 only for "
+                    "archaeology.\n");
+            return 2;
+        }
+    }
+
     const char *path;
     h3_nvfp4_store store;
     char err[512];
