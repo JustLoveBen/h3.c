@@ -393,6 +393,8 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 日期 | 说明 |
 |---|---|
 | 2026-10-27 | C003 EPI_FUSE_SL 238 A/B @ `ed1ce72`: BIT_ID+waffle PASS；hot dit **+46%** → keep OFF；**开发收口**。见 [`epi-fuse-sl`](2026-10-27-epi-fuse-sl-single-launch.md) / [`beyond-dmad`](2026-10-27-beyond-dmad-and-lossless.md)。 |
+| 2026-10-28 | C041 窗24探针 @4090 480p：Euler peak_dit **−3144 MiB**；DMAD −2232；`H3_DIT_INT8_WINDOW` EXPERIMENTAL；**默认不变**。见 [`c041`](2026-10-28-c041-window24-probe.md)。 |
+| 2026-10-28 | C040 768p ledger @4090：1344×768 Euler/DMAD **no OOM**；peak_dit≈23269/23131 MiB；attn=cudnn SDPA。见 [`c040-768p`](2026-10-28-c040-768p-ledger.md)。 |
 | 2026-10-28 | DMAD-4 vs Euler-8 480p KPI (t71u primary pair; PDMD skipped): warm dit 1.61× / warm e2e 1.43×; C007 N/A on cudnn. 见 [`dmad4-vs-euler8`](2026-10-28-dmad4-vs-euler8-kpi-480p.md)。 |
 | 2026-10-28 | C073 dump→replay 480p Euler-8 GPU acceptance：async on/off waffle PASS Δ=0 + rgb bit-id；PDMD contrast-only (t71u). 见 [`c073-480p`](2026-10-28-c073-dump-replay-480p.md)。 |
 | 2026-10-28 | C040 ledger buckets+delta + true `peak_dit`；C062 AUTO 480p×5s p10 KPI (Euler-8 WALL 91.4s / PDMD-4 61.0s；clip2 te=0). 见 [`c040-c062-480p-kpi`](2026-10-28-c040-c062-480p-kpi.md)。 |
