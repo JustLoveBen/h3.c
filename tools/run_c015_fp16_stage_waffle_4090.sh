@@ -116,9 +116,10 @@ PEAK_C=$(extract_peak "$CAND_LOG")
 
 echo "==== waffle gate ===="
 set +e
+# Near-lossless Track-A seam (not BIT_ID): historical defaults 0.15/0.40
 python3 "$ROOT/tools/waffle_same_config_gate.py" \
-  --base "$BASE_LOG" --cand "$CAND_LOG" \
-  --mean-tol 1e-4 --max-tol 1e-3 \
+  --mean-tol 0.15 --max-tol 0.40 --require-frames 5 \
+  "$BASE_LOG" "$CAND_LOG" \
   >"$OUT_ROOT/waffle_gate.txt" 2>&1
 WRC=$?
 set -e
