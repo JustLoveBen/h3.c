@@ -4139,6 +4139,7 @@ int h3_cuda_convrot_act_f32_dd(h3_cuda *cuda, const float *d_x, size_t m,
     return 1;
 }
 
+
 static int h3_cuda_ensure_hadamard_f16(h3_cuda *cuda, int gs, char *error,
                                        size_t error_size) {
     if (!h3_cuda_ensure_hadamard(cuda, gs, error, error_size)) return 0;
@@ -4646,6 +4647,59 @@ __global__ void h3_cuda_f32_to_f16_row_prescale_kernel(const float *x, __half *y
         dst[col] = __float2half(v);
     }
 }
+
+/* EPI_FUSE_INK: ConvRot then per-row INT8 quant into rq scratch. */
+int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
+                                  size_t m, size_t k, int convrot_groupsize,
+                                  int8_t **out_xi8, float **out_scales,
+                                  char *error, size_t error_size) {
+    size_t m_pad, i8_bytes, act_off, rot_off, need;
+    char *base;
+    float *d_rot;
+    int8_t *d_xi8;
+    float *d_scales;
+    unsigned threads = 256;
+    size_t smem;
+    cudaError_t status;
+
+    if (out_xi8) *out_xi8 = NULL;
+    if (out_scales) *out_scales = NULL;
+    if (!cuda || !d_swiglu || !out_xi8 || !out_scales || m == 0 || k == 0 ||
+        convrot_groupsize < 4) {
+        h3_cuda_set_error(error, error_size, "invalid epi_fuse_ink_prep args");
+        return 0;
+    }
+    if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+
+    m_pad = (m + 127u) & ~(size_t)127u;
+    i8_bytes = m_pad * k;
+    act_off = (i8_bytes + 15u) & ~(size_t)15u;
+    rot_off = (act_off + m_pad * sizeof(float) + 15u) & ~(size_t)15u;
+    need = rot_off + m * k * sizeof(float);
+    if (!h3_cuda_ensure_rq_scratch(cuda, need, error, error_size)) return 0;
+    base = (char *)cuda->d_rq_scratch;
+    d_xi8 = (int8_t *)base;
+    d_scales = (float *)(base + act_off);
+    d_rot = (float *)(base + rot_off);
+
+    if (!h3_cuda_convrot_act_f32_dd(cuda, d_swiglu, m, k, convrot_groupsize,
+                                    d_rot, error, error_size))
+        return 0;
+    smem = (size_t)threads * sizeof(float);
+    h3_cuda_quantize_act_per_row_kernel<<<(unsigned)m_pad, threads, smem,
+                                          h3_cuda_op_st(cuda)>>>(
+        d_rot, d_xi8, d_scales, m, k);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        h3_cuda_set_error_cuda(error, error_size, "epi_fuse_ink quant",
+                               status);
+        return 0;
+    }
+    *out_xi8 = d_xi8;
+    *out_scales = d_scales;
+    return 1;
+}
+
 
 /* Same absmax/127 quant as F32, from F16 ConvRot (DiT act_f16).
  * pre_scale: divide act_scale so INT8 dequant restores F32 magnitude. */

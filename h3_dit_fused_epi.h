@@ -27,6 +27,16 @@ static inline int h3_dit_epi_fuse_wanted(void) {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+/* E2 redesign: ConvRot+requant after FC1 SwiGLU, then FC2 pre_q (keeps
+ * Y=(X@H)@W_rot.T). Opt-in H3_DIT_EPI_FUSE_INK=1; default OFF. Does NOT
+ * arm the disarmed skip-ConvRot H3_DIT_EPI_FUSE path. Partial: uses
+ * sgemm ConvRot + per-row INT8 quant (f32 algebra); act_f16-prescale
+ * match and single-launch fuse still TODO before waffle-green default. */
+static inline int h3_dit_epi_fuse_ink_wanted(void) {
+    const char *e = getenv("H3_DIT_EPI_FUSE_INK");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 /* gated[r] = residual[r] + branch[r] * gate_mod; then AdaLN(gated) → normed.
  * Same math as h3_dit_w4a8_gate_f32 then h3_dit_w4a8_adaln_f32. */
 static inline void h3_dit_gate_adaln_f32(

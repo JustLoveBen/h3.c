@@ -168,18 +168,27 @@ static void quant_ref_row(const float *x, size_t k, uint8_t *fp4, float *sf16) {
 
 int main(int argc, char **argv) {
     g_use_32x4 = 1; g_stride_ncb_rd = 1;
+    size_t m = 256, n = 256, k = 512;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "linear")) g_use_32x4 = 0;
-        if (!strcmp(argv[i], "32x4")) g_use_32x4 = 1;
-        if (!strcmp(argv[i], "stride_ncb")) g_stride_ncb_rd = 0;
-        if (!strcmp(argv[i], "stride_ncb_rd")) g_stride_ncb_rd = 1;
+        else if (!strcmp(argv[i], "32x4")) g_use_32x4 = 1;
+        else if (!strcmp(argv[i], "stride_ncb")) g_stride_ncb_rd = 0;
+        else if (!strcmp(argv[i], "stride_ncb_rd")) g_stride_ncb_rd = 1;
+        else if (argv[i][0] >= '1' && argv[i][0] <= '9') {
+            /* positional sizes: first number=M, second=N, third=K */
+            static int size_i = 0;
+            size_t v = (size_t)strtoull(argv[i], NULL, 10);
+            if (size_i == 0) m = v;
+            else if (size_i == 1) n = v;
+            else if (size_i == 2) k = v;
+            size_i++;
+        }
     }
+    if ((k % 64) != 0) { fprintf(stderr, "K must be %%64==0\n"); return 1; }
     CKC(cudaMemcpyToSymbol(d_use_32x4, &g_use_32x4, sizeof(int)));
     CKC(cudaMemcpyToSymbol(d_stride_ncb_rd, &g_stride_ncb_rd, sizeof(int)));
-    printf("mode: %s %s\n", g_use_32x4 ? "32x4" : "linear",
-           g_stride_ncb_rd ? "stride_ncb_rd" : "stride_ncb");
-
-    const size_t m = 256, n = 256, k = 512;
+    printf("mode: %s %s  M=%zu N=%zu K=%zu\n", g_use_32x4 ? "32x4" : "linear",
+           g_stride_ncb_rd ? "stride_ncb_rd" : "stride_ncb", m, n, k);
     const size_t m_pad = m, n_pad = n;
     float *hx = (float *)malloc(m * k * 4), *hw = (float *)malloc(n * k * 4);
     srand(7);

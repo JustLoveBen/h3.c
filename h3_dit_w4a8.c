@@ -3518,7 +3518,12 @@ static int block_phase_out_mlp(
      * an in-kernel ConvRot+requant redesign. Default remains OFF. */
     int epi_fuse_req = gemm_epi && h3_dit_epi_fuse_wanted() &&
                        h3_dit_w4a8_act_f16() && ctx->convrot_gs > 0;
-    const int epi_fuse = 0; /* armed path unreachable without ConvRot-in-kernel */
+    const int epi_fuse = 0; /* skip-ConvRot DISARMED — never arm */
+    /* Redesign arm: after FC1 SwiGLU, ConvRot+requant then FC2 pre_q.
+     * Requires gemm_epi + convrot; independent of H3_DIT_EPI_FUSE.
+     * Default OFF. Prefer H3_DIT_ACT_F16=0 for A/B (ink uses f32 algebra). */
+    int epi_fuse_ink = gemm_epi && h3_dit_epi_fuse_ink_wanted() &&
+                       ctx->convrot_gs > 0 && !ctx->nvfp4_on;
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
     h3_cuda_dit_gemm_epi epi;
@@ -3529,13 +3534,13 @@ static int block_phase_out_mlp(
         fused_logged = 1;
         fprintf(stderr,
                 "dit_fused_epi: %s gate_adaln=%d gemm_epi=%d lora=%d scale=%.4g "
-                "overlap=%d epi_fuse_req=%d epi_fuse=%d (P2 skip-ConvRot "
-                "DISARMED) nvfp4=%d\n",
+                "overlap=%d epi_fuse_req=%d epi_fuse=%d epi_fuse_ink=%d "
+                "(P2 skip-ConvRot DISARMED; ink=ConvRot+requant) nvfp4=%d\n",
                 fused ? "on" : "off", fused ? 1 : 0, gemm_epi ? 1 : 0,
                 ctx->lora ? 1 : 0, ctx->lora ? ctx->lora->scale : 0.0,
                 ctx->lora ? h3_dit_w4a8_lora_overlap() : 0,
                 epi_fuse_req ? 1 : 0, epi_fuse ? 1 : 0,
-                ctx->nvfp4_on ? 1 : 0);
+                epi_fuse_ink ? 1 : 0, ctx->nvfp4_on ? 1 : 0);
         fflush(stderr);
     }
     memset(&epi, 0, sizeof(epi));
@@ -3818,6 +3823,18 @@ fc1_done:
             stats->swiglu_ms = 0.0;
         }
 
+        /* EPI_FUSE_INK: d_act is SwiGLU(FC1) f32. ConvRot+requant into rq
+         * scratch; FC2 pre_q skips act ConvRot (weights are W_rot). */
+        if (epi_fuse_ink && gemm_epi) {
+            char ink_err[256];
+            if (!h3_cuda_epi_fuse_ink_prep_fc2(
+                    ctx->cuda, d_act, seq, ffn, ctx->convrot_gs, &fc2_pre_x,
+                    &fc2_pre_act, ink_err, sizeof(ink_err))) {
+                snprintf(error, error_size, "epi_fuse_ink: %s", ink_err);
+                return 0;
+            }
+        }
+
         prep = gemm = 0.0;
         uly_klog("fc2_gemm", "enter");
         if (ctx->nvfp4_on) {
@@ -3856,7 +3873,7 @@ fc1_done:
             epi.gate_slot = 5;
             epi.d_lora = d_a;
             epi.lora_ready = ready;
-            if (epi_fuse && fc2_pre_x && fc2_pre_act) {
+            if ((epi_fuse || epi_fuse_ink) && fc2_pre_x && fc2_pre_act) {
                 if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
                         ctx->cuda, w_fc2, fc2_pre_x, fc2_pre_act, seq, d_y,
                         &prep, &gemm, backend, sizeof(backend), &epi, detail,
@@ -3879,7 +3896,7 @@ fc1_done:
             epi.d_row_map = d_map;
             epi.slots = slots;
             epi.gate_slot = 5;
-            if (epi_fuse && fc2_pre_x && fc2_pre_act) {
+            if ((epi_fuse || epi_fuse_ink) && fc2_pre_x && fc2_pre_act) {
                 if (!h3_cuda_gemm_i8_dequant_f32_dev_pre_q(
                         ctx->cuda, w_fc2, fc2_pre_x, fc2_pre_act, seq, d_y,
                         &prep, &gemm, backend, sizeof(backend), &epi, detail,

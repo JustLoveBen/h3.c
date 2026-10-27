@@ -425,3 +425,11 @@ C081,E,serving,continuous batching,defer,S3,defer
 - **Patch:** `h3_nvfp4_sf_off_in_tile` in `h3_gpu_cuda.cu`; `tools/quant_dit_nvfp4.py`; `tools/reswizzle_nvfp4_sf.py` for existing sidecars.
 - **Doc:** `docs/research/2026-10-27-nvfp4-mosaic-sf-swizzle.md`.
 - **Not residual:** act ConvRot alone, SF ncb_rd byte-count pad alone (checksum unchanged).
+
+
+## Status bump 2026-10-27 (SF ncb retest)
+- **C001 NVFP4:** still **BLOCK** after `80a85ee` stride=ncb (OR blank; see `2026-10-27-nvfp4-ncb-still-block.md`). INT8 visual PASS.
+- **C003 EPI_FUSE:** remains DISARMED; in-kernel ConvRot+requant slice next (default OFF).
+- **C030/C031:** unchanged (PDMD-4 preferred over DMAD-4).
+
+- **C003 EPI_FUSE_INK:** partial landed (`H3_DIT_EPI_FUSE_INK`, default OFF). See `2026-10-27-epi-fuse-ink-partial.md`.

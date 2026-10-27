@@ -245,3 +245,18 @@ P0 re-run pending this commit.
 After reswizzle of `minimax_h3_fl2va_nvfp4_w4a4.safetensors` + rebuild with 32×4 SF writes:
 re-run P0 INT8 vs NVFP4, same-config waffle, OR free VL. Prior NVFP4 latent checksum
 `0x37f14b6cfc58dced` must change if the fix is live. Chain remains unset/BLOCK.
+
+
+## C001 retest — SF stride=ncb (`80a85ee` / sidecar ncb) — 2026-10-27 Asia/Shanghai
+
+Tree: `/mnt/nvme1n1/workspace/h3_c_main_20261027`  binary `build-cuda-sm120/h3_cuda_generate` BUILD_RC=0  
+Out: `out/p0_visual_20261027_ncb/`  Mac pull: `out/p0_visual_20261027_ncb_from238/`
+
+| Arm | RUN_RC | PROTO | checksum | dit_ms | total_ms | waffle |
+|---|---|---|---|---|---|---|
+| int8_1 | 0 | OK | 0x75efbb7057231ead | 29482 | 63853 | — |
+| int8_2 | 0 | OK | 0x75efbb7057231ead | 24009 | 45348 | PASS Δ=0 |
+| nvfp4_1 | 0 | OK | 0x95c5882d174bced9 | 25463 | 35070 | — |
+| nvfp4_2 | 0 | OK | 0x95c5882d174bced9 | 22493 | 32548 | PASS Δ=0 |
+
+OR (`dots-3-note-preview:free`): INT8 **PASS**, NVFP4 **FAIL** (blank). **NVFP4_ACCEPTABLE=NO**.

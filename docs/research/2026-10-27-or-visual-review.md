@@ -30,3 +30,22 @@
 - True temporal flicker / audio (image samples; no free video without credits)
 - Fine A/B vs teacher (not required for fewstep)
 - NVFP4 root-cause decode vs GEMM (out of scope for this review)
+
+
+## Update: SF stride=ncb retest (2026-10-27 later, Asia/Shanghai)
+
+**SHA:** `80a85ee` (stride fix) + `d107075` (reswizzle vectorize); binary built from `80a85ee`; sidecar reswizzled 32x4+ncb.
+
+**C001 P0** `out/p0_visual_20261027_ncb/` (238):
+| Arm | PROTO | latent cksum | dit_ms hot | waffle |
+|---|---|---|---|---|
+| INT8 r1/r2 | OK | `0x75efbb7057231ead` identical | ~24.0s | PASS Δ=0 |
+| NVFP4 r1/r2 | OK | `0x95c5882d174bced9` identical | ~22.5s | PASS Δ=0 |
+
+**OR** (`dots-studio/dots-3-note-preview:free`, cost=0):
+```json
+{"int8_verdict":"PASS","int8_desc":"Recognizable athlete running on a red track.","nvfp4_verdict":"FAIL","nvfp4_primary_defect":"blank","nvfp4_desc":"Blank brown surface with no visual content."}
+```
+Executor frame inspect agrees: INT8 coherent runner; NVFP4 muddy blank/grid, pixel std≈7 (was rainbow mosaic std≈60 pre-ncb).
+
+**Verdict:** NVFP4_ACCEPTABLE=**NO** — still **BLOCK**. SF stride fix removed colorful mosaic + made waffle deterministic, but content collapsed to blank. Do **not** land chain WIP. Residual RCA open (e2e K=5376 standalone hit cublasLt st=7; reswizzle value map 0/500 mismatch; SF nonzero_frac=1.0).

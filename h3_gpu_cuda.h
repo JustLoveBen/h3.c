@@ -137,6 +137,14 @@ int h3_cuda_gemm_f32_dd_tf32_ex(h3_cuda *cuda, const float *d_x,
 int h3_cuda_convrot_act_f32_dd(h3_cuda *cuda, const float *d_x, size_t m,
                                size_t k, int convrot_groupsize, float *d_y,
                                char *error, size_t error_size);
+
+/* EPI_FUSE_INK: ConvRot(d_swiglu)+per-row INT8 into internal rq scratch.
+ * Out pointers alias scratch (valid until next rq realloc). f32 algebra. */
+int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
+                                  size_t m, size_t k, int convrot_groupsize,
+                                  int8_t **out_xi8, float **out_scales,
+                                  char *error, size_t error_size);
+
 /* F16 act ConvRot (F16 TC, COMPUTE_32F). d_x/d_y are __half*. */
 int h3_cuda_convrot_act_f16_dd(h3_cuda *cuda, const void *d_x_half, size_t m,
                                size_t k, int convrot_groupsize, void *d_y_half,
