@@ -260,3 +260,8 @@ Out: `out/p0_visual_20261027_ncb/`  Mac pull: `out/p0_visual_20261027_ncb_from23
 | nvfp4_2 | 0 | OK | 0x95c5882d174bced9 | 22493 | 32548 | PASS Δ=0 |
 
 OR (`dots-3-note-preview:free`): INT8 **PASS**, NVFP4 **FAIL** (blank). **NVFP4_ACCEPTABLE=NO**.
+
+
+## NVFP4 DiT-K e2e (standalone, 2026-10-27 Asia/Shanghai)
+
+`test_fp4_e2e` + cublasLt13: **32x4+stride_ncb PASS** at K=512 and K=5376 (N=256 and N=21504, rel≈0.0017). stride_ncb_rd FAIL at K=5376. Confirms C001 blank is not SF-stride GEMM error.
