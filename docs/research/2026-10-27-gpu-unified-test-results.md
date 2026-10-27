@@ -265,3 +265,14 @@ OR (`dots-3-note-preview:free`): INT8 **PASS**, NVFP4 **FAIL** (blank). **NVFP4_
 ## NVFP4 DiT-K e2e (standalone, 2026-10-27 Asia/Shanghai)
 
 `test_fp4_e2e` + cublasLt13: **32x4+stride_ncb PASS** at K=512 and K=5376 (N=256 and N=21504, rel≈0.0017). stride_ncb_rd FAIL at K=5376. Confirms C001 blank is not SF-stride GEMM error.
+
+
+## C003 EPI_FUSE_INK 238 A/B (2026-10-27 Asia/Shanghai)
+
+SHA `1c0e8db`. turbo4 INT8, `H3_DIT_ACT_F16=0`, seed `0x48000001`, repeat=2.
+
+| | ctrl hot dit | ink hot dit | checksum | waffle |
+|---|---|---|---|---|
+| r1/r2 | 14271 / 14348 ms | 14321 / 14351 ms | identical `0xc364…f772` | PASS Δ=0 |
+
+**Verdict:** algebra OK / lossless vs ctrl; **no speedup**; keep **default OFF**. P2 `H3_DIT_EPI_FUSE` remains DISARMED.

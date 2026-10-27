@@ -49,3 +49,9 @@
 Executor frame inspect agrees: INT8 coherent runner; NVFP4 muddy blank/grid, pixel std≈7 (was rainbow mosaic std≈60 pre-ncb).
 
 **Verdict:** NVFP4_ACCEPTABLE=**NO** — still **BLOCK**. SF stride fix removed colorful mosaic + made waffle deterministic, but content collapsed to blank. Do **not** land chain WIP. Residual RCA open (e2e K=5376 standalone hit cublasLt st=7; reswizzle value map 0/500 mismatch; SF nonzero_frac=1.0).
+
+## Update: DiT-K e2e + residual (2026-10-27 Asia/Shanghai)
+
+Standalone `test_fp4_e2e` + cublasLt13: **32x4+stride_ncb PASS** at K=5376 (N=256 and N=21504, rel≈0.0017); stride_ncb_rd FAIL. Sidecar `weight_scale2` all 1.0.
+
+**Implication for C001 blank:** not a single-GEMM SF-layout bug. Residual still production multi-layer / act path / energy collapse (latent std 0.31 vs INT8 1.03). NVFP4_ACCEPTABLE=**NO** — **BLOCK** unchanged. No chain WIP.

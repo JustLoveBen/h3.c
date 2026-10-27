@@ -147,9 +147,9 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 | ID | 阶段 | 问题 | 机制 | 证据 | 杠杆 | 前置 | 状态 | S链 | 下一步实验 |
 |---|---|---|---|---|---|---|---|---|---|
-| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；[`nvfp4-mosaic-act-convrot`](2026-10-27-nvfp4-mosaic-act-convrot.md)；timing；[`gpu-unified`](2026-10-27-gpu-unified-test-results.md)；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **in_progress**（act ConvRot + **SF ncb_rd pad** 双修；host SF sizes PASS；待 238 P0+OR；**勿升默认 / 勿交 chain**） | S4 | 复验绿后改 landed/boundary；chain 仍 gated |
+| **C001** | DiT quant | 同精度 GEMM 已近峰，算力墙在精度档 | NVFP4 W4A4 实验臂；视觉门投产 | `nvfp4-w4a4-path`；[`nvfp4-mosaic-act-convrot`](2026-10-27-nvfp4-mosaic-act-convrot.md)；timing；[`gpu-unified`](2026-10-27-gpu-unified-test-results.md)；[`or-visual`](2026-10-27-or-visual-review.md) | WC高 VRAM中 Q高 R高 | INT8 金线；graph关；chain关 | **boundary/BLOCK**（act ConvRot + SF 32x4 + stride=ncb；P0 waffle PASS；OR **blank FAIL**；DiT-K e2e stride_ncb PASS → 非 SF-GEMM；**勿升默认 / 勿交 chain**） | S4 | 生产路径 RCA；chain 仍 gated |
 | **C002** | DiT NVFP4 | 链式消除 FC1→FC2 激活中转 | CUTLASS 79b FP4-out+SFD | `nvfp4-chained-*`；WIP 未提交 | WC中 Q高 R高 | **C001 NVFP4 visual PASS + 用户确认** | **blocked**（C001 NVFP4 **FAIL**；WIP 不动） | S4/S5 | 先修 C001 NVFP4 观感再议 chain |
-| **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | DESIGN §8 errata；[`skip-convrot-unreachable`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md)；[`nan-fix`](2026-10-27-c003-epi-fuse-nan-fix.md) | WC中 Q高（代数错） | act_f16+convrot | **boundary** @ `3145ba0`（P2 skip-ConvRot **DISARMED**/不可达；NaN 已修；238 waffle PASS as no-op；**默认 OFF**） | S5 | 勿 default-on； redesign 需 in-kernel ConvRot；C004 仍挡 |
+| **C003** | DiT INT8 链路 | quant/dequant 中转 ~1.465s/clip | E2 dequant↔requant 对撞融合 | DESIGN §8 errata；[`skip-convrot-unreachable`](2026-10-27-c003-epi-fuse-skip-convrot-unreachable.md)；[`nan-fix`](2026-10-27-c003-epi-fuse-nan-fix.md) | WC中 Q高（代数错） | act_f16+convrot | **boundary**（P2 **DISARMED**；`H3_DIT_EPI_FUSE_INK` partial：238 BIT_ID+waffle PASS、~0% 加速；**默认 OFF**） | S5 | 勿 default-on；真 fused kernel 另开 |
 | **C004** | DiT INT8 | E2-P3 跨 phase FC2→QKV | mode 3 requant 接线 | DESIGN.md §5 | WC中 R中高 | C003 数值门 | **idea** | S5 | A1 通过后再开 |
 | **C005** | DiT | Hadamard/ConvRot 与 FP4 共设计 | 激活旋转抑 outlier | transfer 2.2；nvfp4 文 | Q中（绑 C001） | 随 NVFP4 | **partial** | S4 | 不单独开项 |
 | **C006** | Attn | cuDNN SDPA / sol 后端选择与稳态 | registry；graph 政策 | `h3_sdpa*`；`321538a` | WC低~中 Q高 | 对照纪律 | **landed/政策** | S6 | 保持 graph 默认关；临时开写标题 |
@@ -340,9 +340,9 @@ load/weights → TE(+vision) → refine text_h → DiT schedule/blocks
 
 ```csv
 id,axis,stage,title,status,s_link,near_term_pri
-C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,in_progress-sf-pad+act-convrot,S4,P0-reverify
+C001,A,DiT-NVFP4,NVFP4 visual gate P2.2,boundary-BLOCK-blank-e2e-ok,S4,prod-RCA
 C002,A,DiT-NVFP4,NVFP4 FC1-FC2 chain,blocked,S4/S5,P3-gated
-C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-disarmed,S5,defer-redesign
+C003,A,DiT-INT8,E2 epi-fuse A/B,boundary-ink-bitid-0pct,S5,keep-off
 C004,A,DiT-INT8,E2-P3 FC2-to-QKV,idea,S5,P3
 C007,A,Attn,sol autotune persistence,idea,S6,P2
 C011,A,VAE,cast/prescale fusion remainder,idea,S5,P2
@@ -398,6 +398,7 @@ C081,E,serving,continuous batching,defer,S3,defer
 | 2026-10-27 | 238 smoke：C070 `FORBID=1` INT8/NVFP4 4-step RUN_RC=0；dit_format 澄清后 PROTO_OK；C061 合同行在 generate 日志验过。见 gpu-unified addendum。 |
 | 2026-10-27 | C070 `H3_FORBID_HOT_SYNC` + dit_format NVFP4 日志澄清（INT8 store+GEMM track）。 |
 | 2026-10-27 | C001：发现 `nvfp4_weight_create` **未 pad ncb_rd**（K=5376 截断/打乱 SF）→ 马赛克主因补丁；act ConvRot 仍保留。见 [`nvfp4-mosaic-act-convrot`](2026-10-27-nvfp4-mosaic-act-convrot.md)。 |
+| 2026-10-27 | C001 NVFP4: DiT-K e2e stride_ncb PASS（blank 非 SF-GEMM）；EPI_FUSE_INK partial landed default OFF。 |
 | 2026-10-27 | OR 目检：C001 INT8 PASS / NVFP4 **BLOCK**；C030/C031 **landed(visual-OR)**；C003 维持 DISARMED。见 [`or-visual-review`](2026-10-27-or-visual-review.md)。 |
 | 2026-10-27 | 238 GPU：C003 NaN 修 @ `1b37f28`（waffle 仍 FAIL，默认 OFF）；C001 PROTO；C030/C031 PROTO+waffle PASS；C062 HIT 硬门 PROTO_OK；均待目检（C062 除外）。见 [`gpu-unified-test-results`](2026-10-27-gpu-unified-test-results.md)。 |
 | 2026-10-27 | 离线落地 C061/C074/C040 插桩 + C070 审计页；状态 idea→partial（无 GPU）。 |
