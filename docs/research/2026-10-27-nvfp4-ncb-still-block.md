@@ -24,3 +24,16 @@
 - Weight SF reswizzle logical map: 0 mismatches / 500 samples; SF nonzero_frac=1.0.
 - Standalone e2e still hardcoded-proven at M=N=256 K=512 `32x4+stride_ncb` (rel_l2≈0.0017).
 - Extended e2e harness now accepts `M N K` argv for DiT-shape A/B on 238.
+
+## DiT-K e2e (standalone, cublasLt 13)
+
+Harness: `bench/nvfp4_phase0/test_fp4_e2e.cu` (M/N/K argv) linked against conda `libcublasLt.so.13` with `LD_LIBRARY_PATH` set. Asia/Shanghai 2026-10-27.
+
+| Mode | M | N | K | rel_l2 | result |
+|---|---|---|---|---|---|
+| 32x4+stride_ncb | 256 | 256 | 512 | ≈0.00166 | **PASS** |
+| 32x4+stride_ncb | 256 | 256 | 5376 | ≈0.00166 | **PASS** |
+| 32x4+stride_ncb | 256 | 21504 | 5376 | ≈0.00166 | **PASS** (qkv-ish N) |
+| 32x4+stride_ncb_rd | 256 | 256 | 5376 | ≈0.34 | **FAIL** |
+
+**Conclusion:** SF row-stride=`ncb` is correct at DiT K; C001 blank video is **not** a single-GEMM SF-layout bug. Sidecar `weight_scale2` all 1.0 (folded into SF by `quant_linear`). Residual hypotheses: multi-layer act ConvRot↔FP4 vs INT8 f16-prescale path, or low-energy accumulation across blocks (latent std 0.31 vs INT8 1.03). Still **BLOCK** for visual / chain. Do not fake PASS.
