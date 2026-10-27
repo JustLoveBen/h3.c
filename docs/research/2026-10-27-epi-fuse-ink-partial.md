@@ -31,3 +31,7 @@ Config: turbo4 INT8, 864×480, seed `0x48000001`, `--repeat 2`, `H3_DIT_ACT_F16=
 - ctrl vs ink hot latent: **BIT_ID equal**.
 - Wall-clock: **~0%** (f32 ConvRot+requant prep still separate launches; not a net win yet).
 - **Default remains OFF.** Old `H3_DIT_EPI_FUSE` stays DISARMED. True fused act_f16/single-launch still future work.
+
+## Follow-on
+
+True single-launch: `H3_DIT_EPI_FUSE_SL` — see `2026-10-27-epi-fuse-sl-single-launch.md`.

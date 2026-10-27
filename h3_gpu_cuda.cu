@@ -4655,6 +4655,68 @@ __global__ void h3_cuda_f32_to_f16_row_prescale_kernel(const float *x, __half *y
     }
 }
 
+/* EPI_FUSE_SL: single-launch ConvRot(Hadamard)+per-row INT8.
+ * Mathematically matches ink (X@H then absmax/127 quant) but does not
+ * materialize the f32 rotated row in HBM: Hadamard is recomputed for
+ * absmax then again for quant. H layout matches d_hadamard / cublas path
+ * (y[i]=sum_j x[j]*H[j*gs+i]). Default OFF via H3_DIT_EPI_FUSE_SL. */
+__global__ void h3_cuda_epi_fuse_sl_convrot_quant_kernel(
+    const float *__restrict__ x, const float *__restrict__ H,
+    int8_t *__restrict__ y, float *__restrict__ scales, size_t m, size_t k,
+    int gs) {
+    const size_t row = (size_t)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    extern __shared__ float red[];
+    int8_t *dst = y + row * k;
+    if (row >= m) {
+        for (size_t col = (size_t)tid; col < k; col += (size_t)nthreads)
+            dst[col] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    const float *src = x + row * k;
+    const size_t n_groups = k / (size_t)gs;
+    float local_max = 0.0f;
+    size_t g;
+    int i, j;
+    for (g = 0; g < n_groups; g++) {
+        const float *xg = src + g * (size_t)gs;
+        for (i = tid; i < gs; i += nthreads) {
+            float acc = 0.0f;
+            for (j = 0; j < gs; j++)
+                acc += xg[j] * H[(size_t)j * (size_t)gs + (size_t)i];
+            float a = fabsf(acc);
+            if (a > local_max) local_max = a;
+        }
+    }
+    red[tid] = local_max;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && red[tid + stride] > red[tid])
+            red[tid] = red[tid + stride];
+        __syncthreads();
+    }
+    float absmax = red[0];
+    float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    if (tid == 0) scales[row] = scale;
+    __syncthreads();
+    float inv = 1.0f / scale;
+    for (g = 0; g < n_groups; g++) {
+        const float *xg = src + g * (size_t)gs;
+        int8_t *yg = dst + g * (size_t)gs;
+        for (i = tid; i < gs; i += nthreads) {
+            float acc = 0.0f;
+            for (j = 0; j < gs; j++)
+                acc += xg[j] * H[(size_t)j * (size_t)gs + (size_t)i];
+            float q = roundf(acc * inv);
+            if (q > 127.0f) q = 127.0f;
+            if (q < -127.0f) q = -127.0f;
+            yg[i] = (int8_t)q;
+        }
+    }
+}
+
 /* EPI_FUSE_INK: ConvRot then per-row INT8 quant into rq scratch. */
 int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
                                   size_t m, size_t k, int convrot_groupsize,
@@ -4668,6 +4730,8 @@ int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
     unsigned threads = 256;
     size_t smem;
     cudaError_t status;
+    int use_sl = 0;
+    const char *sl_env;
 
     if (out_xi8) *out_xi8 = NULL;
     if (out_scales) *out_scales = NULL;
@@ -4677,10 +4741,45 @@ int h3_cuda_epi_fuse_ink_prep_fc2(h3_cuda *cuda, const float *d_swiglu,
         return 0;
     }
     if (!h3_cuda_bind(cuda, error, error_size)) return 0;
+    if (k % (size_t)convrot_groupsize != 0) {
+        h3_cuda_set_error(error, error_size, "K not divisible by convrot_gs");
+        return 0;
+    }
+
+    sl_env = getenv("H3_DIT_EPI_FUSE_SL");
+    use_sl = sl_env && sl_env[0] == '1' && sl_env[1] == '\0';
 
     m_pad = (m + 127u) & ~(size_t)127u;
     i8_bytes = m_pad * k;
     act_off = (i8_bytes + 15u) & ~(size_t)15u;
+
+    if (use_sl) {
+        /* No f32 rot mid-buffer: i8 + scales only. */
+        need = act_off + m_pad * sizeof(float);
+        if (!h3_cuda_ensure_rq_scratch(cuda, need, error, error_size))
+            return 0;
+        base = (char *)cuda->d_rq_scratch;
+        d_xi8 = (int8_t *)base;
+        d_scales = (float *)(base + act_off);
+        if (!h3_cuda_ensure_hadamard(cuda, convrot_groupsize, error,
+                                     error_size))
+            return 0;
+        smem = (size_t)threads * sizeof(float);
+        h3_cuda_epi_fuse_sl_convrot_quant_kernel<<<(unsigned)m_pad, threads,
+                                                   smem, h3_cuda_op_st(cuda)>>>(
+            d_swiglu, cuda->d_hadamard, d_xi8, d_scales, m, k,
+            convrot_groupsize);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            h3_cuda_set_error_cuda(error, error_size, "epi_fuse_sl kernel",
+                                   status);
+            return 0;
+        }
+        *out_xi8 = d_xi8;
+        *out_scales = d_scales;
+        return 1;
+    }
+
     rot_off = (act_off + m_pad * sizeof(float) + 15u) & ~(size_t)15u;
     need = rot_off + m * k * sizeof(float);
     if (!h3_cuda_ensure_rq_scratch(cuda, need, error, error_size)) return 0;

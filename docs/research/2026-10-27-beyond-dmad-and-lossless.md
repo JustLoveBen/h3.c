@@ -38,7 +38,7 @@ Prefer **bit-identical** or **same-config waffle PASS vs INT8 ctrl**.
 | 7 | C018 QKV merge | maybe non-bit if INT8 order | mid | idea/maybe stale | Diff before build |
 | 8 | Z05 CUDA Graph default | bit-id launch | <0.5s noise | closed default-off | Keep off |
 
-**Deferred this batch:** real EPI_FUSE ConvRot-in-epilogue (large); VAE cast nsys (disk); RoPE GPU WC dedicated KPI; C040 wipe-free ledger run.
+**Deferred / auth-gated:** disk wipe; nsys full; NVFP4 retrain/new weights; NVFP4 chain; VAE cast nsys. SL WC confirm on 238 this knife.
 
 ## 2. Landed code (this batch)
 
@@ -111,7 +111,7 @@ Protocol: dmad4 INT8, TE HIT, `H3_FORBID_HOT_SYNC=1`, `--repeat`≥3, **discard 
 | C017 L2 pin | landed opt-in; fair hot Δ≈0 |
 | C062 TE_CACHE_AUTO | partial+; default off |
 | C068/C069 fair hot | memo default-on; WC material no |
-| C003 EPI_FUSE | **DISARMED** (algebra) |
+| C003 EPI_FUSE / INK / SL | P2 **DISARMED**; INK partial green; **SL landed default OFF** |
 | C070 forbid | landed |
 | C001 NVFP4 | visual **terminal BLOCK** (energy RCA) — no chain |
 
@@ -120,7 +120,7 @@ Protocol: dmad4 INT8, TE HIT, `H3_FORBID_HOT_SYNC=1`, `--repeat`≥3, **discard 
 1. **清盘**（~99% / 58G）— 阻塞 nsys / 大矩阵 outs  
 2. **nsys** VAE cast/prescale（C011）— 需盘+授权  
 3. **NVFP4 mosaic 根因** — 非本轮 chain WIP  
-4. **真 EPI_FUSE** in-kernel ConvRot+requant — 大 redesign，仅当 waffle≈ctrl  
+4. **EPI_FUSE_SL** single-launch landed (default OFF) — 238 WC/waffle 表见 `epi-fuse-sl-single-launch`; 勿 default-on  
 5. 可选人眼抛光 PDMD/DMAD；扩 L2 pin 到 RoPE device buf（无证据不优先）
 
 

@@ -3522,8 +3522,11 @@ static int block_phase_out_mlp(
     /* Redesign arm: after FC1 SwiGLU, ConvRot+requant then FC2 pre_q.
      * Requires gemm_epi + convrot; independent of H3_DIT_EPI_FUSE.
      * Default OFF. Prefer H3_DIT_ACT_F16=0 for A/B (ink uses f32 algebra). */
-    int epi_fuse_ink = gemm_epi && h3_dit_epi_fuse_ink_wanted() &&
-                       ctx->convrot_gs > 0 && !ctx->nvfp4_on;
+    int epi_fuse_sl = gemm_epi && h3_dit_epi_fuse_sl_wanted() &&
+                      ctx->convrot_gs > 0 && !ctx->nvfp4_on;
+    /* SL implies ink algebra (pre_q after fused ConvRot+requant). */
+    int epi_fuse_ink = gemm_epi && ctx->convrot_gs > 0 && !ctx->nvfp4_on &&
+                       (h3_dit_epi_fuse_ink_wanted() || epi_fuse_sl);
     int8_t *fc2_pre_x = NULL;
     float *fc2_pre_act = NULL;
     h3_cuda_dit_gemm_epi epi;
@@ -3535,12 +3538,14 @@ static int block_phase_out_mlp(
         fprintf(stderr,
                 "dit_fused_epi: %s gate_adaln=%d gemm_epi=%d lora=%d scale=%.4g "
                 "overlap=%d epi_fuse_req=%d epi_fuse=%d epi_fuse_ink=%d "
-                "(P2 skip-ConvRot DISARMED; ink=ConvRot+requant) nvfp4=%d\n",
+                "epi_fuse_sl=%d "
+                "(P2 skip-ConvRot DISARMED; ink/SL=ConvRot+requant) nvfp4=%d\n",
                 fused ? "on" : "off", fused ? 1 : 0, gemm_epi ? 1 : 0,
                 ctx->lora ? 1 : 0, ctx->lora ? ctx->lora->scale : 0.0,
                 ctx->lora ? h3_dit_w4a8_lora_overlap() : 0,
                 epi_fuse_req ? 1 : 0, epi_fuse ? 1 : 0,
-                epi_fuse_ink ? 1 : 0, ctx->nvfp4_on ? 1 : 0);
+                epi_fuse_ink ? 1 : 0, epi_fuse_sl ? 1 : 0,
+                ctx->nvfp4_on ? 1 : 0);
         fflush(stderr);
     }
     memset(&epi, 0, sizeof(epi));

@@ -37,6 +37,15 @@ static inline int h3_dit_epi_fuse_ink_wanted(void) {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+/* E2 single-launch: one kernel ConvRot(Hadamard)+per-row INT8, no f32 rot
+ * HBM mid-buffer (recompute Hadamard for absmax then quant). Opt-in
+ * H3_DIT_EPI_FUSE_SL=1; default OFF. Implies ink algebra / pre_q wiring;
+ * does NOT arm DISARMED skip-ConvRot H3_DIT_EPI_FUSE. */
+static inline int h3_dit_epi_fuse_sl_wanted(void) {
+    const char *e = getenv("H3_DIT_EPI_FUSE_SL");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 /* gated[r] = residual[r] + branch[r] * gate_mod; then AdaLN(gated) → normed.
  * Same math as h3_dit_w4a8_gate_f32 then h3_dit_w4a8_adaln_f32. */
 static inline void h3_dit_gate_adaln_f32(
