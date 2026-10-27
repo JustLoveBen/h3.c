@@ -246,8 +246,8 @@
 
 | # | 吸收项（机制级） | 来源 | Track | 本仓现状 | 装船形态 |
 | ---: | --- | --- | --- | --- | --- |
-| 1 | QKV 三瘦→一宽 GEMM | Sol Pillar-1 | **A** | 缺口 / maybe stale（C018） | 先 diff 现状 → 有缺口再写核；INT8 浮点序 → waffle 门非硬 BIT_ID |
-| 2 | QKNorm+RoPE 融合 | Sol Pillar-1 | **A** | 缺 | bit-id 可达；checksum 门 |
+| 1 | QKV 三瘦→一宽 GEMM | Sol Pillar-1 | **A** | **已落地**（C018 stale closed；[`exp-g3`](2026-10-28-exp-g3-pillar1-gap-proof.md)） | 停止 −0.6~−1.2s；余量→C015 |
+| 2 | QKNorm+RoPE 融合 | Sol Pillar-1 | **A** | **已落地**（C019 stale closed；`qkv_rope_f16_kernel`） | 勿重开 |
 | 3 | CUDA Graph / 区域捕获 | Sol Spark 1.39× 成分 | **A** | 默认关（Z05 噪声） | 固定 shape 图；先测 launch 税占比再开 |
 | 4 | GEMM+epilogue / cast 消隐 | Sol + 本仓 INT8 链路 | **A** | 部分；C011/C015 待 | nsys 定点；waffle |
 | 5 | 精确 TE / RoPE 不变量缓存 | 全行业 + 本仓 | **A** | C062/C068 已有 | AUTO 默认可议；勿与近似 cache 混谈 |
@@ -280,7 +280,7 @@
 按 ROI 串行（**不与他机 C015 抢卡**）：
 
 1. C015/C042 act-FP16（若 PASS）→ 768p 余量  
-2. C018 QKV-merge（Sol Pillar-1）→ 证明缺口后施工  
+2. ~~C018 QKV-merge~~ **stale closed**（Exp-G3）；改 **C015** 消中转  
 3. QKNorm+RoPE fuse  
 4. C011 VAE cast 融合（nsys 后）  
 5. Graph capture 仅当 launch 税 ≥ 阈值  
@@ -337,6 +337,7 @@
 | **Method** | nsys 或 kernel 名计数 + 源码 diff；对比 Sol 官方 Pillar-1 列表 |
 | **PASS** | 证明缺口存在 → 开工票；预估 WC 与 waffle 门写入切片 |
 | **FAIL** | 已合并/不可达 → catalog 标 **stale closed**，停止估计 −0.6~−1.2s |
+| **结果 2026-10-28** | **FAIL（缺口不存在）** — 见 [`exp-g3`](2026-10-28-exp-g3-pillar1-gap-proof.md)；DeepSeek Absorb/QKV 叙事同步关闭；下一刀 **C015** |
 
 #### Exp-G4 · Track B · PDMD vs DMAD 同日 4090（研究臂）
 
@@ -383,3 +384,4 @@
 | --- | --- |
 | 2026-10-28 | 初稿：行业地图（带链接）、本仓 Track A/B 证据表、加速且提质理论、严谨模板、分轨下一刀。分析-only，无长 GPU。 |
 | 2026-10-28 | **§G 增补：** sol-h3 / FastH3 / VDN / TaoMate / DMD 族竞品吸收 → Track A/B 映射 → shippable 栈 S0–S3 → Exp-G1…G6 可证伪门。分析-only。 |
+| 2026-10-28 | **Exp-G3 FAIL**：C018/C019 stale closed；C015 dig+；[`deepseek-derived-track-a-status`](2026-10-28-deepseek-derived-track-a-status.md)。 |

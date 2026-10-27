@@ -9,6 +9,7 @@
 #include "h3_w4a8_dequant.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -229,6 +230,13 @@ int h3_dit_w4a8_group_size(const h3_dit_w4a8 *ctx);
 /* DiT INT8 act ConvRot in F16. Default ON after AdaLN-range prescale
  * (5090 KPI-B finite). Rollback = H3_DIT_ACT_F16=0. */
 int h3_dit_w4a8_act_f16(void);
+/* C015/C042: store d_qkv/d_wide as FP16 in block WS (≠ ACT_F16 ConvRot).
+ * Default OFF. Stub until construction lands — getter never arms packing. */
+int h3_dit_w4a8_act_fp16_stage(void);
+/* Opt-in / VRAM_LEDGER companion: print block-WS component GiB + C015 save. */
+void h3_dit_w4a8_ws_component_ledger_fprint(FILE *out, const h3_dit_w4a8 *ctx,
+                                           size_t seq, unsigned n_blocks,
+                                           int use_ext_act);
 /* Fuse post-GEMM gate/AdaLN/SwiGLU. Default ON. Rollback = H3_DIT_FUSED_EPILOGUE=0. */
 int h3_dit_w4a8_fused_epilogue(void);
 /* LoRA A/B as F16 + mixed GEMM. Opt-in H3_DIT_LORA_F16=1 (cuBLAS mixed n=64 不支持). */

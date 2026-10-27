@@ -1582,6 +1582,49 @@ static size_t layers_dev_chain_ws_bytes(const h3_dit_w4a8 *ctx, size_t seq,
     return need;
 }
 
+/* C015 companion: component GiB for block WS (layers_dev_chain packing).
+ * qkv+wide half-save is the theoretical C015 FP16-staging VRAM delta. */
+void h3_dit_w4a8_ws_component_ledger_fprint(FILE *out, const h3_dit_w4a8 *ctx,
+                                           size_t seq, unsigned n_blocks,
+                                           int use_ext_act) {
+    const size_t hidden = H3_DIT_W4A8_HIDDEN;
+    const size_t inner = H3_DIT_W4A8_INNER;
+    const size_t ffn = H3_DIT_W4A8_FFN;
+    const size_t slots = H3_DIT_W4A8_SLOTS;
+    const size_t mod_rows = dit_adaln_mod_rows(ctx);
+    const size_t rope_half = (size_t)H3_DIT_W4A8_ROPE_HALF;
+    const size_t mod_elems = mod_rows * slots * hidden;
+    const size_t head_dim = H3_DIT_W4A8_HEAD_DIM;
+    const size_t wide = ffn * 2;
+    const size_t aux_stride = mod_elems + hidden * 2 + head_dim * 2;
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    size_t act_b, map_b, rope_b, aux_b, ab_b, qkv_b, wide_b, total;
+    size_t c015_save;
+    if (!out || seq == 0) return;
+    if (n_blocks < 1) n_blocks = 1;
+    if (n_blocks > (unsigned)H3_DIT_W4A8_N_BLOCKS)
+        n_blocks = (unsigned)H3_DIT_W4A8_N_BLOCKS;
+    act_b = use_ext_act ? 0 : (seq * hidden * sizeof(float) * 2);
+    map_b = H3_WS_MAP_BYTES(seq);
+    rope_b = seq * rope_half * sizeof(float) * 2;
+    aux_b = (size_t)n_blocks * aux_stride * sizeof(float);
+    ab_b = seq * hidden * sizeof(float) * 2;
+    qkv_b = seq * inner * 3 * sizeof(float);
+    wide_b = seq * wide * sizeof(float);
+    total = act_b + map_b + rope_b + aux_b + ab_b + qkv_b + wide_b;
+    c015_save = (qkv_b + wide_b) / 2u;
+    fprintf(out,
+            "dit_ws_ledger: seq=%zu n_blocks=%u use_ext_act=%d "
+            "act=%.3f map=%.3f rope=%.3f aux=%.3f a_b=%.3f "
+            "qkv_f32=%.3f wide_f32=%.3f total=%.3f GiB | "
+            "C015_qkv+wide_half_save=%.3f GiB "
+            "(≠ H3_DIT_ACT_F16 ConvRot; stage stub default OFF)\n",
+            seq, n_blocks, use_ext_act ? 1 : 0, act_b / GiB, map_b / GiB,
+            rope_b / GiB, aux_b / GiB, ab_b / GiB, qkv_b / GiB, wide_b / GiB,
+            total / GiB, c015_save / GiB);
+    fflush(out);
+}
+
 int h3_dit_w4a8_pregrow_layers_ws(h3_dit_w4a8 *ctx, size_t seq,
                                   unsigned n_blocks, char *error,
                                   size_t error_size) {
@@ -1603,6 +1646,21 @@ int h3_dit_w4a8_pregrow_layers_ws(h3_dit_w4a8 *ctx, size_t seq,
            (double)ctx->d_block_ws_bytes / (1024.0 * 1024.0 * 1024.0),
            (double)(seq * (size_t)H3_DIT_W4A8_HIDDEN * sizeof(float) * 2) /
                (1024.0 * 1024.0 * 1024.0));
+    {
+        const char *vl = getenv("H3_VRAM_LEDGER");
+        const char *wl = getenv("H3_DIT_WS_LEDGER");
+        int want = (vl && vl[0] == '1' && vl[1] == '\0') ||
+                   (wl && wl[0] == '1' && wl[1] == '\0');
+        if (want)
+            h3_dit_w4a8_ws_component_ledger_fprint(
+                stdout, ctx, seq,
+                n_blocks < 1 ? 1u
+                             : (n_blocks > (unsigned)H3_DIT_W4A8_N_BLOCKS
+                                    ? (unsigned)H3_DIT_W4A8_N_BLOCKS
+                                    : n_blocks),
+                1);
+    }
+    (void)h3_dit_w4a8_act_fp16_stage(); /* one-shot refuse log if env set */
     fflush(stdout);
     return 1;
 }
@@ -1623,6 +1681,33 @@ int h3_dit_w4a8_act_f16(void) {
     const char *e = getenv("H3_DIT_ACT_F16");
     if (e && e[0] == '0' && e[1] == '\0') return 0;
     return 1;
+}
+
+/* C015/C042 workspace FP16 staging — NOT the same as H3_DIT_ACT_F16.
+ * Construction pending: never arms packing / GEMM C dtype. Env=1 only logs. */
+int h3_dit_w4a8_act_fp16_stage(void) {
+    const char *e = getenv("H3_DIT_ACT_FP16_STAGE");
+    static int logged;
+    if (!(e && e[0] == '1' && e[1] == '\0')) return 0;
+    if (!logged) {
+        const double GiB = 1024.0 * 1024.0 * 1024.0;
+        const size_t inner = (size_t)H3_DIT_W4A8_INNER;
+        const size_t wide = (size_t)H3_DIT_W4A8_FFN * 2u;
+        size_t s480 = 15103, s768 = 37414;
+        double save480 =
+            (double)(s480 * (inner * 3u + wide) * sizeof(float) / 2u) / GiB;
+        double save768 =
+            (double)(s768 * (inner * 3u + wide) * sizeof(float) / 2u) / GiB;
+        logged = 1;
+        fprintf(stderr,
+                "dit_act_fp16_stage: H3_DIT_ACT_FP16_STAGE=1 requested but "
+                "NOT CONSTRUCTED (C015 Track-A dig); expected qkv+wide "
+                "half-save ≈%.2f GiB @seq=%zu / ≈%.2f GiB @seq=%zu; "
+                "packing remains F32; ≠ H3_DIT_ACT_F16 ConvRot\n",
+                save480, s480, save768, s768);
+        fflush(stderr);
+    }
+    return 0;
 }
 
 int h3_dit_w4a8_fused_epilogue(void) {
@@ -4283,6 +4368,19 @@ static int block_forward_gpu_resident(
     need += seq * inner * 3 * sizeof(float);              /* qkv / act */
     need += seq * wide * sizeof(float);                   /* qkva / fc1 */
     if (!ensure_block_ws(ctx, need, error, error_size)) return 0;
+    {
+        static int dit_ws_ledger_once;
+        const char *vl = getenv("H3_VRAM_LEDGER");
+        const char *wl = getenv("H3_DIT_WS_LEDGER");
+        int want = (vl && vl[0] == '1' && vl[1] == '\0') ||
+                   (wl && wl[0] == '1' && wl[1] == '\0');
+        if (want && !dit_ws_ledger_once) {
+            dit_ws_ledger_once = 1;
+            /* Host block pack: x/y live in WS (use_ext_act=0 geometry). */
+            h3_dit_w4a8_ws_component_ledger_fprint(stdout, ctx, seq, 1, 0);
+            (void)h3_dit_w4a8_act_fp16_stage();
+        }
+    }
 
     base = (char *)ctx->d_block_ws;
 #define H3_WS_F32(n)                                                           \
