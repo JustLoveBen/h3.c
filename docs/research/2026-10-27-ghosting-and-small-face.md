@@ -124,10 +124,12 @@ $BIN ... --width 864 --height 480 --steps 16 --cfg 1 ...
 
 | 项 | 值 |
 | --- | --- |
-| 基线 | 4090 INT8 864×480×8 · seed `0x76800002` · `bd330d2` |
-| DiT SDPA | `cuda_cudnn_sdpa` hits=400（虚影≠naive flash） |
-| A/B | talking_head **960×544 · 8-step** → `out/ghost_fix_ab_20261027/`；Mac 同步 `~/grokbot-share/ghost_fix_ab_20261027/` |
-| 未跑 | PDMD-4（4090 无 LoRA）；1344×768（VRAM/时间更大，等 960 结果再定） |
+| 基线 | 4090 INT8 864×480×8 · seed `0x76800002` · `bd330d2` · warm dit ≈27.2s · WALL≈52.7s |
+| DiT SDPA | 基线与 A/B 均为 `cuda_cudnn_sdpa` hits=400（虚影≠naive flash） |
+| A/B | talking_head **960×544 · 8-step** · dit=37.46s · WALL=65.82s · latent std=1.082 · RUN_RC=0 · SHA doc `cd6b1c6` |
+| 产物 | 4090 `out/ghost_fix_ab_20261027/`；Mac `~/grokbot-share/ghost_fix_ab_20261027/{talking_head_960x544_s8,baseline_864x480_s8_talking_head}.mp4` |
+| 未跑 | PDMD-4（4090 无 LoRA）；1344×768；steps=16 负对照 |
+| 人眼 | 待消息列表贴片：预期小脸/背景五官相对 480p 更可辨；运动虚影可能仍在（时间预算未改） |
 
 ## 6. 给产品的一句话
 
