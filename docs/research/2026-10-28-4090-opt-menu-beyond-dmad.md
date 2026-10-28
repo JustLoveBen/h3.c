@@ -13,6 +13,7 @@
 
 ### Shipped this round (2026-10-28)
 
+- **NFE / few-step product ladder** packaged: [`nfe-fewstep-contracts`](2026-10-28-nfe-fewstep-contracts.md) + `tools/h3_nfe_product_ladder_env.sh` (euler8 Track-A / dmad4 Track-B / pdmd4 contrast; pdmd2 not sellable — no LoRA). Reuses DMAD↔Euler KPI @`3cee9ff`; no new fewer-step arm claimed.
 - **Track-A C015** act-FP16 **default ON** (`b99d56b`).  
 - **Track-B S2 recipe packaged** (opt-in): `H3_DIT_INT8_WINDOW=24` + sol `LAYERS=2` — **cudnn default unchanged**. Helper `tools/h3_track_b_s2_env.sh` · doc [`s2-recipe`](2026-10-28-track-b-s2-sellable-recipe.md). Evidence G1 @`eb805b4`.  
 - **Raise-canvas SKU policy** (doc only): DMAD≤1152×640 / Euler@1344×768 — [`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md).  

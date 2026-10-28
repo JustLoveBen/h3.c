@@ -82,4 +82,8 @@ Far-face is **pixel budget**, not FaceRefine. See [`raise-canvas-sku-policy`](20
 
 - Flip cudnn → sol as product default  
 - Reopen C018 / C011 / C016 / C043  
-- Ship full-sparse sol or Sage3 on 4090  
+- Ship full-sparse sol or Sage3 on 4090
+
+## NFE ladder
+
+Compose with [`nfe-fewstep-contracts`](2026-10-28-nfe-fewstep-contracts.md) (`source tools/h3_nfe_product_ladder_env.sh dmad4` then this S2 env).
