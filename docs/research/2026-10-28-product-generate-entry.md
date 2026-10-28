@@ -81,3 +81,9 @@ GPU smoke (4090): `--sku rc0 --seconds 1 --repeat 1` should not break the 480p d
 - [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md)
 - [`track-b-s2-sellable-recipe`](2026-10-28-track-b-s2-sellable-recipe.md)
 - Helpers still usable: `tools/h3_nfe_product_ladder_env.sh`, `tools/h3_raise_canvas_sku_env.sh`
+
+## 7. Follow-on gates (same entry)
+
+- A2 RC1/RC2 complex: [`a2-rc1-rc2-complex-gates`](2026-10-28-a2-rc1-rc2-complex-gates.md)
+- A3 C015+WINDOW24 ledger: [`a3-c015-window24-ledger`](2026-10-28-a3-c015-window24-ledger.md)
+- Runner: `tools/run_a1a2a3_product_gates_4090.sh`
