@@ -86,3 +86,9 @@ Expected RC1 / RC2 style:
 
 ## Policy
 **后续这种问题不要自己发现 → agent 必须自己发现：** any burn-in / META KPI where wall ≫ clip duration × plausible warm rate (e.g. 1s smoke with ≥30s “warm”) must trip `ALERT_KPI_TIMING` before share.
+
+
+## Follow-up (same day)
+- `flag_absurd_timing` now **refuses SHARE warm post** when no `hot=1` (COLD-only → `SHARE/refused/`); still burns honest `COLD … NOT-warm` locally.
+- Also refuse when `hot_total > 12× clip_seconds` (vs DMAD ~25s/5s ≈ 5s/s).
+- Dedicated re-verify: `tools/run_rc0_dmad_warm_kpi_4090.sh` (RC0 DMAD 1s+5s, repeat=2, hot-only labels).

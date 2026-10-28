@@ -60,18 +60,30 @@ extract_timing() {
 }
 
 flag_absurd_timing() {
-  # Self-flag: 1s smoke must not be presented as multi-10s product warm KPI.
-  local sec="$1" proc_wall="$2" has_hot="$3" name="$4"
-  local alerts=0
+  # Self-flag + refuse SHARE post: never wait for user to spot KPI lies (t89u).
+  # Returns 1 when share of this label as product warm KPI must be refused.
+  local sec="$1" proc_wall="$2" has_hot="$3" name="$4" hot_total="${5:-na}"
+  local refuse=0
   if awk -v s="$sec" -v w="$proc_wall" 'BEGIN{exit !(s+0<=2 && w+0>=30)}'; then
     echo "ALERT_KPI_TIMING: $name sec=${sec}s but proc_wall=${proc_wall}s (≥30). Likely COLD TE/VAE load — do NOT label as warm product KPI." | tee -a "$OUT_ROOT/META.txt"
-    alerts=1
+    refuse=1
   fi
   if [[ "$has_hot" != "1" ]]; then
-    echo "ALERT_KPI_TIMING: $name has no hot=1 phase (repeat=1 cold-only). Label must say COLD, not warm." | tee -a "$OUT_ROOT/META.txt"
-    alerts=1
+    echo "ALERT_KPI_TIMING: $name has no hot=1 phase (repeat=1 cold-only). Label must say COLD, not warm. REFUSE warm SHARE post." | tee -a "$OUT_ROOT/META.txt"
+    refuse=1
   fi
-  return 0
+  # Baseline: DMAD-4 480p×5s warm e2e ~25s @3cee9ff; 1s warm e2e should be ~few s (dit≈5s cold).
+  # If hot_total absurd vs clip length, refuse warm KPI post.
+  if [[ "$has_hot" == "1" && "$hot_total" != "na" && -n "$hot_total" ]]; then
+    if awk -v s="$sec" -v h="$hot_total" 'BEGIN{
+      # refuse if warm e2e > 12s per clip-second (5s→60s ceiling; 1s→12s) — far above ~5s/s DMAD
+      exit !(h+0 > (s+0)*12 && h+0>0)
+    }'; then
+      echo "ALERT_KPI_TIMING: $name hot_total=${hot_total}s for ${sec}s clip (>12×sec). Absurd vs DMAD~25s/5s baseline — REFUSE." | tee -a "$OUT_ROOT/META.txt"
+      refuse=1
+    fi
+  fi
+  return "$refuse"
 }
 
 run_sku() {
@@ -104,7 +116,10 @@ run_sku() {
   eval "${TIMING//;/ }"
   HAS_HOT=0
   [[ "$hot_total" != "na" && -n "$hot_total" ]] && HAS_HOT=1
-  flag_absurd_timing "$SEC" "${proc_wall:-0}" "$HAS_HOT" "$NAME" || true
+  REFUSE_WARM_SHARE=0
+  if ! flag_absurd_timing "$SEC" "${proc_wall:-0}" "$HAS_HOT" "$NAME" "${hot_total:-na}"; then
+    REFUSE_WARM_SHARE=1
+  fi
 
   # KPI seconds for burn-in: hot clip total if present; else cold with explicit COLD tag.
   if [[ "$HAS_HOT" == "1" ]]; then
@@ -140,10 +155,17 @@ run_sku() {
   fi
   if [[ -s "$SRC" ]]; then
     "$ROOT/tools/burn_eval_label.sh" "$SRC" "$OUT/labeled/${NAME}_labeled.mp4" "$LABEL" || true
-    cp -f "$OUT/labeled/${NAME}_labeled.mp4" "$SHARE/labeled/" 2>/dev/null || true
-    cp -f "$SRC" "$SHARE/${NAME}.mp4" 2>/dev/null || true
+    # Always keep local labeled; SHARE only if not an absurd warm-KPI lie.
+    if [[ "$REFUSE_WARM_SHARE" == "1" && "$HAS_HOT" != "1" ]]; then
+      echo "REFUSE_SHARE_WARM_KPI: $NAME kept local only (COLD / absurd). Fix repeat≥2 before posting warm." | tee -a "$OUT_ROOT/META.txt"
+      mkdir -p "$SHARE/refused"
+      cp -f "$OUT/labeled/${NAME}_labeled.mp4" "$SHARE/refused/${NAME}_labeled_COLD.mp4" 2>/dev/null || true
+    else
+      cp -f "$OUT/labeled/${NAME}_labeled.mp4" "$SHARE/labeled/" 2>/dev/null || true
+      cp -f "$SRC" "$SHARE/${NAME}.mp4" 2>/dev/null || true
+    fi
   fi
-  echo "$NAME RC=$RC SEC=$SEC REPEAT=$REPEAT HAS_HOT=$HAS_HOT proc_wall=$proc_wall hot_total=$hot_total cold_total=$cold_total cold_te=$cold_te LABEL=$LABEL SRC=$SRC" | tee -a "$OUT_ROOT/META.txt"
+  echo "$NAME RC=$RC SEC=$SEC REPEAT=$REPEAT HAS_HOT=$HAS_HOT REFUSE_WARM_SHARE=$REFUSE_WARM_SHARE proc_wall=$proc_wall hot_total=$hot_total cold_total=$cold_total cold_te=$cold_te LABEL=$LABEL SRC=$SRC" | tee -a "$OUT_ROOT/META.txt"
   return "$RC"
 }
 
