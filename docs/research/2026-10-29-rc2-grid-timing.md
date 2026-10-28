@@ -73,11 +73,14 @@ So cold process wall became “warm 49.78s”. Same bug on RC1/RC2: labeled “w
 4. A1 smoke `repeat=1` → `repeat=2` so next gates can quote true hot KPI for 1s smoke.
 5. `burn_eval_label.sh` comment updated: never burn cold WALL as warm; 1s ≠ 5s product KPI.
 
-Expected re-label for existing RC0 log:  
-`RC0 864x480 DMAD-4 INT8 C015 | 1s COLD 49.78s (te 26.9s) NOT warm-KPI`
+Expected re-label for existing RC0 log (reburned on share):  
+`RC0 864x480 DMAD-4 INT8 | 1s COLD 49.78s te26.9s NOT-warm`
 
-Expected RC2-style:  
-`RC2 1344x768 Euler-8 INT8 C015 w24 | 5s hot 125.38s (dit 105.4s); proc 279.06s cold+hot`
+Expected RC1 / RC2 style:  
+`RC1 … | 5s hot 50.69s dit36.7s wall131.73s`  
+`RC2 … | 5s hot 125.38s dit105.4s wall279.06s`
+
+`burn_eval_label.sh` now picks fontsize from frame width × label length so 480p does not clip.
 
 ---
 

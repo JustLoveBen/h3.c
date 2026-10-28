@@ -108,22 +108,22 @@ run_sku() {
 
   # KPI seconds for burn-in: hot clip total if present; else cold with explicit COLD tag.
   if [[ "$HAS_HOT" == "1" ]]; then
+    # Keep short for 480p burn-in width; always say hot (never mislabel WALL as warm).
     KPI_TAG="hot ${hot_total}s"
-    [[ "$hot_dit" != "na" ]] && KPI_TAG="${KPI_TAG} (dit ${hot_dit}s)"
-    # If process wall >> hot (cold+warm sum), annotate so humans don't confuse.
+    [[ "$hot_dit" != "na" ]] && KPI_TAG="${KPI_TAG} dit${hot_dit}s"
     if awk -v p="${proc_wall:-0}" -v h="${hot_total:-0}" 'BEGIN{exit !(p+0 > h+0*1.25 && p+0>0 && h+0>0)}'; then
-      KPI_TAG="${KPI_TAG}; proc ${proc_wall}s cold+hot"
+      KPI_TAG="${KPI_TAG} wall${proc_wall}s"
     fi
   else
     KPI_TAG="COLD ${proc_wall}s"
-    [[ "$cold_te" != "na" ]] && KPI_TAG="${KPI_TAG} (te ${cold_te}s)"
-    KPI_TAG="${KPI_TAG} NOT warm-KPI"
+    [[ "$cold_te" != "na" ]] && KPI_TAG="${KPI_TAG} te${cold_te}s"
+    KPI_TAG="${KPI_TAG} NOT-warm"
   fi
 
   LABEL=""
   case "$SKU" in
-    rc0) LABEL="RC0 864x480 DMAD-4 INT8 C015 | ${SEC}s ${KPI_TAG}" ;;
-    rc0_euler) LABEL="RC0 864x480 Euler-8 INT8 C015 | ${SEC}s ${KPI_TAG}" ;;
+    rc0) LABEL="RC0 864x480 DMAD-4 INT8 | ${SEC}s ${KPI_TAG}" ;;
+    rc0_euler) LABEL="RC0 864x480 Euler-8 INT8 | ${SEC}s ${KPI_TAG}" ;;
     rc1) LABEL="RC1 1152x640 DMAD-4 INT8 C015 w24 | ${SEC}s ${KPI_TAG}" ;;
     rc2) LABEL="RC2 1344x768 Euler-8 INT8 C015 w24 | ${SEC}s ${KPI_TAG}" ;;
     *) LABEL="$NAME | ${SEC}s ${KPI_TAG}" ;;

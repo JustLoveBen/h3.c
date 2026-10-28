@@ -17,13 +17,26 @@ fi
 if [[ ! -f "$FONT" ]]; then
   FONT="/Library/Fonts/Arial Bold.ttf"
 fi
-# Prefer drawtext; fall back to plain copy with warning if filter missing.
+# Adaptive fontsize so long KPI strings fit 480p (864w) without clipping.
+W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN" 2>/dev/null | head -1)
+W=${W:-864}
+# ~0.55*fontsize px per char (bold); leave 24px margin each side
+FS=$(awk -v w="$W" -v n="${#LABEL}" 'BEGIN{
+  fit=int((w-24)/(n*0.55+1));
+  if(fit>28) fit=28;
+  if(fit<14) fit=14;
+  print fit
+}')
 mkdir -p "$(dirname "$OUT")"
+# Escape drawtext specials: : \ '
+ESC=${LABEL//\\/\\\\}
+ESC=${ESC//:/\\:}
+ESC=${ESC//\'/\\\'}
 if ffmpeg -y -hide_banner -loglevel error -i "$IN" \
-  -vf "drawtext=fontfile=${FONT}:text='${LABEL//:/\\:}':x=12:y=12:fontsize=28:fontcolor=white:borderw=3:bordercolor=black@0.8" \
+  -vf "drawtext=fontfile=${FONT}:text='${ESC}':x=12:y=12:fontsize=${FS}:fontcolor=white:borderw=3:bordercolor=black@0.8" \
   -c:v libx264 -preset veryfast -crf 14 -pix_fmt yuv420p -c:a copy -movflags +faststart \
   "$OUT"; then
-  echo "burned label='$LABEL' → $OUT"
+  echo "burned label='$LABEL' fontsize=$FS → $OUT"
 else
   echo "drawtext failed; writing unlabeled copy" >&2
   cp -f "$IN" "$OUT"
