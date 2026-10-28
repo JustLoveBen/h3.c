@@ -16,7 +16,7 @@
 - **NFE / few-step product ladder** packaged: [`nfe-fewstep-contracts`](2026-10-28-nfe-fewstep-contracts.md) + `tools/h3_nfe_product_ladder_env.sh` (euler8 Track-A / dmad4 Track-B / pdmd4 contrast; pdmd2 not sellable — no LoRA). Reuses DMAD↔Euler KPI @`3cee9ff`; no new fewer-step arm claimed.
 - **Track-A C015** act-FP16 **default ON** (`b99d56b`).  
 - **Track-B S2 recipe packaged** (opt-in): `H3_DIT_INT8_WINDOW=24` + sol `LAYERS=2` — **cudnn default unchanged**. Helper `tools/h3_track_b_s2_env.sh` · doc [`s2-recipe`](2026-10-28-track-b-s2-sellable-recipe.md). Evidence G1 @`eb805b4`.  
-- **Raise-canvas SKU policy** (doc only): DMAD≤1152×640 / Euler@1344×768 — [`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md).  
+- **Raise-canvas SKU productized**: DMAD≤1152×640 / Euler@1344×768 — [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh` (policy sketch [`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md)).  
 - Closed / do not reopen: C011, C016, C043, C018, C019.
 
 
@@ -41,7 +41,7 @@
 |---:|---|---|---|---|---|---|---|---|
 | **1** | **C041 窗 30→24** | VRAM | ~GiB 级峰值余量；可能 −WC（H2D 更频） | L | 同配置可过（能力探针） | ✅ | 低 | **NOW（他机在跑）** — C040 768p free≈0.8 GiB，缩窗是最便宜的余量探针；**不解默认** |
 | **2** | **C015/C042 act-FP16 中转** | VRAM / 近无损 WC | 激活带宽↓；768p+ 余量；WC 可能小正/零 | M | **非 BIT_ID**；需同配置 waffle | ✅ | 中 | **DONE default ON** [`c015-default-on`](2026-10-28-c015-default-on-decision.md) |
-| **3** | **抬画布质量 SKU**（960×544 / 1152×640 PDMD上限；1344 Euler） | quality@sameNFE | 小脸五官可辨（主杠杆） | L | 跨分辨率非 waffle 金线 | ✅ 已证 | 低（产品档） | **DOC** [`raise-canvas`](2026-10-28-raise-canvas-sku-policy.md) + [`ghosting`](2026-10-27-ghosting-and-small-face.md) |
+| **3** | **抬画布质量 SKU**（960×544 / 1152×640 PDMD上限；1344 Euler） | quality@sameNFE | 小脸五官可辨（主杠杆） | L | 跨分辨率非 waffle 金线 | ✅ 已证 | 低（产品档） | **DONE** [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `h3_raise_canvas_sku_env.sh` |
 | **4** | **C035 detail / taomate-0.7 refiner LoRA** | quality@sameNFE / better-than-DMAD polish | 少步过饱和/糊边恢复；非发明远景像素 | M | 有损臂；独立合同 | ✅ | 中 | **BLOCK 2026-10-28** — 无本地权（[`exp-g2-block`](2026-10-28-exp-g2-c035-refiner-block.md)）；权重到位再扫 |
 | **5** | **人脸/身份 LoRA（训练臂 · 非 FaceRefine）** | training / quality | 近景身份/口型更稳；**不能**单独救 ~34px 远脸 | H | 新合同 | ✅ 推理可挂 | **高（训）** | **有条件 NOW 设计、DEFER 重训** — 见 §2.1；需 face-heavy 数据 + 与 DMAD/Euler 合同正交 |
 | **6** | ~~**C011 VAE cast/prescale**~~ | — | ≈29 ms VAE meat | — | — | — | — | **CLOSED NO_WC_WIN** [`nsys-close`](2026-10-28-c011-vae-cast-prescale-nsys-close.md)；next DeepSeek **C016 PDL dig** |
@@ -139,3 +139,4 @@
 | 2026-10-28 | **C043 CLOSED** covered-by-window+C041；next **C015 default-on decision dig**. |
 | 2026-10-28 | **C015 default ON** (decision dig YES). |
 | 2026-10-28 | Track-B S2 recipe packaged + raise-canvas SKU policy; cudnn default unchanged. |
+| 2026-10-28 | **Raise-canvas SKU productized** — doc + `tools/h3_raise_canvas_sku_env.sh`; refuses 1280×720 / 1344+fewstep. |

@@ -76,7 +76,7 @@ Stack OK — no OOM; cudnn default path unchanged.
 
 ## Raise-canvas (quality SKU, separate doc)
 
-Far-face is **pixel budget**, not FaceRefine. See [`raise-canvas-sku-policy`](2026-10-28-raise-canvas-sku-policy.md): DMAD/PDMD ≤1152×640; Euler-8 @1344×768 for max face budget.
+Far-face is **pixel budget**, not FaceRefine. Productized: [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh` (policy sketch [`raise-canvas-sku-policy`](2026-10-28-raise-canvas-sku-policy.md)): DMAD/PDMD ≤1152×640; Euler-8 @1344×768 for max face budget.
 
 ## Non-goals
 
@@ -87,3 +87,4 @@ Far-face is **pixel budget**, not FaceRefine. See [`raise-canvas-sku-policy`](20
 ## NFE ladder
 
 Compose with [`nfe-fewstep-contracts`](2026-10-28-nfe-fewstep-contracts.md) (`source tools/h3_nfe_product_ladder_env.sh dmad4` then this S2 env).
+Compose raise-canvas: `source tools/h3_raise_canvas_sku_env.sh {480p|1152_dmad|1344_euler}` (S2 does not raise face-px).

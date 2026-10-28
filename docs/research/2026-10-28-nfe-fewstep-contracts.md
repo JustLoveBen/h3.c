@@ -1,7 +1,7 @@
 # NFE / few-step product contracts (ladder)
 
 > **Asia/Shanghai 2026-10-28.** Product packaging after Track-A C015 default-ON (`b99d56b`) + Track-B S2 (`3e4414b`).  
-> **This turn:** define the sellable NFE ladder and gates. **Does not** start raise-canvas SKU productization (separate next axis — see [`raise-canvas-sku-policy`](2026-10-28-raise-canvas-sku-policy.md) for policy-only).  
+> **NFE axis packaged @`7cc2a0f`.** Raise-canvas productized in [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh` (policy sketch: [`raise-canvas-sku-policy`](2026-10-28-raise-canvas-sku-policy.md)).  
 > **Policy (t71u / memory):** primary eval/product arms = **DMAD or Euler**; **PDMD = contrast-only**. FaceRefine STOPPED. NVFP4 BLOCK. No inventing LoRA not on disk (G2 C035 BLOCK; no pdmd2 weights on 4090).
 
 ## 0. One-liner
@@ -91,17 +91,18 @@ Does **not** export `H3_CUDA_SDPA_BACKEND` (cudnn stays product default). Compos
 
 - PDMD-2 / any 2-NFE product SKU without on-disk LoRA + new Track-B visual floor.  
 - Flipping product primary back to PDMD (historical beyond-DMAD ranking superseded by t71u).  
-- Raise-canvas productization (doc exists; **next** sequential axis).  
+- ~~Raise-canvas productization~~ → [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) (done after this NFE doc).  
 - C035 refiner, FaceRefine, NVFP4, MagCache, turbo4×fewstep.  
 - Reopening C011 / C016 / C043 / C018.
 
-## 6. Next sequential axis
+## 6. Sequential axes
 
-1. ~~NFE / few-step contracts~~ **this doc**  
-2. **Raise-canvas SKU productization** (parent dispatch) — matrix already sketched in [`raise-canvas-sku-policy`](2026-10-28-raise-canvas-sku-policy.md)
+1. ~~NFE / few-step contracts~~ **this doc** @`7cc2a0f`  
+2. ~~Raise-canvas SKU productization~~ → [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh`
 
 ## 7. Related
 
+- [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh`  
 - [`track-b-s2-sellable-recipe`](2026-10-28-track-b-s2-sellable-recipe.md)  
 - [`accel-quality-theory-and-industry`](2026-10-28-accel-quality-theory-and-industry.md) § NFE still WC axis  
 - [`4090-opt-menu-beyond-dmad`](2026-10-28-4090-opt-menu-beyond-dmad.md)

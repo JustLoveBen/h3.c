@@ -1,5 +1,7 @@
 # Raise-canvas SKU policy (product doc)
 
+> **Productized:** see [`raise-canvas-sku`](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh` (this file remains the short policy sketch).
+
 > **Asia/Shanghai 2026-10-28.** Product policy only — no new kernels.  
 > Evidence: ghost/face A/B [`ghosting`](2026-10-27-ghosting-and-small-face.md) @`47b4cd8`; 4090 profile (W/H %32==0).
 
@@ -33,6 +35,8 @@
 
 ## Cross-links
 
+- [`raise-canvas-sku` productization](2026-10-28-raise-canvas-sku.md) + `tools/h3_raise_canvas_sku_env.sh`
+- [`nfe-fewstep-contracts`](2026-10-28-nfe-fewstep-contracts.md)
 - [`ghosting-and-small-face`](2026-10-27-ghosting-and-small-face.md)  
 - [`accel-quality` S0](2026-10-28-accel-quality-theory-and-industry.md)  
 - [`track-b-s2-recipe`](2026-10-28-track-b-s2-sellable-recipe.md)  
