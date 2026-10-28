@@ -8,7 +8,9 @@
 #   pdmd2 NOT sellable until 2NFE LoRA is on disk (absent @4090 2026-10-28)
 #   Doc: docs/research/2026-10-28-nfe-fewstep-contracts.md
 #
-# Usage:
+# Product entry (preferred): tools/h3_product_generate.sh --sku rc0|rc1|rc2
+#   Doc: docs/research/2026-10-28-product-generate-entry.md
+# Usage (source-only dig helper):
 #   source tools/h3_nfe_product_ladder_env.sh euler8   # Track-A quality gold
 #   source tools/h3_nfe_product_ladder_env.sh dmad4    # Track-B speed fewstep
 #   source tools/h3_nfe_product_ladder_env.sh pdmd4    # Track-B contrast

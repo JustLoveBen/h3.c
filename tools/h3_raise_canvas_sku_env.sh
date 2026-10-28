@@ -9,7 +9,9 @@
 #   Geometry: W/H must %32==0 (1280×720 rejected)
 #   Doc: docs/research/2026-10-28-raise-canvas-sku.md
 #
-# Usage:
+# Product entry (preferred): tools/h3_product_generate.sh --sku rc0|rc1|rc2
+#   Doc: docs/research/2026-10-28-product-generate-entry.md
+# Usage (source-only dig helper):
 #   source tools/h3_raise_canvas_sku_env.sh 480p         # RC0 default canvas
 #   source tools/h3_raise_canvas_sku_env.sh 1152_dmad    # RC1 speed-face
 #   source tools/h3_raise_canvas_sku_env.sh 1344_euler   # RC2 max-face

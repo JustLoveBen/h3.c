@@ -65,7 +65,20 @@ source tools/h3_track_b_s2_env.sh   # WINDOW=24 + sol LAYERS=2; still need --sdp
 | NFE Euler-8 / DMAD-4 | product arms | No | Choose per Track; then pick canvas SKU |
 | Raise-canvas SKU | this doc | **YES** | Primary far-face lever |
 
-## 5. Copy-paste CLI examples
+## 5. Product entry (preferred)
+
+```bash
+tools/h3_product_generate.sh --sku rc0 --prompt-ids evals/768p/ids/p10_street_wave_dolly.ids --out out/rc0
+tools/h3_product_generate.sh --sku rc1 --prompt-ids … --out out/rc1
+tools/h3_product_generate.sh --sku rc2 --prompt-ids … --out out/rc2
+# refuses: --canvas 1280x720 / --nfe dmad4 --canvas 1344
+tools/h3_product_generate_smoke.sh
+```
+
+Full wiring: [`product-generate-entry`](2026-10-28-product-generate-entry.md). Env-compose examples below remain for digs.
+
+## 5b. Copy-paste CLI examples (env compose)
+
 
 Assume model root + generate binary already on PATH; adjust `-d` / binary name to the machine.
 

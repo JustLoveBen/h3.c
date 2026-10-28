@@ -72,7 +72,20 @@ Keep ranking and gates **separate**. Same-config waffle / BIT_ID only for Track-
 
 Labeled clips (share): `~/grokbot-share/nfe_fewstep_contracts_20261028/labeled/`.
 
-## 4. Helper script
+## 4. Product entry (preferred)
+
+```bash
+# One-liner — no env soup
+tools/h3_product_generate.sh --sku rc0_euler --prompt-ids evals/768p/ids/p10_street_wave_dolly.ids --out out/rc0_euler
+tools/h3_product_generate.sh --sku rc0 --prompt-ids … --out out/rc0_dmad   # DMAD-4 speed
+tools/h3_product_generate.sh --nfe dmad4 --canvas 480 --dry-run
+tools/h3_product_generate_smoke.sh
+```
+
+Doc: [`product-generate-entry`](2026-10-28-product-generate-entry.md). Env helpers below remain valid for digs.
+
+## 4b. Helper script (source-only)
+
 
 ```bash
 # Track-A quality gold (prints recommended flags; does not invent LoRA)
