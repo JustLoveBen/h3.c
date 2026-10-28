@@ -36,15 +36,42 @@ STAMP=$(date "+%Y-%m-%d %H:%M:%S %Z")
   echo "gate_prompt: p10_street_wave_dolly complex 480p-style"
 } | tee "$OUT_ROOT/META.txt"
 
-extract_warm() {
+# Parse process wall + cold/hot phase breakdown from generate.log.
+# NEVER call process WALL_SEC "warm" — /usr/bin/time covers cold TE+VAE load too.
+# For KPI labels: prefer last phase_ms with hot=1 (true warm clip); else mark COLD.
+extract_timing() {
   local log="$1"
-  # Prefer last WALL_SEC if present; else last phase e2e-ish line
-  local w
-  w=$(grep -E "WALL_SEC=" "$log" 2>/dev/null | tail -1 | sed -n "s/.*WALL_SEC=\\([0-9.]*\\).*/\\1/p")
-  if [[ -z "$w" ]]; then
-    w=$(grep -E "e2e_ms=|wall_ms=" "$log" 2>/dev/null | tail -1 | head -c 80)
+  local proc_wall hot_total_s cold_total_s hot_dit_s cold_te_s
+  proc_wall=$(grep -E "^WALL_SEC=" "$log" 2>/dev/null | tail -1 | sed -n "s/.*WALL_SEC=\([0-9.]*\).*/\1/p")
+  if [[ -z "$proc_wall" ]]; then
+    proc_wall=$(grep -E "WALL_SEC=" "$log" 2>/dev/null | tail -1 | sed -n "s/.*WALL_SEC=\([0-9.]*\).*/\1/p")
   fi
-  echo "${w:-na}"
+  # phase_ms: ... total=MS ... hot=0|1 ...
+  cold_total_s=$(grep -E "phase_ms:.*hot=0" "$log" 2>/dev/null | head -1 | sed -n "s/.*total=\([0-9.]*\).*/\1/p")
+  hot_total_s=$(grep -E "phase_ms:.*hot=1" "$log" 2>/dev/null | tail -1 | sed -n "s/.*total=\([0-9.]*\).*/\1/p")
+  cold_te_s=$(grep -E "phase_ms:.*hot=0" "$log" 2>/dev/null | head -1 | sed -n "s/.*te=\([0-9.]*\).*/\1/p")
+  hot_dit_s=$(grep -E "phase_ms:.*hot=1" "$log" 2>/dev/null | tail -1 | sed -n "s/.*dit=\([0-9.]*\).*/\1/p")
+  # ms → s
+  if [[ -n "$cold_total_s" ]]; then cold_total_s=$(awk -v m="$cold_total_s" 'BEGIN{printf "%.2f", m/1000}'); fi
+  if [[ -n "$hot_total_s" ]]; then hot_total_s=$(awk -v m="$hot_total_s" 'BEGIN{printf "%.2f", m/1000}'); fi
+  if [[ -n "$cold_te_s" ]]; then cold_te_s=$(awk -v m="$cold_te_s" 'BEGIN{printf "%.1f", m/1000}'); fi
+  if [[ -n "$hot_dit_s" ]]; then hot_dit_s=$(awk -v m="$hot_dit_s" 'BEGIN{printf "%.1f", m/1000}'); fi
+  echo "proc_wall=${proc_wall:-na};hot_total=${hot_total_s:-na};cold_total=${cold_total_s:-na};cold_te=${cold_te_s:-na};hot_dit=${hot_dit_s:-na}"
+}
+
+flag_absurd_timing() {
+  # Self-flag: 1s smoke must not be presented as multi-10s product warm KPI.
+  local sec="$1" proc_wall="$2" has_hot="$3" name="$4"
+  local alerts=0
+  if awk -v s="$sec" -v w="$proc_wall" 'BEGIN{exit !(s+0<=2 && w+0>=30)}'; then
+    echo "ALERT_KPI_TIMING: $name sec=${sec}s but proc_wall=${proc_wall}s (≥30). Likely COLD TE/VAE load — do NOT label as warm product KPI." | tee -a "$OUT_ROOT/META.txt"
+    alerts=1
+  fi
+  if [[ "$has_hot" != "1" ]]; then
+    echo "ALERT_KPI_TIMING: $name has no hot=1 phase (repeat=1 cold-only). Label must say COLD, not warm." | tee -a "$OUT_ROOT/META.txt"
+    alerts=1
+  fi
+  return 0
 }
 
 run_sku() {
@@ -72,14 +99,34 @@ run_sku() {
       "$OUT/generate.log" || true
   } | tee "$OUT/extract.txt"
 
-  WARM=$(extract_warm "$OUT/generate.log")
+  TIMING=$(extract_timing "$OUT/generate.log")
+  # shellcheck disable=SC2086
+  eval "${TIMING//;/ }"
+  HAS_HOT=0
+  [[ "$hot_total" != "na" && -n "$hot_total" ]] && HAS_HOT=1
+  flag_absurd_timing "$SEC" "${proc_wall:-0}" "$HAS_HOT" "$NAME" || true
+
+  # KPI seconds for burn-in: hot clip total if present; else cold with explicit COLD tag.
+  if [[ "$HAS_HOT" == "1" ]]; then
+    KPI_TAG="hot ${hot_total}s"
+    [[ "$hot_dit" != "na" ]] && KPI_TAG="${KPI_TAG} (dit ${hot_dit}s)"
+    # If process wall >> hot (cold+warm sum), annotate so humans don't confuse.
+    if awk -v p="${proc_wall:-0}" -v h="${hot_total:-0}" 'BEGIN{exit !(p+0 > h+0*1.25 && p+0>0 && h+0>0)}'; then
+      KPI_TAG="${KPI_TAG}; proc ${proc_wall}s cold+hot"
+    fi
+  else
+    KPI_TAG="COLD ${proc_wall}s"
+    [[ "$cold_te" != "na" ]] && KPI_TAG="${KPI_TAG} (te ${cold_te}s)"
+    KPI_TAG="${KPI_TAG} NOT warm-KPI"
+  fi
+
   LABEL=""
   case "$SKU" in
-    rc0) LABEL="RC0 864x480 DMAD-4 INT8 C015 | warm ${WARM}s" ;;
-    rc0_euler) LABEL="RC0 864x480 Euler-8 INT8 C015 | warm ${WARM}s" ;;
-    rc1) LABEL="RC1 1152x640 DMAD-4 INT8 C015 w24 | warm ${WARM}s" ;;
-    rc2) LABEL="RC2 1344x768 Euler-8 INT8 C015 w24 | warm ${WARM}s" ;;
-    *) LABEL="$NAME | warm ${WARM}s" ;;
+    rc0) LABEL="RC0 864x480 DMAD-4 INT8 C015 | ${SEC}s ${KPI_TAG}" ;;
+    rc0_euler) LABEL="RC0 864x480 Euler-8 INT8 C015 | ${SEC}s ${KPI_TAG}" ;;
+    rc1) LABEL="RC1 1152x640 DMAD-4 INT8 C015 w24 | ${SEC}s ${KPI_TAG}" ;;
+    rc2) LABEL="RC2 1344x768 Euler-8 INT8 C015 w24 | ${SEC}s ${KPI_TAG}" ;;
+    *) LABEL="$NAME | ${SEC}s ${KPI_TAG}" ;;
   esac
   # Prefer warm clip (_r2) if repeat>1
   SRC="$OUT/${NAME}.mp4"
@@ -96,14 +143,15 @@ run_sku() {
     cp -f "$OUT/labeled/${NAME}_labeled.mp4" "$SHARE/labeled/" 2>/dev/null || true
     cp -f "$SRC" "$SHARE/${NAME}.mp4" 2>/dev/null || true
   fi
-  echo "$NAME RC=$RC WARM=$WARM SRC=$SRC" | tee -a "$OUT_ROOT/META.txt"
+  echo "$NAME RC=$RC SEC=$SEC REPEAT=$REPEAT HAS_HOT=$HAS_HOT proc_wall=$proc_wall hot_total=$hot_total cold_total=$cold_total cold_te=$cold_te LABEL=$LABEL SRC=$SRC" | tee -a "$OUT_ROOT/META.txt"
   return "$RC"
 }
 
-# A1: short 480p default path via product entry (do not break rc0)
-echo "==== A1 smoke rc0 1s ====" 
+# A1: short 480p smoke via product entry.
+# repeat=2 so burn-in can quote hot=1 (NOT cold TE wall). 1s≠5s product KPI.
+echo "==== A1 smoke rc0 1s repeat=2 (label hot, not cold TE) ===="
 set +e
-run_sku a1_rc0_smoke rc0 1 1 0
+run_sku a1_rc0_smoke rc0 1 2 0
 A1_RC=$?
 set -e
 
